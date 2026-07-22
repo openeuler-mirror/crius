@@ -1,0 +1,99 @@
+[package]
+name = "crius"
+version = "0.1.0"
+edition = "2021"
+authors = ["tdnorthgarden@gmail.com>"]
+description = "A Rust implementation of CRI API"
+license = "Apache-2.0"
+
+[lib]
+name = "crius"
+path = "src/lib.rs"
+
+[[bin]]
+name = "crius"
+path = "src/main.rs"
+
+[[bin]]
+name = "crs"
+path = "src/crs/main.rs"
+
+[[bin]]
+name = "crius-shim"
+path = "src/shim/main.rs"
+required-features = ["shim"]
+
+[features]
+default = []
+shim = ["fern", "ctrlc", "libc"]
+
+[dependencies]
+# 异步运行时
+tokio = { version = "1.0", features = ["full"] }
+futures = "0.3"
+
+# gRPC和Protocol Buffers
+tonic = { version = "0.11", features = ["tls", "tls-roots"] }
+tonic-reflection = "0.11"
+tokio-stream = { version = "0.1", features = ["net"] }
+prost = "0.12"
+prost-types = "0.12"
+
+# 日志和错误处理
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-log = "0.2"
+thiserror = "1.0"
+anyhow = "1.0"
+
+# 配置管理
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+serde_derive = "1.0"
+serde_with = "2.0"
+toml = "0.7"
+miniz_oxide = "0.8"
+
+# 工具库
+lazy_static = "1.4"
+log = "0.4"
+nix = "0.25"
+clap = { version = "4.0", features = ["derive", "env"] }
+clap_complete = "4.5.60"
+tower = "0.4"
+hyper = { version = "0.14", features = ["server", "tcp", "http1"] }
+tokio-rustls = "0.25"
+rustls = "0.22"
+rustls-pemfile = "2.2"
+oci-distribution = "0.11.0"
+rand = "0.8.0"
+uuid = { version = "0.8", features = ["v4"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+# 状态持久化
+rusqlite = { version = "0.32", features = ["bundled", "chrono"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+base64 = "0.21.7"
+
+# shim 专用依赖（条件编译）
+fern = { version = "0.6", optional = true }
+ctrlc = { version = "3.4", optional = true }
+libc = { version = "0.2", optional = true }
+
+# 网络相关
+async-trait = "0.1"
+rtnetlink = "0.21.0"
+ttrpc = { version = "0.9.0", features = ["async"] }
+protobuf = "3"
+
+tempfile = "3.3"
+
+[dev-dependencies]
+tempfile = "3.3"
+env_logger = "0.10"
+
+[build-dependencies]
+tonic-build = "0.11"
+prost-build = "0.12"
+ttrpc-codegen = "0.6.0"
