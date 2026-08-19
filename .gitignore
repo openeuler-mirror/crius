@@ -1,0 +1,13 @@
+# 构建产物
+/target
+
+# 日志文件
+*.log
+
+# 编译器临时配置文件
+.vscode
+.idea
+.cargo
+
+# 编译依赖文件
+/vendor/

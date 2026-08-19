@@ -1,0 +1,64 @@
+/*
+	Copyright 2026 KylinSoft  Co., Ltd.
+ 	 
+ 	Licensed under the Apache License, Version 2.0 (the "License");
+ 	you may not use this file except in compliance with the License.
+ 	You may obtain a copy of the License at
+ 	
+ 	    http://www.apache.org/licenses/LICENSE-2.0
+ 	 
+ 	Unless required by applicable law or agreed to in writing, software
+ 	distributed under the License is distributed on an "AS IS" BASIS,
+ 	WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ 	See the License for the specific language governing permissions and
+ 	limitations under the License.
+*/
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let out_dir = std::env::var("OUT_DIR")?;
+    let descriptor_path = format!("{}/file_descriptor_set.bin", out_dir);
+    let nri_out_dir = format!("{}/nri", out_dir);
+
+    let mut config = prost_build::Config::new();
+    config.file_descriptor_set_path(&descriptor_path);
+
+    tonic_build::configure()
+        .build_server(true)
+        .build_client(true)
+        .out_dir(&out_dir)
+        .compile_with_config(
+            config,
+            &[
+                "proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto",
+                "proto/crius/diagnostics/v1/diagnostics.proto",
+                "proto/crius/local/v1/local.proto",
+            ],
+            &["proto"],
+        )?;
+
+    std::fs::create_dir_all(&nri_out_dir)?;
+    ttrpc_codegen::Codegen::new()
+        .out_dir(&nri_out_dir)
+        .inputs(["proto/github.com/containerd/nri/pkg/api/api.proto"])
+        .include("proto")
+        .rust_protobuf()
+        .customize(ttrpc_codegen::Customize {
+            async_all: true,
+            gen_mod: true,
+            ..Default::default()
+        })
+        .rust_protobuf_customize(ttrpc_codegen::ProtobufCustomize::default().gen_mod_rs(false))
+        .run()?;
+
+    std::fs::write(
+        format!("{}/mod.rs", nri_out_dir),
+        "pub mod api;\npub mod api_ttrpc;\n",
+    )?;
+
+    println!("cargo:rerun-if-changed=proto/github.com/containerd/nri/pkg/api/api.proto");
+    println!("cargo:rerun-if-changed=proto/k8s.io/cri-api/pkg/apis/runtime/v1/api.proto");
+    println!("cargo:rerun-if-changed=proto/crius/diagnostics/v1/diagnostics.proto");
+    println!("cargo:rerun-if-changed=proto/crius/local/v1/local.proto");
+
+    Ok(())
+}
