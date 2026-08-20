@@ -14,11 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
+use std::os::unix::net::UnixListener;
+use std::os::unix::fs::symlink;
+use std::net::SocketAddr;
 
 use anyhow::Error;
 use clap::Parser;
+use tracing::info;
+use tonic::transport::Server;
+use tokio_stream::wrappers::UnixListenerStream;
+use tokio::net::UnixListener as TokioUnixListener;
 
 use crius::config::Config;
 
@@ -121,6 +129,42 @@ async fn main() -> Result<(), Error> {
     config.apply_env_overrides()?;
     apply_cli_overrides(&args, &mut config);
 
+    let listen = config.api.listen.clone();
+
+    let server = Server::builder();    
+
+    // 创建gRPC服务器
+    info!("Starting crius gRPC server on {}", listen);
+
+    if listen.starts_with("unix://") {
+        // Unix domain socket
+        let socket_path = listen.trim_start_matches("unix://");
+        let path = Path::new(socket_path);
+
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        // 清理旧socket文件
+        let _ = fs::remove_file(path);
+
+        // 创建Unix监听器
+        let uds = UnixListener::bind(path)?;
+        create_unix_socket_aliases(path, &config.api.listen_aliases)?;
+        for alias in &config.api.listen_aliases {
+            info!("CRI unix socket alias listening on {}", alias);
+        }
+        let uds_stream = UnixListenerStream::new(TokioUnixListener::from_std(uds)?);
+
+        let serve_result = server
+            .serve_with_incoming_shutdown(uds_stream, shutdown_signal()).await;
+        serve_result?;
+    } else {
+        let addr: SocketAddr = listen.parse()?;
+        let serve_result = server.serve_with_shutdown(addr, shutdown_signal()).await;
+        serve_result?;
+    }
+
     Ok(())
 }
 
@@ -134,5 +178,55 @@ fn apply_cli_overrides(args: &Args, config: &mut Config) {
     }
     if args.debug {
         config.logging.level = "debug".to_string();
+    }
+}
+
+fn unix_socket_path(listen: &str) -> Option<&Path> {
+    listen.strip_prefix("unix://").map(Path::new)
+}
+
+fn create_unix_socket_aliases(primary_socket_path: &Path, aliases: &[String]) -> Result<(), Error> {
+    for alias in aliases {
+        let alias_path = unix_socket_path(alias).ok_or_else(|| {
+            anyhow::anyhow!("api.listen_aliases value {} must use unix://", alias)
+        })?;
+        if alias_path == primary_socket_path {
+            continue;
+        }
+        if let Some(parent) = alias_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        match fs::symlink_metadata(alias_path) {
+            Ok(metadata) => {
+                if metadata.file_type().is_dir() {
+                    return Err(anyhow::anyhow!(
+                        "socket alias {} points to a directory",
+                        alias_path.display()
+                    ));
+                }
+                fs::remove_file(alias_path)?;
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(err.into()),
+        }
+        symlink(primary_socket_path, alias_path)?;
+    }
+    Ok(())
+}
+
+async fn shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => {}
+            _ = sigterm.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = tokio::signal::ctrl_c().await;
     }
 }
