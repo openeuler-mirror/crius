@@ -111,13 +111,28 @@ struct Args {
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
     
-    let mut config = match Config::load(args.config) {
+    let mut config = match Config::load(&args.config) {
         Ok(cfg) => cfg,
         Err(crius::error::Error::Io(err)) if err.kind() == std::io::ErrorKind::NotFound => {
             Config::default()
         }
         Err(err) => return Err(err.into()),
     };
+    config.apply_env_overrides()?;
+    apply_cli_overrides(&args, &mut config);
 
     Ok(())
+}
+
+
+fn apply_cli_overrides(args: &Args, config: &mut Config) {
+    if let Some(listen) = &args.listen {
+        config.api.listen = listen.clone();
+    }
+    if let Some(log_file) = &args.log {
+        config.logging.file = Some(log_file.display().to_string());
+    }
+    if args.debug {
+        config.logging.level = "debug".to_string();
+    }
 }

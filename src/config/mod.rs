@@ -15,11 +15,13 @@ limitations under the License.
 */
 
 use std::{fs, path::Path};
+use std::str::FromStr;
 
 use serde::Deserialize;
 
 use crate::error::Result;
 use crate::defaults::*;
+use crate::error::Error;
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -144,7 +146,113 @@ impl Config {
         let content = fs::read_to_string(path)?;
         let config: Self = toml::from_str(&content)?;
         Ok(config)
-    } 
+    }
+
+    pub fn apply_env_overrides(&mut self) -> Result<()> {
+        apply_string_override("CRIUS_ROOT", &mut self.root);
+        apply_string_override("CRIUS_LISTEN", &mut self.api.listen);
+        apply_csv_override("CRIUS_LISTEN_ALIASES", &mut self.api.listen_aliases);
+        apply_bool_override("CRIUS_ALLOW_TCP_SERVICE", &mut self.api.allow_tcp_service)?;
+        apply_numeric_override(
+            "CRIUS_GRPC_MAX_SEND_MSG_SIZE",
+            &mut self.api.grpc_max_send_msg_size,
+        )?;
+        apply_numeric_override(
+            "CRIUS_GRPC_MAX_RECV_MSG_SIZE",
+            &mut self.api.grpc_max_recv_msg_size,
+        )?;
+        apply_bool_override("CRIUS_ENABLE_POD_EVENTS", &mut self.api.enable_pod_events)?;
+        apply_csv_override(
+            "CRIUS_INCLUDED_POD_METRICS",
+            &mut self.api.included_pod_metrics,
+        );
+        apply_numeric_override(
+            "CRIUS_STATS_COLLECTION_PERIOD",
+            &mut self.api.stats_collection_period,
+        )?;
+        apply_numeric_override(
+            "CRIUS_POD_SANDBOX_METRICS_COLLECTION_PERIOD",
+            &mut self.api.pod_sandbox_metrics_collection_period,
+        )?;
+        apply_string_override("CRIUS_IMAGE_DRIVER", &mut self.image.driver);
+        apply_string_override("CRIUS_IMAGE_ROOT", &mut self.image.root);
+        apply_string_override(
+            "CRIUS_IMAGE_GLOBAL_AUTH_FILE",
+            &mut self.image.global_auth_file,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_NAMESPACED_AUTH_DIR",
+            &mut self.image.namespaced_auth_dir,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DEFAULT_TRANSPORT",
+            &mut self.image.default_transport,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SHORT_NAME_MODE",
+            &mut self.image.short_name_mode,
+        );
+        apply_numeric_override(
+            "CRIUS_MAX_CONCURRENT_DOWNLOADS",
+            &mut self.image.max_concurrent_downloads,
+        )?;
+        apply_numeric_override(
+            "CRIUS_IMAGE_PULL_RETRY_COUNT",
+            &mut self.image.pull_retry_count,
+        )?;
+        apply_string_override(
+            "CRIUS_IMAGE_REGISTRY_CONFIG_DIR",
+            &mut self.image.registry_config_dir,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_KEYS_PATH",
+            &mut self.image.decryption_keys_path,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_DECODER_PATH",
+            &mut self.image.decryption_decoder_path,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_DECRYPTION_KEYPROVIDER_CONFIG",
+            &mut self.image.decryption_keyprovider_config,
+        );
+        apply_csv_override(
+            "CRIUS_ADDITIONAL_ARTIFACT_STORES",
+            &mut self.image.additional_artifact_stores,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SIGNATURE_POLICY",
+            &mut self.image.signature_policy,
+        );
+        apply_string_override(
+            "CRIUS_IMAGE_SIGNATURE_POLICY_DIR",
+            &mut self.image.signature_policy_dir,
+        );
+        apply_csv_override(
+            "CRIUS_IMAGE_STORAGE_OPTIONS",
+            &mut self.image.storage_options,
+        );
+        apply_string_override("CRIUS_IMAGE_VOLUMES", &mut self.image.image_volumes);
+        apply_csv_override("CRIUS_PINNED_IMAGES", &mut self.image.pinned_images);
+        apply_string_override(
+            "CRIUS_IMAGE_BIG_FILES_TEMPORARY_DIR",
+            &mut self.image.big_files_temporary_dir,
+        );
+        apply_bool_override(
+            "CRIUS_OCI_ARTIFACT_MOUNT_SUPPORT",
+            &mut self.image.oci_artifact_mount_support,
+        )?;
+        apply_string_override("CRIUS_LOG_LEVEL", &mut self.logging.level);
+        apply_optional_string_override("CRIUS_LOG_FILE", &mut self.logging.file);
+        apply_string_override("CRIUS_LOG_DIR", &mut self.logging.dir);
+        apply_numeric_override(
+            "CRIUS_MAX_CONTAINER_LOG_LINE_SIZE",
+            &mut self.logging.max_container_log_line_size,
+        )?;
+
+        Ok(())
+    }
+
 }
 
 impl Default for ApiConfig {
@@ -201,4 +309,66 @@ impl Default for LoggingConfig {
             max_container_log_line_size: 4096 
         }
     }    
+}
+
+fn apply_string_override(env_name: &str, target: &mut String) {
+    if let Some(value) = std::env::var_os(env_name) {
+        *target = value.to_string_lossy().trim().to_string();
+    }
+}
+
+fn apply_csv_override(env_name: &str, target: &mut Vec<String>) {
+    if let Some(value) = std::env::var_os(env_name) {
+        *target = split_csv_list(&value.to_string_lossy());
+    }
+}
+
+fn apply_bool_override(env_name: &str, target: &mut bool) -> Result<()> {
+    if let Some(value) = std::env::var_os(env_name) {
+        *target = parse_bool(&value.to_string_lossy())
+            .map_err(|err| Error::Config(format!("{env_name}: {err}")))?;
+    }
+    Ok(())
+}
+
+fn apply_optional_string_override(env_name: &str, target: &mut Option<String>) {
+    if let Some(value) = std::env::var_os(env_name) {
+        let trimmed = value.to_string_lossy().trim().to_string();
+        *target = if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        };
+    }
+}
+
+fn apply_numeric_override<T>(env_name: &str, target: &mut T) -> Result<()> 
+where 
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    if let Some(value) = std::env::var_os(env_name) {
+        *target = value.to_string_lossy().trim().parse::<T>().map_err(|err|Error::Config(format!(
+            "{env_name}: invalid {} value: {err}",
+            std::any::type_name::<T>()
+        )))?;
+    }
+
+    Ok(())
+}
+
+fn split_csv_list(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn parse_bool(raw: &str) -> std::result::Result<bool, String> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("invalid boolean value {other}")),
+    }
 }
