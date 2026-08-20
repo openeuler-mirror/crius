@@ -19,3 +19,13 @@ pub const DEFAULT_CRI_SOCKET_URI :&str = "unix:///run/crius/crius.sock";
 pub const DEFAULT_CONTAINER_STORAGE_DIR: &str = "/var/lib/containers/storage";
 pub const DEFAULT_STORAGE_DRIVER: &str = "overlay";
 pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES: u32 = 80 * 1024 * 1024;
+
+pub const DEFAULT_RUNTIME_STATE_DIR: &str = "/run/crius";
+pub const DEFAULT_RUNTIME_SHIM_DIR: &str = "/run/crius/shims";
+pub const DEFAULT_RUNTIME_ATTACH_SOCKET_DIR: &str = "/run/crius/attach";
+pub const DEFAULT_RUNTIME_CONTAINER_EXITS_DIR: &str = "/run/crius/exits";
+pub const DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE: &str = "/var/lib/crius/clean.shutdown";
+pub const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
+pub const DEFAULT_RUNTIME_VERSION_FILE_PERSIST: &str = "/var/lib/crius/version";
+
+pub const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
