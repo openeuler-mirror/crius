@@ -16,6 +16,7 @@ limitations under the License.
 
 use std::{fs, path::Path};
 use std::str::FromStr;
+use std::collections::HashMap;
 
 use serde::Deserialize;
 
@@ -33,8 +34,8 @@ pub struct Config {
     /// API 配置。
     pub api: ApiConfig,
 
-    // 运行时配置。
-    // pub runtime: RuntimeConfig,
+    /// 运行时配置。
+    pub runtime: RuntimeConfig,
 
     /// 镜像配置。
     pub image: ImageConfig,
@@ -81,6 +82,147 @@ pub struct ApiConfig{
     // pub streaming: StreamingConfig,
 }
 
+/// 运行时配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RuntimeConfig {
+    /// 默认运行时类型/handler 名称。
+    pub runtime_type: String,
+    /// OCI runtime 二进制路径。
+    pub runtime_path: String,
+    /// 默认 runtime 特定配置文件路径。
+    pub runtime_config_path: String,
+    /// 默认 OCI spec 模板文件；为空表示使用内建生成逻辑。
+    pub base_runtime_spec: String,
+    /// 运行时状态根目录。
+    pub root: String,
+    /// 默认 runtime 按平台覆盖的二进制路径映射，格式为 `os/arch -> path`。
+    pub platform_runtime_paths: HashMap<String, String>,
+    /// 对外暴露的 runtime handlers。
+    pub handlers: Vec<String>,
+    /// 按 handler 细化的 runtime 配置，参考 CRI-O runtimes 表。
+    pub runtimes: HashMap<String, RuntimeHandlerConfig>,
+    /// 按 workload 名称定义的 annotation 驱动资源预设。
+    pub workloads: HashMap<String, RuntimeWorkloadConfig>,
+    /// PodSandbox pause 镜像。
+    pub pause_image: String,
+    /// pause 镜像内的 infra 命令路径。
+    pub pause_command: String,
+    /// 命名空间辅助二进制路径；为空时使用内建 netns 管理逻辑。
+    pub pinns_path: String,
+    /// 是否允许在特定场景下省略 infra/pause 容器。
+    pub drop_infra_ctr: bool,
+    /// 可选的 cgroup driver 显式配置。
+    pub cgroup_driver: Option<CgroupDriverConfig>,
+    /// shim 二进制路径。
+    pub shim_path: String,
+    /// 默认 monitor/shim 所在 cgroup；支持空字符串、`pod` 或 systemd slice。
+    pub monitor_cgroup: String,
+    /// shim 工作目录。
+    pub shim_dir: String,
+    /// attach/resize socket 根目录。
+    pub attach_socket_dir: String,
+    /// 容器退出记录根目录。
+    pub container_exits_dir: String,
+    /// 干净退出标记文件。
+    pub clean_shutdown_file: String,
+    /// 容器优雅停止的最小等待时间（秒）。
+    pub container_stop_timeout: u32,
+    /// 临时版本标记文件，用于识别 reboot 后启动。
+    pub version_file: String,
+    /// 持久版本标记文件，用于识别升级后的恢复分支。
+    pub version_file_persist: String,
+    /// 可选的 CRIU 二进制路径；为空时使用 runtime 默认行为。
+    pub criu_path: String,
+    /// 可选的 CRIU image staging 根目录；为空时沿用 artifact 邻接目录。
+    pub criu_image_path: String,
+    /// 可选的 CRIU work staging 根目录；为空时默认落到 image 目录下的 `work/`。
+    pub criu_work_path: String,
+    /// 是否启用 checkpoint/restore 支持。
+    pub enable_criu_support: bool,
+    /// 是否允许启动期自动清理孤儿 runtime/shim/pod 工件。
+    pub internal_wipe: bool,
+    /// 是否在 unclean 启动时检查并尝试修复持久化账本。
+    pub internal_repair: bool,
+    /// 对所有 bind mount source 添加的宿主路径前缀；为空表示不改写。
+    pub bind_mount_prefix: String,
+    /// 是否禁用 cgroup 支持。
+    pub disable_cgroup: bool,
+    /// hugetlb controller 缺失时是否容忍并忽略 hugepage limits。
+    pub tolerate_missing_hugetlb_controller: bool,
+    /// 镜像拉取使用的独立 cgroup；支持空值、`pod` 或指定 cgroup path。
+    pub separate_pull_cgroup: String,
+    /// 守护进程默认的 UID 映射，格式为 `container:host:size[,..]`。
+    pub uid_mappings: String,
+    /// 守护进程默认的 GID 映射，格式为 `container:host:size[,..]`。
+    pub gid_mappings: String,
+    /// 非 root userns 映射允许使用的最小宿主 UID；-1 表示不限制。
+    pub minimum_mappable_uid: i64,
+    /// 非 root userns 映射允许使用的最小宿主 GID；-1 表示不限制。
+    pub minimum_mappable_gid: i64,
+    /// shim 创建的宿主 IO 工件默认 UID。
+    pub io_uid: u32,
+    /// shim 创建的宿主 IO 工件默认 GID。
+    pub io_gid: u32,
+    /// 守护进程默认的 pids 限制；-1 表示不设置默认限制。
+    pub pids_limit: i64,
+    /// infra/pause 容器默认 cpuset。
+    pub infra_ctr_cpuset: String,
+    /// 允许 guaranteed workload 共享使用的 cpuset。
+    pub shared_cpuset: String,
+    /// exec / execSync 的 CPU 亲和策略；"" 表示 runtime 默认，"first" 表示使用 cpuset 的第一个 CPU。
+    pub exec_cpu_affinity: String,
+    /// irqbalance 守护进程配置文件路径。
+    pub irqbalance_config_file: String,
+    /// irqbalance banned CPU mask 启动期恢复文件；`disable` 表示禁用恢复逻辑。
+    pub irqbalance_config_restore_file: String,
+    /// 是否默认将所有 Pod/容器根文件系统设为只读。
+    pub read_only: bool,
+    /// 是否禁用 pivot_root，改用 MS_MOVE。
+    pub no_pivot: bool,
+    /// 是否禁止为容器创建新的 session keyring。
+    pub no_new_keyring: bool,
+    /// 是否启用 shim debug。
+    pub shim_debug: bool,
+    /// 传给 monitor/shim 进程的默认环境变量列表，格式为 `KEY=value`。
+    pub monitor_env: Vec<String>,
+    /// 注入到所有容器的默认环境变量，格式为 `KEY=value`。
+    pub default_env: Vec<String>,
+    /// daemon 级默认 capabilities 列表。
+    pub default_capabilities: Vec<String>,
+    /// daemon 级默认 sysctls，格式为 `key = value` 或 `key=value`。
+    pub default_sysctls: Vec<String>,
+    /// daemon 级默认 ulimits，格式为 `name=soft:hard`。
+    pub default_ulimits: Vec<String>,
+    /// 允许 CRI 请求映射进容器的宿主设备路径列表。
+    pub allowed_devices: Vec<String>,
+    /// 注入到所有容器的额外宿主设备映射，格式为 `/SRC[:/DST[:PERMS]]`。
+    pub additional_devices: Vec<String>,
+    /// 是否将设备节点的 uid/gid 跟随 security context 的 runAsUser/runAsGroup。
+    pub device_ownership_from_security_context: bool,
+    /// 是否把 capabilities 同步写入 inheritable 集合。
+    pub add_inheritable_capabilities: bool,
+    /// 默认附加挂载文件，格式为 `/SRC:/DST`，一行一个。
+    pub default_mounts_file: String,
+    /// OCI hooks 目录列表；后面的目录拥有更高同名文件优先级。
+    pub hooks_dir: Vec<String>,
+    /// 宿主关键挂载源缺失时需要直接拒绝创建的路径列表。
+    pub absent_mount_sources_to_reject: Vec<String>,
+    /// 是否禁用 Kubernetes ProcMount 支持。
+    pub disable_proc_mount: bool,
+    /// 容器时区策略；空字符串表示不注入，`Local` 表示跟随宿主机。
+    pub timezone: String,
+    /// 是否在 CRI 日志文件之外额外写 journald。
+    pub log_to_journald: bool,
+    /// 是否在日志轮转和容器退出时跳过 sync。
+    pub no_sync_log: bool,
+    /// 是否将容器/Pod 的 OOMScoreAdj 下界限制为 daemon 当前值。
+    pub restrict_oom_score_adj: bool,
+    /// 为非 hostNetwork Pod 默认开启低位端口绑定。
+    pub enable_unprivileged_ports: bool,
+    /// 为非 hostNetwork 且非 userns Pod 默认开启 ping group range。
+    pub enable_unprivileged_icmp: bool,
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageConfig{
@@ -140,6 +282,89 @@ pub struct LoggingConfig{
     pub max_container_log_line_size: usize,
 }
 
+/// 单个 runtime handler 的细化配置。
+#[derive(Debug, Clone, Deserialize)]
+pub struct RuntimeHandlerConfig {
+    /// 该 handler 绑定的 runtime backend 类型。
+    pub backend: String,
+    /// 该 handler 传递给 backend 的差异化配置项。
+    pub backend_options: HashMap<String, String>,
+    /// 该 handler 对应的 OCI runtime 二进制路径。
+    pub runtime_path: String,
+    /// 该 handler 对应的 runtime 特定配置文件路径；为空时继承默认值。
+    pub runtime_config_path: String,
+    /// 该 handler 对应的 runtime 状态根目录。
+    pub runtime_root: String,
+    /// 该 handler 按平台覆盖的 runtime 二进制路径映射。
+    pub platform_runtime_paths: HashMap<String, String>,
+    /// 是否继承默认 handler 的 runtime_path/runtime_root。
+    pub inherit_default_runtime: bool,
+    /// 该 handler 专属的 monitor/shim 二进制路径；为空时继承 runtime.shim_path。
+    pub monitor_path: String,
+    /// 该 handler 专属的 monitor/shim cgroup；未设置时继承 runtime.monitor_cgroup。
+    pub monitor_cgroup: Option<String>,
+    /// 该 handler 专属的 monitor/shim 环境变量；未设置时继承 runtime.monitor_env。
+    pub monitor_env: Option<Vec<String>>,
+    /// 是否允许该 handler 的 exec/attach/port-forward 使用 websocket 协议；未设置时继承默认值。
+    pub stream_websockets: Option<bool>,
+    /// 该 handler 额外允许处理的 annotation 前缀。
+    pub allowed_annotations: Vec<String>,
+    /// 该 handler 默认注入到 OCI annotations 的键值对；显式请求优先。
+    pub default_annotations: HashMap<String, String>,
+    /// privileged 容器是否跳过默认宿主设备注入。
+    pub privileged_without_host_devices: bool,
+    /// 在跳过宿主设备注入时，是否仍维持全设备 allowlist。
+    pub privileged_without_host_devices_all_devices_allowed: bool,
+    /// 该 handler 的容器创建超时（秒）；未设置时继承内置默认值。
+    pub container_create_timeout: Option<u32>,
+    /// 该 handler 的 rootfs snapshotter；为空时使用默认 `internal-overlay-untar`。
+    pub snapshotter: String,
+    /// 该 handler 专属的 CNI 配置目录；为空时继承全局 network.config_dirs。
+    pub cni_conf_dir: String,
+    /// 该 handler 专属的 CNI 配置文件最大加载数量；未设置时继承全局 network.max_conf_num。
+    #[serde(alias = "cni_max_conf_num")]
+    pub cni_max_conf_num: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+#[serde(default)]
+pub struct RuntimeWorkloadConfig {
+    /// 激活该 workload 的 Pod annotation key。
+    pub activation_annotation: String,
+    /// 容器级资源覆盖 annotation 前缀。
+    pub annotation_prefix: String,
+    /// 该 workload 额外允许的 annotation 列表。
+    pub allowed_annotations: Vec<String>,
+    /// 该 workload 的默认资源预设。
+    pub resources: RuntimeWorkloadResources,
+}
+
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct RuntimeWorkloadResources {
+    /// 默认 CPU shares。
+    #[serde(rename = "cpushares")]
+    pub cpu_shares: i64,
+    /// 默认 CPU quota（微秒）。
+    #[serde(rename = "cpuquota")]
+    pub cpu_quota: i64,
+    /// 默认 CPU period（微秒）。
+    #[serde(rename = "cpuperiod")]
+    pub cpu_period: i64,
+    /// 默认 cpuset CPUs。
+    #[serde(rename = "cpuset")]
+    pub cpuset_cpus: String,
+    /// 默认 CPU limit（millicores）。
+    #[serde(rename = "cpulimit")]
+    pub cpu_limit: i64,
+}
+
+/// 守护进程 cgroup driver 配置。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CgroupDriverConfig {
+    Systemd,
+    Cgroupfs,
+}
 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
@@ -269,6 +494,96 @@ impl Default for ApiConfig {
             pod_sandbox_metrics_collection_period: 0,
             exec_sync_io_drain_timeout: std::time::Duration::ZERO, 
         }        
+    }
+}
+
+impl Default for RuntimeConfig {
+    fn default() -> Self {
+        Self {
+            runtime_type: "runc".to_string(),
+            runtime_path: "/usr/bin/runc".to_string(),
+            runtime_config_path: String::new(),
+            base_runtime_spec: String::new(),
+            root: DEFAULT_RUNTIME_STATE_DIR.to_string(),
+            platform_runtime_paths: HashMap::new(),
+            handlers: Vec::new(),
+            runtimes: HashMap::new(),
+            workloads: HashMap::new(),
+            pause_image: "registry.k8s.io/pause:3.9".to_string(),
+            pause_command: "/pause".to_string(),
+            pinns_path: String::new(),
+            drop_infra_ctr: false,
+            cgroup_driver: None,
+            shim_path: "/usr/bin/crius-shim".to_string(),
+            monitor_cgroup: String::new(),
+            shim_dir: DEFAULT_RUNTIME_SHIM_DIR.to_string(),
+            attach_socket_dir: DEFAULT_RUNTIME_ATTACH_SOCKET_DIR.to_string(),
+            container_exits_dir: DEFAULT_RUNTIME_CONTAINER_EXITS_DIR.to_string(),
+            clean_shutdown_file: DEFAULT_RUNTIME_CLEAN_SHUTDOWN_FILE.to_string(),
+            container_stop_timeout: MIN_CONTAINER_STOP_TIMEOUT_SECS,
+            version_file: DEFAULT_RUNTIME_VERSION_FILE.to_string(),
+            version_file_persist: DEFAULT_RUNTIME_VERSION_FILE_PERSIST.to_string(),
+            criu_path: String::new(),
+            criu_image_path: String::new(),
+            criu_work_path: String::new(),
+            enable_criu_support: true,
+            internal_wipe: true,
+            internal_repair: true,
+            bind_mount_prefix: String::new(),
+            disable_cgroup: false,
+            tolerate_missing_hugetlb_controller: true,
+            separate_pull_cgroup: String::new(),
+            uid_mappings: String::new(),
+            gid_mappings: String::new(),
+            minimum_mappable_uid: -1,
+            minimum_mappable_gid: -1,
+            io_uid: 0,
+            io_gid: 0,
+            pids_limit: -1,
+            infra_ctr_cpuset: String::new(),
+            shared_cpuset: String::new(),
+            exec_cpu_affinity: String::new(),
+            irqbalance_config_file: String::new(),
+            irqbalance_config_restore_file: "disable".to_string(),
+            read_only: false,
+            no_pivot: false,
+            no_new_keyring: false,
+            shim_debug: false,
+            monitor_env: Vec::new(),
+            default_env: Vec::new(),
+            default_capabilities: vec![
+                "CHOWN".to_string(),
+                "DAC_OVERRIDE".to_string(),
+                "FSETID".to_string(),
+                "FOWNER".to_string(),
+                "MKNOD".to_string(),
+                "NET_RAW".to_string(),
+                "SETGID".to_string(),
+                "SETUID".to_string(),
+                "SETFCAP".to_string(),
+                "SETPCAP".to_string(),
+                "NET_BIND_SERVICE".to_string(),
+                "SYS_CHROOT".to_string(),
+                "KILL".to_string(),
+                "AUDIT_WRITE".to_string(),
+            ],
+            default_sysctls: Vec::new(),
+            default_ulimits: Vec::new(),
+            allowed_devices: Vec::new(),
+            additional_devices: Vec::new(),
+            device_ownership_from_security_context: false,
+            add_inheritable_capabilities: false,
+            default_mounts_file: String::new(),
+            hooks_dir: Vec::new(),
+            absent_mount_sources_to_reject: Vec::new(),
+            disable_proc_mount: false,
+            timezone: String::new(),
+            log_to_journald: false,
+            no_sync_log: false,
+            restrict_oom_score_adj: false,
+            enable_unprivileged_ports: false,
+            enable_unprivileged_icmp: false,
+        }
     }
 }
 
