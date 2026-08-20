@@ -14,12 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
-
-pub mod error;
-pub mod config;
-pub mod defaults;
+pub const DEFAULT_CRI_SOCKET_URI :&str = "unix:///run/crius/crius.sock";
+pub const DEFAULT_CONTAINER_STORAGE_DIR: &str = "/var/lib/containers/storage";
+pub const DEFAULT_STORAGE_DRIVER: &str = "overlay";
+pub const DEFAULT_GRPC_MAX_MESSAGE_SIZE_BYTES: u32 = 80 * 1024 * 1024;
