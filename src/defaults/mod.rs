@@ -29,3 +29,5 @@ pub const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
 pub const DEFAULT_RUNTIME_VERSION_FILE_PERSIST: &str = "/var/lib/crius/version";
 
 pub const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
+
+pub const LOCAL_LOG_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%:z";

@@ -20,6 +20,7 @@ use std::result::Result::Ok;
 use std::os::unix::net::UnixListener;
 use std::os::unix::fs::symlink;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use anyhow::Error;
 use clap::Parser;
@@ -27,10 +28,12 @@ use tracing::{info, debug};
 use tonic::transport::Server;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio::net::UnixListener as TokioUnixListener;
+use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
 
 use crius::proto::runtime::v1::runtime_service_server::RuntimeServiceServer;
 
 use crius::config::Config;
+use crius::defaults::LOCAL_LOG_TIME_FORMAT;
 use crius::server::service::{RuntimeServiceImpl, RuntimeServiceConfig};
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
@@ -132,9 +135,9 @@ async fn main() -> Result<(), Error> {
     config.apply_env_overrides()?;
     apply_cli_overrides(&args, &mut config);
 
-    info!("Loaded configuration from {}", args.config.display());
+    init_logging(&config)?;
 
-    let runtime_name = config.runtime.runtime_type.clone();
+    info!("Loaded configuration from {}", args.config.display());
     
     let runtime_config = RuntimeServiceConfig::new(config.clone());
     let listen = config.api.listen.clone();
@@ -144,6 +147,7 @@ async fn main() -> Result<(), Error> {
     let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+
     // 注册路由
     let server = Server::builder()
         .add_service(runtime_service_server);    
@@ -246,4 +250,99 @@ async fn shutdown_signal() {
     {
         let _ = tokio::signal::ctrl_c().await;
     }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+struct LocalLogTimer;
+
+impl tracing_subscriber::fmt::time::FormatTime for LocalLogTimer {
+    fn format_time(
+        &self,
+        writer: &mut tracing_subscriber::fmt::format::Writer<'_>,
+    ) -> std::fmt::Result {
+        write!(
+            writer,
+            "{}",
+            chrono::Local::now().format(LOCAL_LOG_TIME_FORMAT)
+        )
+    }
+}
+
+#[derive(Clone)]
+enum LogOutput {
+    Stderr,
+    File(Arc<Mutex<std::fs::File>>),
+}
+
+impl LogOutput {
+    fn from_config(config: &Config) -> Result<Self, Error> {
+        if let Some(path) = &config.logging.file {
+            let path = PathBuf::from(path);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)?;
+            Ok(Self::File(Arc::new(Mutex::new(file))))
+        } else {
+            Ok(Self::Stderr)
+        }
+    }
+}
+
+struct LockedFileWriter {
+    file: Arc<Mutex<std::fs::File>>,
+}
+
+impl std::io::Write for LockedFileWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
+        std::io::Write::write(&mut *file, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut file = self
+            .file
+            .lock()
+            .map_err(|_| std::io::Error::other("log file mutex poisoned"))?;
+        std::io::Write::flush(&mut *file)
+    }
+}
+
+impl<'a> MakeWriter<'a> for LogOutput {
+    type Writer = Box<dyn std::io::Write + 'a>;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        match self {
+            Self::Stderr => Box::new(std::io::stderr()),
+            Self::File(file) => Box::new(LockedFileWriter { file: file.clone() }),
+        }
+    }
+}
+
+fn init_logging(config: &Config) -> Result<(), Error> {
+    let base_filter = EnvFilter::try_from_default_env().or_else(|_| {
+        EnvFilter::try_new(format!(
+            "crius={},tower_http=info",
+            config.logging.level.trim()
+        ))
+    })?;
+    let writer = LogOutput::from_config(config)?;
+    let fmt_layer = fmt::layer()
+        .with_timer(LocalLogTimer)
+        .with_file(true)
+        .with_line_number(true)
+        .with_writer(writer);
+
+    tracing_subscriber::registry()
+        .with(base_filter)
+        .with(fmt_layer)
+        .try_init()?;
+
+    Ok(())
 }
