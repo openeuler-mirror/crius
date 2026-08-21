@@ -23,12 +23,15 @@ use std::net::SocketAddr;
 
 use anyhow::Error;
 use clap::Parser;
-use tracing::info;
+use tracing::{info, debug};
 use tonic::transport::Server;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio::net::UnixListener as TokioUnixListener;
 
+use crius::proto::runtime::v1::runtime_service_server::RuntimeServiceServer;
+
 use crius::config::Config;
+use crius::server::service::{RuntimeServiceImpl, RuntimeServiceConfig};
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -129,12 +132,26 @@ async fn main() -> Result<(), Error> {
     config.apply_env_overrides()?;
     apply_cli_overrides(&args, &mut config);
 
-    let listen = config.api.listen.clone();
+    info!("Loaded configuration from {}", args.config.display());
 
-    let server = Server::builder();    
+    let runtime_name = config.runtime.runtime_type.clone();
+    
+    let runtime_config = RuntimeServiceConfig::new(config.clone());
+    let listen = config.api.listen.clone();
+    // 创建服务实例
+    let runtime_service =
+        RuntimeServiceImpl::new(runtime_config.clone());
+    let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
+        .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+        .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    // 注册路由
+    let server = Server::builder()
+        .add_service(runtime_service_server);    
 
     // 创建gRPC服务器
     info!("Starting crius gRPC server on {}", listen);
+    debug!("Using configuration: {:?}", runtime_config);
+
 
     if listen.starts_with("unix://") {
         // Unix domain socket

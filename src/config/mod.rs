@@ -626,6 +626,15 @@ impl Default for LoggingConfig {
     }    
 }
 
+impl CgroupDriverConfig {
+    pub fn as_proto(self) -> crate::proto::runtime::v1::CgroupDriver {
+        match self {
+            Self::Systemd => crate::proto::runtime::v1::CgroupDriver::Systemd,
+            Self::Cgroupfs => crate::proto::runtime::v1::CgroupDriver::Cgroupfs,
+        }
+    }
+}
+
 fn apply_string_override(env_name: &str, target: &mut String) {
     if let Some(value) = std::env::var_os(env_name) {
         *target = value.to_string_lossy().trim().to_string();
