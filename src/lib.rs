@@ -23,3 +23,11 @@ limitations under the License.
 pub mod error;
 pub mod config;
 pub mod defaults;
+pub mod server;
+pub mod proto {
+    pub mod runtime {
+        pub mod v1 {
+            tonic::include_proto!("runtime.v1");
+        }
+    }
+}
