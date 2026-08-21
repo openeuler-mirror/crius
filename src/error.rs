@@ -44,3 +44,9 @@ impl From<serde_json::Error> for Error {
         Error::Config(err.to_string())
     }
 }
+
+impl From<anyhow::Error> for Error {
+    fn from(err: anyhow::Error) -> Self {
+        Error::Config(err.to_string())
+    }
+}

@@ -23,6 +23,8 @@ use std::sync::{Arc as StdArc, Mutex as StdMutex};
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
 
+use crate::image::{ImageServiceOptions, ImageServiceImpl};
+
 /// 运行时配置
 #[derive(Debug, Clone)]
 pub struct RuntimeServiceConfig {
@@ -166,7 +168,7 @@ pub struct RuntimeServiceImpl {
     pub(super) removed_container_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) removed_pod_sandbox_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) config: RuntimeServiceConfig,
-    // pub(super) image_service: ImageServiceImpl,
+    pub(super) image_service: ImageServiceImpl,
     pub(super) shim_work_dir: PathBuf,
     pub(super) attach_socket_dir: PathBuf,
     pub(super) container_exits_dir: PathBuf,
@@ -180,7 +182,46 @@ impl RuntimeServiceImpl {
         let pod_sandboxes = Arc::new(Mutex::new(HashMap::new()));
         let container_names = StdArc::new(StdMutex::new(NameRegistry::default()));
         let pod_names = StdArc::new(StdMutex::new(NameRegistry::default()));
-        let mut config = config;
+        let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {
+            storage_path: config.image_root.clone(),
+            ledger_db_path: Some(config.root_dir.join("crius.db")),
+            storage_driver: config.image_driver.clone(),
+            storage_options: config.image_storage_options.clone(),
+            global_auth_file: (!config.image_global_auth_file.as_os_str().is_empty())
+                .then(|| config.image_global_auth_file.clone()),
+            namespaced_auth_dir: (!config.image_namespaced_auth_dir.as_os_str().is_empty())
+                .then(|| config.image_namespaced_auth_dir.clone()),
+            default_transport: config.image_default_transport.clone(),
+            short_name_mode: config.image_short_name_mode.clone(),
+            pull_progress_timeout: config.image_pull_progress_timeout,
+            max_concurrent_downloads: config.image_max_concurrent_downloads,
+            pull_retry_count: config.image_pull_retry_count,
+            registry_config_dir: (!config.image_registry_config_dir.as_os_str().is_empty())
+                .then(|| config.image_registry_config_dir.clone()),
+            decryption_keys_path: (!config.image_decryption_keys_path.as_os_str().is_empty())
+                .then(|| config.image_decryption_keys_path.clone()),
+            decryption_decoder_path: config.image_decryption_decoder_path.clone(),
+            decryption_keyprovider_config: (!config
+                .image_decryption_keyprovider_config
+                .as_os_str()
+                .is_empty())
+            .then(|| config.image_decryption_keyprovider_config.clone()),
+            additional_artifact_stores: config.image_additional_artifact_stores.clone(),
+            pinned_image_patterns: config.image_pinned_images.clone(),
+            signature_policy: (!config.image_signature_policy.as_os_str().is_empty())
+                .then(|| config.image_signature_policy.clone()),
+            signature_policy_dir: (!config.image_signature_policy_dir.as_os_str().is_empty())
+                .then(|| config.image_signature_policy_dir.clone()),
+            big_files_temporary_dir: (!config.image_big_files_temporary_dir.as_os_str().is_empty())
+                .then(|| config.image_big_files_temporary_dir.clone()),
+            separate_pull_cgroup: config.separate_pull_cgroup.clone(),
+            cgroup_driver: match config.cgroup_driver {
+                Some(CgroupDriver::Systemd) => crate::config::CgroupDriverConfig::Systemd,
+                _ => crate::config::CgroupDriverConfig::Cgroupfs,
+            },
+            disable_cgroup: config.disable_cgroup,
+        })
+        .expect("Failed to initialize image service");
         let service = Self { 
             containers, 
             pod_sandboxes, 
@@ -189,7 +230,7 @@ impl RuntimeServiceImpl {
             removed_container_ids: Arc::new(Mutex::new(HashSet::new())), 
             removed_pod_sandbox_ids: Arc::new(Mutex::new(HashSet::new())), 
             config, 
-            // image_service: (), 
+            image_service: image_service, 
             shim_work_dir: PathBuf::new(), 
             attach_socket_dir: PathBuf::new(), 
             container_exits_dir: PathBuf::new(), 
@@ -197,6 +238,10 @@ impl RuntimeServiceImpl {
             last_startup_clean_shutdown: Arc::new(Mutex::new(None)), 
         };
         service
+    }
+
+    pub fn image_service(&self) -> ImageServiceImpl {
+        self.image_service.clone()
     }
 }
 

@@ -145,9 +145,7 @@ async fn main() -> Result<(), Error> {
     // 创建服务实例
     let runtime_service =
         RuntimeServiceImpl::new(runtime_config.clone());
-    let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
-        .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
-        .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let image_service = runtime_service.image_service();
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(
             env!("OUT_DIR"),
@@ -155,7 +153,10 @@ async fn main() -> Result<(), Error> {
         )))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
-
+    
+    let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
+        .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+        .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
     // 注册路由
     let server = Server::builder()
         .add_service(runtime_service_server)

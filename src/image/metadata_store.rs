@@ -14,21 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
+use std::path::{Path, PathBuf};
 
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod proto {
-    pub mod runtime {
-        pub mod v1 {
-            tonic::include_proto!("runtime.v1");
+#[derive(Debug, Clone)]
+pub struct FilesystemImageMetadataStore {
+    storage_root: PathBuf,
+    additional_artifact_stores: Vec<PathBuf>,
+    ledger_db_path: Option<PathBuf>,
+}
+
+impl FilesystemImageMetadataStore {
+    pub fn new(
+        storage_root: impl AsRef<Path>,
+        additional_artifact_stores: Vec<PathBuf>,
+        ledger_db_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            storage_root: storage_root.as_ref().to_path_buf(),
+            additional_artifact_stores,
+            ledger_db_path,
         }
     }
 }
