@@ -26,6 +26,7 @@ use anyhow::Error;
 use clap::Parser;
 use tracing::{info, debug};
 use tonic::transport::Server;
+use tonic_reflection::server::Builder as ReflectionBuilder;
 use tokio_stream::wrappers::UnixListenerStream;
 use tokio::net::UnixListener as TokioUnixListener;
 use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
@@ -147,10 +148,18 @@ async fn main() -> Result<(), Error> {
     let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let reflection_service = ReflectionBuilder::configure()
+        .register_encoded_file_descriptor_set(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/file_descriptor_set.bin"
+        )))
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
 
     // 注册路由
     let server = Server::builder()
-        .add_service(runtime_service_server);    
+        .add_service(runtime_service_server)
+        .add_service(reflection_service);    
 
     // 创建gRPC服务器
     info!("Starting crius gRPC server on {}", listen);
