@@ -151,6 +151,77 @@ impl ImageServiceImpl {
             ledger_db_path,
         })
     }
+
+    fn has_registry_component(component: &str) -> bool {
+        component.contains('.') || component.contains(':') || component == "localhost"
+    }
+
+    pub fn resolve_pull_reference(&self, reference:&str) -> Result<String, Status> {
+        let raw = reference.trim();
+        if raw.is_empty() {
+            return Err(Status::invalid_argument(
+                "Image reference must not be empty",
+            ));
+        }
+
+        let transport = self.default_transport.trim();
+        let without_transport = if let Some(rest) = raw.strip_prefix("docker://") {
+            rest
+        } else if raw.contains("://") {
+            return Err(Status::invalid_argument(format!(
+                "unsupported image transport in reference {}",
+                raw
+            )));
+        } else {
+            raw
+        };
+
+        let first_component = without_transport.split('/').next().unwrap_or_default();
+        let is_short_name =
+            !without_transport.contains('/') || !Self::has_registry_component(first_component);
+        if is_short_name && self.short_name_mode == "enforcing" {
+            return Err(Status::invalid_argument(format!(
+                "short image names are rejected when image.short_name_mode = enforcing: {}",
+                raw
+            )));
+        }
+        if !transport.is_empty() && transport != "docker://" {
+            return Err(Status::invalid_argument(format!(
+                "unsupported image.default_transport {}",
+                transport
+            )));
+        }
+
+        Ok(Self::canonicalize_image_reference(without_transport))
+    }
+
+    fn canonicalize_image_reference(reference: &str) -> String {
+        let raw = reference.trim();
+        if raw.is_empty() || raw.starts_with("sha256:") {
+            return raw.to_string();
+        }
+
+        let mut normalized = if raw.split('/').count() == 1 {
+            format!("docker.io/library/{}", raw)
+        } else {
+            let mut parts = raw.splitn(2, '/');
+            let first = parts.next().unwrap_or_default();
+            let remainder = parts.next().unwrap_or_default();
+            if Self::has_registry_component(first) {
+                raw.to_string()
+            } else {
+                format!("docker.io/{}/{}", first, remainder)
+            }
+        };
+
+        let has_digest = normalized.contains('@');
+        let last_segment = normalized.rsplit('/').next().unwrap_or_default();
+        if !has_digest && !last_segment.contains(':') {
+            normalized.push_str(":latest");
+        }
+
+        normalized.into()
+    }
 }
 
 #[tonic::async_trait]
@@ -173,6 +244,13 @@ impl ImageService for ImageServiceImpl {
         &self,
         request: Request<PullImageRequest>,
     ) -> Result<Response<PullImageResponse>, Status> {
+        let req = request.into_inner();
+        let image_spec = req
+            .image
+            .ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
+        let requested_ref = image_spec.image.clone();
+        let canonical_ref = self.resolve_pull_reference(&requested_ref)?;
+
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
 
