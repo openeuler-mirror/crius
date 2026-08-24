@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 
+use std::time::Duration;
+
 pub const DEFAULT_CRI_SOCKET_URI :&str = "unix:///run/crius/crius.sock";
 pub const DEFAULT_CONTAINER_STORAGE_DIR: &str = "/var/lib/containers/storage";
 pub const DEFAULT_STORAGE_DRIVER: &str = "overlay";
@@ -31,3 +33,5 @@ pub const DEFAULT_RUNTIME_VERSION_FILE_PERSIST: &str = "/var/lib/crius/version";
 pub const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
 
 pub const LOCAL_LOG_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%:z";
+
+pub const SERVER_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);

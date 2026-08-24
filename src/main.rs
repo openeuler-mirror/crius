@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Error;
 use clap::Parser;
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 use tonic::transport::Server;
 use tonic_reflection::server::Builder as ReflectionBuilder;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -34,7 +34,7 @@ use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude:
 use crius::proto::runtime::v1::{runtime_service_server::RuntimeServiceServer, image_service_server::ImageServiceServer};
 
 use crius::config::Config;
-use crius::defaults::LOCAL_LOG_TIME_FORMAT;
+use crius::defaults::{LOCAL_LOG_TIME_FORMAT, SERVER_SHUTDOWN_GRACE_PERIOD};
 use crius::server::service::{RuntimeServiceImpl, RuntimeServiceConfig};
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
@@ -167,10 +167,11 @@ async fn main() -> Result<(), Error> {
         .add_service(reflection_service)
         .add_service(image_service_server);    
 
+    let shutdown_watchdog = spawn_shutdown_watchdog();
+
     // 创建gRPC服务器
     info!("Starting crius gRPC server on {}", listen);
     debug!("Using configuration: {:?}", runtime_config);
-
 
     if listen.starts_with("unix://") {
         // Unix domain socket
@@ -194,11 +195,15 @@ async fn main() -> Result<(), Error> {
 
         let serve_result = server
             .serve_with_incoming_shutdown(uds_stream, shutdown_signal()).await;
+        shutdown_watchdog.abort();
+        shutdown_runtime_service(&runtime_config.clean_shutdown_file).await;
         serve_result?;
     } else {
         let addr: SocketAddr = listen.parse()?;
         let serve_result = server.serve_with_shutdown(addr, shutdown_signal()).await;
         serve_result?;
+        shutdown_watchdog.abort();
+        shutdown_runtime_service(&runtime_config.clean_shutdown_file).await;
     }
 
     Ok(())
@@ -360,4 +365,31 @@ fn init_logging(config: &Config) -> Result<(), Error> {
         .try_init()?;
 
     Ok(())
+}
+
+fn spawn_shutdown_watchdog() -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async {
+        shutdown_signal().await;
+        info!("Shutdown signal received, initiating CRI server shutdown");
+        tokio::time::sleep(SERVER_SHUTDOWN_GRACE_PERIOD).await;
+        warn!(
+            "CRI server did not stop within {:?}; forcing process exit",
+            SERVER_SHUTDOWN_GRACE_PERIOD
+        );
+        std::process::exit(0);
+    })
+}
+
+async fn write_clean_shutdown_marker(path: &Path) -> Result<(), Error> {
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    tokio::fs::write(path, b"clean\n").await?;
+    Ok(())
+}
+
+async fn shutdown_runtime_service(clean_shutdown_file: &Path) {
+    if let Err(err) = write_clean_shutdown_marker(clean_shutdown_file).await {
+        log::error!("Failed to persist clean shutdown marker: {}", err);
+    }
 }
