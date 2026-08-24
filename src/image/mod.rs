@@ -24,8 +24,10 @@ use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Notify;
 use serde::{Serialize, Deserialize};
+use tonic::{Request, Response, Status};
 
-use crate::proto::runtime::v1::{Image};
+use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
+use crate::proto::runtime::v1::*;
 use crate::error::Error;
 
 use content_store::{FsContentStore, ContentTransferTracker};
@@ -148,6 +150,44 @@ impl ImageServiceImpl {
             pull_cgroup,
             ledger_db_path,
         })
+    }
+}
+
+#[tonic::async_trait]
+impl ImageService for ImageServiceImpl {
+    async fn list_images(
+        &self,
+        _request: Request<ListImagesRequest>,
+    ) -> Result<Response<ListImagesResponse>, Status> {
+        Err(tonic::Status::unimplemented("list image: not implemented"))
+    }
+
+    async fn image_status(
+        &self,
+        _request: Request<ImageStatusRequest>,
+    ) -> Result<Response<ImageStatusResponse>, Status> {
+        Err(tonic::Status::unimplemented("image status: not implemented"))
+    }
+
+    async fn pull_image(
+        &self,
+        request: Request<PullImageRequest>,
+    ) -> Result<Response<PullImageResponse>, Status> {
+        Err(tonic::Status::unimplemented("pull image: not implemented"))
+    }
+
+    async fn remove_image(
+        &self,
+        _request: Request<RemoveImageRequest>,
+    ) -> Result<Response<RemoveImageResponse>, Status> {
+        Err(tonic::Status::unimplemented("remove image: not implemented"))
+    }
+
+    async fn image_fs_info(
+        &self,
+        _request: Request<ImageFsInfoRequest>,
+    ) -> Result<Response<ImageFsInfoResponse>, Status> {
+        Err(tonic::Status::unimplemented("image fs info: not implemented"))
     }
 }
 
