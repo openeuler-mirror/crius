@@ -18,7 +18,7 @@ use std::{fs, path::Path};
 use std::str::FromStr;
 use std::collections::HashMap;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 use crate::defaults::*;
@@ -359,7 +359,7 @@ pub struct RuntimeWorkloadResources {
 }
 
 /// 守护进程 cgroup driver 配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Deserialize, Copy, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum CgroupDriverConfig {
     Systemd,

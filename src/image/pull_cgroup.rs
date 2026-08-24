@@ -19,8 +19,16 @@ use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
 use serde::{Serialize, Deserialize};
+use anyhow::Result;
 
 use crate::config::CgroupDriverConfig;
+
+#[derive(Debug, Clone)]
+pub enum PullCgroupTarget {
+    Disabled,
+    Pod { cgroup_parent: String },
+    Path(String),
+}
 
 #[derive(Debug, Clone)]
 pub struct PullCgroupExecutor {
@@ -62,6 +70,43 @@ impl PullCgroupExecutor {
             last_scope: Arc::new(RwLock::new(None)),
         }
     }
+
+    pub fn effective_config(&self) -> PullCgroupEffectiveConfig {
+        let enabled = self.mode != PullCgroupMode::Disabled
+            && !self.disabled_by_disable_cgroup;
+        PullCgroupEffectiveConfig {
+            configured: self.configured.clone(),
+            mode: self.mode.clone(),
+            enabled,
+            disable_cgroup_degraded: self.mode != PullCgroupMode::Disabled
+                && self.disabled_by_disable_cgroup,
+            cgroup_driver: self.cgroup_driver,
+        }
+    }
+
+    pub fn target_for_pod(&self, pod_cgroup_parent: Option<&str>) -> Result<PullCgroupTarget> {
+        if self.effective_config().enabled {
+            match self.mode {
+                PullCgroupMode::Disabled => Ok(PullCgroupTarget::Disabled),
+                PullCgroupMode::Path => Ok(PullCgroupTarget::Path(self.configured.clone())),
+                PullCgroupMode::Pod => {
+                    let cgroup_parent = pod_cgroup_parent
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "runtime.separate_pull_cgroup=pod requires sandbox linux.cgroup_parent"
+                            )
+                        })?;
+                    Ok(PullCgroupTarget::Pod {
+                        cgroup_parent: cgroup_parent.to_string(),
+                    })
+                }
+            }
+        } else {
+            Ok(PullCgroupTarget::Disabled)
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -85,6 +130,16 @@ pub struct PullCgroupScopeRecord {
     pub at_unix_millis: i64,
     pub started_at_unix_millis: i64,
     pub ended_at_unix_millis: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PullCgroupEffectiveConfig {
+    pub configured: String,
+    pub mode: PullCgroupMode,
+    pub enabled: bool,
+    pub disable_cgroup_degraded: bool,
+    pub cgroup_driver: CgroupDriverConfig,
 }
 
 pub fn parse_pull_cgroup_mode(raw: &str) -> PullCgroupMode {
