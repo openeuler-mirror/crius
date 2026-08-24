@@ -25,6 +25,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::Notify;
 use serde::{Serialize, Deserialize};
 use tonic::{Request, Response, Status};
+use oci_distribution::{Reference};
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
@@ -222,6 +223,17 @@ impl ImageServiceImpl {
 
         normalized.into()
     }
+
+    fn provided_registry_bearer_token(auth: &AuthConfig) -> Option<String> {
+        for candidate in [&auth.registry_token, &auth.identity_token] {
+            let token = candidate.trim();
+            if !token.is_empty() {
+                return Some(token.to_string());
+            }
+        }
+
+        None
+    }
 }
 
 #[tonic::async_trait]
@@ -250,6 +262,29 @@ impl ImageService for ImageServiceImpl {
             .ok_or_else(|| Status::invalid_argument("Image spec not specified"))?;
         let requested_ref = image_spec.image.clone();
         let canonical_ref = self.resolve_pull_reference(&requested_ref)?;
+
+        // 解析镜像引用
+        let reference: Reference = canonical_ref
+            .parse()
+            .map_err(|e| Status::invalid_argument(format!("Invalid image reference: {}", e)))?;
+        let supplied_bearer_token = req
+            .auth
+            .as_ref()
+            .and_then(Self::provided_registry_bearer_token);
+        let pull_namespace = req
+            .sandbox_config
+            .as_ref()
+            .and_then(|config| config.metadata.as_ref())
+            .map(|metadata| metadata.namespace.clone());
+        let pod_cgroup_parent = req
+            .sandbox_config
+            .as_ref()
+            .and_then(|config| config.linux.as_ref())
+            .map(|linux| linux.cgroup_parent.as_str());
+        let pull_cgroup_target = self
+            .pull_cgroup
+            .target_for_pod(pod_cgroup_parent)
+            .map_err(|err| Status::invalid_argument(err.to_string()))?;
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
