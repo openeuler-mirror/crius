@@ -21,6 +21,7 @@ pub mod pull_cgroup;
 use std::path::PathBuf;
 use std::collections::{HashMap};
 use std::sync::{Arc, RwLock};
+use std::path::Path;
 
 use tokio::sync::{Mutex, Notify};
 use serde::{Serialize, Deserialize};
@@ -28,7 +29,7 @@ use tonic::{Request, Response, Status};
 use oci_distribution::{secrets::RegistryAuth, Reference};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use std::path::Path;
+use log::info;
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
@@ -551,6 +552,81 @@ impl ImageServiceImpl {
 
         None
     }
+
+    fn load_image_metadata(&self, image_id: &str) -> Option<ImageMeta> {
+        self.metadata_store
+            .load_by_id(image_id)
+            .map(|record| record.meta)
+    }
+
+    // 保存镜像元数据
+    async fn save_image_metadata(&self, image: &CriusImage) -> Result<(), Error> {
+        self.metadata_store.save(image)?;
+        Ok(())
+    }
+
+    fn push_unique(target: &mut Vec<String>, value: &str) {
+        if !value.is_empty() && !target.iter().any(|existing| existing == value) {
+            target.push(value.to_string());
+        }
+    }
+
+    async fn persist_local_image_alias(
+        &self,
+        image: &Image,
+        requested_ref: &str,
+        canonical_ref: &str,
+    ) -> Result<(), Error> {
+        let Some(existing) = self.load_image_metadata(&image.id) else {
+            return Ok(());
+        };
+        let reloadable = self.current_reloadable_config();
+
+        let mut repo_tags = existing.repo_tags.clone();
+        Self::push_unique(&mut repo_tags, canonical_ref);
+        if requested_ref != canonical_ref {
+            Self::push_unique(&mut repo_tags, requested_ref);
+        }
+        repo_tags.sort();
+        repo_tags.dedup();
+
+        self.save_image_metadata(&CriusImage {
+            id: image.id.clone(),
+            repo_tags,
+            repo_digests: image.repo_digests.clone(),
+            size: image.size,
+            pinned: Self::image_is_pinned_by_patterns(
+                &reloadable.pinned_image_patterns,
+                image
+                    .repo_tags
+                    .iter()
+                    .map(String::as_str)
+                    .chain([canonical_ref, requested_ref]),
+            ),
+            pulled_at: existing.pulled_at,
+            source_reference: if requested_ref != canonical_ref {
+                Some(requested_ref.to_string())
+            } else {
+                existing.source_reference
+            },
+            os: existing.os,
+            architecture: existing.architecture,
+            config_user: existing.config_user,
+            config_env: existing.config_env,
+            config_entrypoint: existing.config_entrypoint,
+            config_cmd: existing.config_cmd,
+            config_working_dir: existing.config_working_dir,
+            annotations: existing.annotations,
+            declared_volumes: existing.declared_volumes,
+            manifest_media_type: existing.manifest_media_type,
+            selected_manifest_digest: existing.selected_manifest_digest,
+            selected_platform: existing.selected_platform,
+            stored_layers: existing.stored_layers,
+            artifact_type: existing.artifact_type,
+            artifact_blobs: existing.artifact_blobs,
+        })
+        .await
+    }
 }
 
 #[tonic::async_trait]
@@ -641,6 +717,24 @@ impl ImageService for ImageServiceImpl {
             }
 
             break;
+        }
+
+        info!("Pulling image: {}", canonical_ref);
+        info!("Checking whether image exists locally: {}", canonical_ref);
+        if let Some(existing_image) = self.find_local_image(&canonical_ref).await {
+            self.persist_local_image_alias(&existing_image, &requested_ref, &canonical_ref)
+                .await
+                .map_err(|e| Status::internal(format!("Failed to persist image alias: {}", e)))?;
+            if let Some(notify) = self.in_progress_pulls.lock().await.remove(&pull_key) {
+                notify.notify_waiters();
+            }
+            info!(
+                "Image already exists locally: {} -> {}",
+                canonical_ref, existing_image.id
+            );
+            return Ok(Response::new(PullImageResponse {
+                image_ref: existing_image.id,
+            }));
         }
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
@@ -762,6 +856,34 @@ pub struct ArtifactBlobMeta {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct ImageMeta {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub repo_digests: Vec<String>,
+    pub size: u64,
+    pub pinned: bool,
+    pub pulled_at: i64,
+    pub source_reference: Option<String>,
+    pub os: Option<String>,
+    pub architecture: Option<String>,
+    pub config_user: Option<String>,
+    pub config_env: Vec<String>,
+    pub config_entrypoint: Vec<String>,
+    pub config_cmd: Vec<String>,
+    pub config_working_dir: Option<String>,
+    pub annotations: HashMap<String, String>,
+    pub declared_volumes: Vec<String>,
+    pub manifest_media_type: Option<String>,
+    pub selected_manifest_digest: Option<String>,
+    pub selected_platform: Option<String>,
+    pub stored_layers: Vec<StoredLayerMeta>,
+    pub artifact_type: Option<String>,
+    pub artifact_blobs: Vec<ArtifactBlobMeta>,
+}
+
+/// 增加crius镜像定义
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct CriusImage {
     pub id: String,
     pub repo_tags: Vec<String>,
     pub repo_digests: Vec<String>,
