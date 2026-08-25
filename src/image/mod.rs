@@ -19,13 +19,16 @@ pub mod metadata_store;
 pub mod pull_cgroup;
 
 use std::path::PathBuf;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 use std::sync::{Arc, Mutex, RwLock};
 
 use tokio::sync::Notify;
 use serde::{Serialize, Deserialize};
 use tonic::{Request, Response, Status};
-use oci_distribution::{Reference};
+use oci_distribution::{secrets::RegistryAuth, Reference};
+use base64::Engine;
+use sha2::{Digest, Sha256};
+use std::path::Path;
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
@@ -234,6 +237,158 @@ impl ImageServiceImpl {
 
         None
     }
+
+    fn current_reloadable_config(&self) -> ReloadableImageConfig {
+        self.reloadable_config
+            .read()
+            .expect("image reloadable config lock poisoned")
+            .clone()
+    }
+
+    fn image_name_for_namespaced_auth(reference: &Reference) -> String {
+        format!(
+            "{}/{}",
+            reference.resolve_registry(),
+            reference.repository()
+        )
+    }
+
+    fn decode_auth_field(auth_field: &str) -> Option<(String, String)> {
+        let raw = auth_field.trim();
+        if raw.is_empty() {
+            return None;
+        }
+        let encoded = raw
+            .strip_prefix("Basic ")
+            .or_else(|| raw.strip_prefix("basic "))
+            .unwrap_or(raw);
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded.as_bytes())
+            .ok()?;
+        let decoded = String::from_utf8(decoded).ok()?;
+        let (username, password) = decoded.split_once(':')?;
+        Some((username.to_string(), password.to_string()))
+    }
+
+    fn registry_auth_from_auth_config(auth: AuthConfig) -> Result<RegistryAuth, Status> {
+        if !auth.username.is_empty() || !auth.password.is_empty() {
+            return Ok(RegistryAuth::Basic(auth.username, auth.password));
+        }
+
+        if !auth.auth.trim().is_empty() {
+            let (username, password) = Self::decode_auth_field(&auth.auth).ok_or_else(|| {
+                Status::invalid_argument(
+                    "Invalid auth.auth field: expected base64(username:password)",
+                )
+            })?;
+            return Ok(RegistryAuth::Basic(username, password));
+        }
+
+        Ok(RegistryAuth::Anonymous)
+    }
+
+    fn namespaced_auth_file_path(&self, namespace: &str, reference: &Reference) -> Option<PathBuf> {
+        let reloadable = self.current_reloadable_config();
+        let root = reloadable.namespaced_auth_dir.as_ref()?;
+        let namespace = namespace.trim();
+        if namespace.is_empty() {
+            return None;
+        }
+
+        let image_name = Self::image_name_for_namespaced_auth(reference);
+        let digest = format!("{:x}", Sha256::digest(image_name.as_bytes()));
+        Some(root.join(format!("{namespace}-{digest}.json")))
+    }
+
+    fn registry_auth_aliases(registry: &str) -> Vec<String> {
+        let normalized = Self::normalize_registry_key(registry);
+        match normalized.as_str() {
+            "docker.io" | "registry-1.docker.io" | "index.docker.io" => vec![
+                "docker.io".to_string(),
+                "registry-1.docker.io".to_string(),
+                "index.docker.io".to_string(),
+                "index.docker.io/v1".to_string(),
+                "index.docker.io/v1/".to_string(),
+                "https://index.docker.io/v1/".to_string(),
+            ],
+            _ => vec![normalized],
+        }
+    }
+
+    fn normalize_registry_key(value: &str) -> String {
+        value
+            .trim()
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_end_matches('/')
+            .trim_end_matches("/v1")
+            .trim_end_matches("/v1/")
+            .trim_end_matches("/v2")
+            .trim_end_matches("/v2/")
+            .trim_end_matches("/v1/_catalog")
+            .trim_end_matches("/v2/_catalog")
+            .to_ascii_lowercase()
+    }
+
+    fn registry_auth_from_docker_entry(entry: &DockerAuthEntry) -> Option<RegistryAuth> {
+        if !entry.username.trim().is_empty() || !entry.password.trim().is_empty() {
+            return Some(RegistryAuth::Basic(
+                entry.username.clone(),
+                entry.password.clone(),
+            ));
+        }
+
+        Self::decode_auth_field(&entry.auth)
+            .map(|(username, password)| RegistryAuth::Basic(username, password))
+    }
+
+    fn registry_auth_from_file(
+        path: &Path,
+        reference: &Reference,
+    ) -> Result<Option<RegistryAuth>, Status> {
+        let raw = std::fs::read(path).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to read auth file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        let config: DockerConfigFile = serde_json::from_slice(&raw).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to parse auth file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+
+        let aliases = Self::registry_auth_aliases(reference.resolve_registry());
+        for alias in aliases {
+            for (registry, entry) in &config.auths {
+                if Self::normalize_registry_key(registry) == alias {
+                    return Ok(Self::registry_auth_from_docker_entry(entry));
+                }
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn registry_auth_from_namespaced_auth_dir(
+        &self,
+        reference: &Reference,
+        namespace: Option<&str>,
+    ) -> Result<Option<RegistryAuth>, Status> {
+        let Some(path) =
+            namespace.and_then(|namespace| self.namespaced_auth_file_path(namespace, reference))
+        else {
+            return Ok(None);
+        };
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        Self::registry_auth_from_file(&path, reference)
+    }
 }
 
 #[tonic::async_trait]
@@ -285,6 +440,20 @@ impl ImageService for ImageServiceImpl {
             .pull_cgroup
             .target_for_pod(pod_cgroup_parent)
             .map_err(|err| Status::invalid_argument(err.to_string()))?;
+
+        let auth = match req.auth.clone() {
+            Some(auth) => Self::registry_auth_from_auth_config(auth)?,
+            None => {
+                if let Some(auth) = self
+                    .registry_auth_from_namespaced_auth_dir(&reference, pull_namespace.as_deref())?
+                {
+                    auth
+                } else {
+                    RegistryAuth::Anonymous
+                }
+            }
+        };
+
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
@@ -365,3 +534,18 @@ pub struct ImageServiceOptions {
     pub disable_cgroup: bool,
 }
 
+#[derive(Debug, Deserialize, Default)]
+struct DockerAuthEntry {
+    #[serde(default)]
+    auth: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct DockerConfigFile {
+    #[serde(default)]
+    auths: HashMap<String, DockerAuthEntry>,
+}
