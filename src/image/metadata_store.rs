@@ -18,8 +18,8 @@ limitations under the License.
 use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 
-use crate::image::ImageMeta;
-use crate::storage::{StorageManager, ImageRecord, ImageRefRecord};
+use crate::image::{ImageMeta, CriusImage};
+use crate::storage::{StorageManager, ImageRecord, ImageRefRecord, ContentBlobRefRecord};
 
 use super::Image;
 
@@ -139,6 +139,68 @@ impl FilesystemImageMetadataStore {
         }
         Ok(records)
     }
+
+    pub fn load_by_id(&self, image_id: &str) -> Option<StoredImageRecord> {
+        if let Some(db_path) = self.ledger_db_path.as_ref() {
+            if let Ok(storage) = StorageManager::new(db_path) {
+                if let Ok(Some(record)) = storage.get_image(image_id) {
+                    return Some(StoredImageRecord {
+                        meta: meta_from_record(
+                            &record,
+                            storage.list_image_refs(Some(image_id)).ok(),
+                        ),
+                        record_dir: record
+                            .cache_path
+                            .as_deref()
+                            .map(PathBuf::from)
+                            .unwrap_or_else(|| {
+                                Self::image_records_dir(&self.storage_root).join(image_id)
+                            }),
+                    });
+                }
+            }
+        }
+        self.load_all()
+            .ok()?
+            .into_iter()
+            .find(|record| record.meta.id == image_id)
+    }
+
+    pub fn local_record_dir(root: &Path, id: &str, artifact: bool) -> PathBuf {
+        if artifact {
+            Self::artifact_records_dir(root).join(id)
+        } else {
+            Self::image_records_dir(root).join(id)
+        }
+    }
+
+    pub fn image_record_dir(&self, image: &CriusImage) -> PathBuf {
+        Self::local_record_dir(
+            &self.storage_root,
+            &image.id,
+            image
+                .artifact_type
+                .as_ref()
+                .map(|value| !value.trim().is_empty())
+                .unwrap_or(false),
+        )
+    }
+
+    pub fn save(&self, image: &CriusImage) -> Result<PathBuf> {
+        if let Some(db_path) = self.ledger_db_path.as_ref() {
+            let mut storage = StorageManager::new(db_path)?;
+            storage.save_image(&image_to_record(image, self.image_record_dir(image)))?;
+            storage.replace_image_refs(&image.id, &image_to_refs(image))?;
+            storage.replace_content_blob_refs("image", &image.id, &image_to_blob_refs(image))?;
+        }
+        let record_dir = self.image_record_dir(image);
+        std::fs::create_dir_all(&record_dir)
+            .with_context(|| format!("failed to create {}", record_dir.display()))?;
+        let meta_path = record_dir.join("metadata.json");
+        std::fs::write(&meta_path, serde_json::to_vec(image)?)
+            .with_context(|| format!("failed to write {}", meta_path.display()))?;
+        Ok(record_dir)
+    }
 }
 
 fn meta_from_record(record: &ImageRecord, refs: Option<Vec<ImageRefRecord>>) -> ImageMeta {
@@ -179,6 +241,39 @@ fn meta_from_record(record: &ImageRecord, refs: Option<Vec<ImageRefRecord>>) -> 
     }
 }
 
+fn image_to_record(image: &CriusImage, cache_path: PathBuf) -> ImageRecord {
+    ImageRecord {
+        id: image.id.clone(),
+        size: image.size,
+        pinned: image.pinned,
+        pulled_at: image.pulled_at,
+        source_reference: image.source_reference.clone(),
+        os: image.os.clone(),
+        architecture: image.architecture.clone(),
+        config_user: image.config_user.clone(),
+        config_env_json: serde_json::to_string(&image.config_env)
+            .unwrap_or_else(|_| "[]".to_string()),
+        config_entrypoint_json: serde_json::to_string(&image.config_entrypoint)
+            .unwrap_or_else(|_| "[]".to_string()),
+        config_cmd_json: serde_json::to_string(&image.config_cmd)
+            .unwrap_or_else(|_| "[]".to_string()),
+        config_working_dir: image.config_working_dir.clone(),
+        annotations_json: serde_json::to_string(&image.annotations)
+            .unwrap_or_else(|_| "{}".to_string()),
+        declared_volumes_json: serde_json::to_string(&image.declared_volumes)
+            .unwrap_or_else(|_| "[]".to_string()),
+        manifest_media_type: image.manifest_media_type.clone(),
+        selected_manifest_digest: image.selected_manifest_digest.clone(),
+        selected_platform: image.selected_platform.clone(),
+        stored_layers_json: serde_json::to_string(&image.stored_layers)
+            .unwrap_or_else(|_| "[]".to_string()),
+        artifact_type: image.artifact_type.clone(),
+        artifact_blobs_json: serde_json::to_string(&image.artifact_blobs)
+            .unwrap_or_else(|_| "[]".to_string()),
+        cache_path: Some(cache_path.display().to_string()),
+    }
+}
+
 fn image_from_meta(meta: &ImageMeta) -> Image {
     let requested = meta
         .source_reference
@@ -205,4 +300,57 @@ fn image_from_meta(meta: &ImageMeta) -> Image {
             runtime_handler: String::new(),
         }),
     }
+}
+
+fn image_to_refs(image: &CriusImage) -> Vec<ImageRefRecord> {
+    let mut refs = Vec::new();
+    for reference in &image.repo_tags {
+        refs.push(ImageRefRecord {
+            reference: reference.clone(),
+            image_id: image.id.clone(),
+            namespace: None,
+            ref_kind: "tag".to_string(),
+        });
+    }
+    for reference in &image.repo_digests {
+        refs.push(ImageRefRecord {
+            reference: reference.clone(),
+            image_id: image.id.clone(),
+            namespace: None,
+            ref_kind: "digest".to_string(),
+        });
+    }
+    if let Some(reference) = image.source_reference.as_ref() {
+        refs.push(ImageRefRecord {
+            reference: reference.clone(),
+            image_id: image.id.clone(),
+            namespace: None,
+            ref_kind: "source".to_string(),
+        });
+    }
+    refs
+}
+
+fn image_to_blob_refs(image: &CriusImage) -> Vec<ContentBlobRefRecord> {
+    let layer_refs = image
+        .stored_layers
+        .iter()
+        .filter(|layer| !layer.digest.trim().is_empty())
+        .map(|layer| ContentBlobRefRecord {
+            owner_kind: "image".to_string(),
+            owner_id: image.id.clone(),
+            digest: layer.digest.clone(),
+            ref_kind: "layer".to_string(),
+        });
+    let artifact_refs = image
+        .artifact_blobs
+        .iter()
+        .filter(|blob| !blob.digest.trim().is_empty())
+        .map(|blob| ContentBlobRefRecord {
+            owner_kind: "image".to_string(),
+            owner_id: image.id.clone(),
+            digest: blob.digest.clone(),
+            ref_kind: "artifact".to_string(),
+        });
+    layer_refs.chain(artifact_refs).collect()
 }

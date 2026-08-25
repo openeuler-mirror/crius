@@ -58,6 +58,29 @@ impl StorageManager {
     pub fn list_image_refs(&self, image_id: Option<&str>) -> Result<Vec<ImageRefRecord>> {
         todo!("查询存储中镜像列索引")
     }
+
+    pub fn get_image(&self, image_id: &str) -> Result<Option<ImageRecord>> {
+        todo!("从存储中查询镜像")
+    }
+
+    pub fn save_image(&mut self, record: &ImageRecord) -> Result<()> {
+        todo!("将镜像记录保存至存储")
+    }
+
+    pub fn replace_image_refs(&mut self, image_id: &str, refs: &[ImageRefRecord]) -> Result<()> {
+        todo!("刷新存储中镜像引用")
+    }
+
+    pub fn replace_content_blob_refs(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        records: &[ContentBlobRefRecord],
+    ) -> Result<()> {
+        todo!("刷新存储中blob引用记录")
+    }
+
+
 }
 
 /// 镜像记录
@@ -92,5 +115,14 @@ pub struct ImageRefRecord {
     pub reference: String,
     pub image_id: String,
     pub namespace: Option<String>,
+    pub ref_kind: String,
+}
+
+/// 内容 blob 引用记录
+#[derive(Debug, Clone)]
+pub struct ContentBlobRefRecord {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub digest: String,
     pub ref_kind: String,
 }
