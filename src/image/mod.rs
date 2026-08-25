@@ -20,9 +20,9 @@ pub mod pull_cgroup;
 
 use std::path::PathBuf;
 use std::collections::{HashMap};
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 
-use tokio::sync::Notify;
+use tokio::sync::{Mutex, Notify};
 use serde::{Serialize, Deserialize};
 use tonic::{Request, Response, Status};
 use oci_distribution::{secrets::RegistryAuth, Reference};
@@ -389,6 +389,168 @@ impl ImageServiceImpl {
 
         Self::registry_auth_from_file(&path, reference)
     }
+
+    fn normalize_image_id(id: &str) -> &str {
+        id.strip_prefix("sha256:").unwrap_or(id)
+    }
+
+    fn image_id_matches(image_id: &str, candidate: &str) -> bool {
+        if image_id == candidate {
+            return true;
+        }
+
+        let normalized_image_id = Self::normalize_image_id(image_id);
+        let normalized_candidate = Self::normalize_image_id(candidate);
+
+        normalized_image_id == normalized_candidate
+            || normalized_image_id.starts_with(normalized_candidate)
+            || normalized_candidate.starts_with(normalized_image_id)
+    }
+
+    fn image_matches_ref(image: &Image, requested_ref: &str) -> bool {
+        let canonical_requested = Self::canonicalize_image_reference(requested_ref);
+        Self::image_id_matches(&image.id, requested_ref)
+            || image.repo_tags.iter().any(|tag| {
+                let canonical_tag = Self::canonicalize_image_reference(tag);
+                tag == requested_ref
+                    || canonical_tag == canonical_requested
+                    || tag.starts_with(requested_ref)
+                    || requested_ref.starts_with(tag)
+                    || canonical_tag.starts_with(&canonical_requested)
+                    || canonical_requested.starts_with(&canonical_tag)
+            })
+            || image.repo_digests.iter().any(|digest| {
+                digest == requested_ref
+                    || digest.starts_with(requested_ref)
+                    || requested_ref.starts_with(digest)
+            })
+    }
+
+    fn registry_auth_from_global_auth_file(
+        &self,
+        reference: &Reference,
+    ) -> Result<Option<RegistryAuth>, Status> {
+        let reloadable = self.current_reloadable_config();
+        let Some(path) = reloadable.global_auth_file.as_ref() else {
+            return Ok(None);
+        };
+
+        Self::registry_auth_from_file(path, reference)
+    }
+
+    fn pinned_pattern_matches(pattern: &str, candidate: &str) -> bool {
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return false;
+        }
+        if pattern.starts_with('*') && pattern.ends_with('*') && pattern.len() > 2 {
+            return candidate.contains(&pattern[1..pattern.len() - 1]);
+        }
+        if let Some(prefix) = pattern.strip_suffix('*') {
+            return candidate.starts_with(prefix);
+        }
+        candidate == pattern
+    }
+
+    fn image_is_pinned_by_patterns<'a>(
+        patterns: &[String],
+        refs: impl IntoIterator<Item = &'a str>,
+    ) -> bool {
+        let refs: Vec<&str> = refs.into_iter().collect();
+        patterns.iter().any(|pattern| {
+            refs.iter()
+                .copied()
+                .any(|candidate| Self::pinned_pattern_matches(pattern, candidate))
+        })
+    }
+
+    fn image_is_pinned_meta(&self, meta: &ImageMeta) -> bool {
+        let mut refs = meta
+            .repo_tags
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        refs.extend(meta.repo_digests.iter().map(String::as_str));
+        if let Some(source_reference) = meta.source_reference.as_deref() {
+            refs.push(source_reference);
+        }
+        let reloadable = self.current_reloadable_config();
+        Self::image_is_pinned_by_patterns(&reloadable.pinned_image_patterns, refs)
+    }
+
+    fn image_user_fields_from_config_user(
+        config_user: Option<&str>,
+    ) -> (Option<Int64Value>, String) {
+        let Some(config_user) = config_user
+            .map(str::trim)
+            .filter(|config_user| !config_user.is_empty())
+        else {
+            return (None, String::new());
+        };
+
+        let user = config_user.split(':').next().unwrap_or(config_user).trim();
+        if user.is_empty() {
+            return (None, String::new());
+        }
+
+        match user.parse::<i64>() {
+            Ok(uid) => (Some(Int64Value { value: uid }), String::new()),
+            Err(_) => (None, user.to_string()),
+        }
+    }
+
+    fn image_from_meta(meta: &ImageMeta) -> Image {
+        let (uid, username) = Self::image_user_fields_from_config_user(meta.config_user.as_deref());
+        let mut image = Image {
+            id: meta.id.clone(),
+            repo_tags: meta.repo_tags.clone(),
+            repo_digests: meta.repo_digests.clone(),
+            size: meta.size,
+            uid,
+            username,
+            pinned: meta.pinned,
+            spec: meta.repo_tags.first().map(|tag| ImageSpec {
+                image: tag.clone(),
+                user_specified_image: tag.clone(),
+                annotations: meta.annotations.clone(),
+                ..Default::default()
+            }),
+        };
+        image.repo_tags.sort();
+        image.repo_tags.dedup();
+        image.repo_digests.sort();
+        image.repo_digests.dedup();
+        image
+    }
+
+    async fn find_local_image(&self, image_ref: &str) -> Option<Image> {
+        let canonical_ref = Self::canonicalize_image_reference(image_ref);
+        {
+            let images = self.images.lock().await;
+            if let Some(image) = images.get(image_ref) {
+                return Some(image.clone());
+            }
+            if let Some(image) = images.get(&canonical_ref) {
+                return Some(image.clone());
+            }
+        }
+
+        if let Ok(Some(record)) = self
+            .metadata_store
+            .find_by_reference(image_ref, Self::image_matches_ref)
+        {
+            let mut meta = record.meta;
+            meta.pinned = self.image_is_pinned_meta(&meta);
+            let image = Self::image_from_meta(&meta);
+            let mut images = self.images.lock().await;
+            for tag in &meta.repo_tags {
+                images.insert(tag.clone(), image.clone());
+            }
+            return Some(image);
+        }
+
+        None
+    }
 }
 
 #[tonic::async_trait]
@@ -448,12 +610,38 @@ impl ImageService for ImageServiceImpl {
                     .registry_auth_from_namespaced_auth_dir(&reference, pull_namespace.as_deref())?
                 {
                     auth
+                } else if let Some(auth) = self.registry_auth_from_global_auth_file(&reference)? {
+                    auth
                 } else {
                     RegistryAuth::Anonymous
                 }
             }
         };
+        let pull_key = canonical_ref.clone();
 
+        loop {
+            let wait_for_existing = {
+                let mut in_progress = self.in_progress_pulls.lock().await;
+                if let Some(notify) = in_progress.get(&pull_key) {
+                    Some(notify.clone())
+                } else {
+                    in_progress.insert(pull_key.clone(), Arc::new(Notify::new()));
+                    None
+                }
+            };
+
+            if let Some(notify) = wait_for_existing {
+                notify.notified().await;
+                if let Some(existing_image) = self.find_local_image(&pull_key).await {
+                    return Ok(Response::new(PullImageResponse {
+                        image_ref: existing_image.id,
+                    }));
+                }
+                continue;
+            }
+
+            break;
+        }
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
@@ -548,4 +736,52 @@ struct DockerAuthEntry {
 struct DockerConfigFile {
     #[serde(default)]
     auths: HashMap<String, DockerAuthEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct StoredLayerMeta {
+    #[serde(default)]
+    pub digest: String,
+    pub path: String,
+    pub media_type: String,
+    pub source_media_type: String,
+    pub encrypted: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ArtifactBlobMeta {
+    pub digest: String,
+    pub media_type: String,
+    pub path: String,
+    pub size: u64,
+    pub annotations: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct ImageMeta {
+    pub id: String,
+    pub repo_tags: Vec<String>,
+    pub repo_digests: Vec<String>,
+    pub size: u64,
+    pub pinned: bool,
+    pub pulled_at: i64,
+    pub source_reference: Option<String>,
+    pub os: Option<String>,
+    pub architecture: Option<String>,
+    pub config_user: Option<String>,
+    pub config_env: Vec<String>,
+    pub config_entrypoint: Vec<String>,
+    pub config_cmd: Vec<String>,
+    pub config_working_dir: Option<String>,
+    pub annotations: HashMap<String, String>,
+    pub declared_volumes: Vec<String>,
+    pub manifest_media_type: Option<String>,
+    pub selected_manifest_digest: Option<String>,
+    pub selected_platform: Option<String>,
+    pub stored_layers: Vec<StoredLayerMeta>,
+    pub artifact_type: Option<String>,
+    pub artifact_blobs: Vec<ArtifactBlobMeta>,
 }
