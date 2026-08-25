@@ -18,7 +18,7 @@ limitations under the License.
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 
-use serde::{Serialize, Deserialize};
+use serde::{Serialize};
 use anyhow::Result;
 
 use crate::config::CgroupDriverConfig;
