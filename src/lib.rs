@@ -25,6 +25,7 @@ pub mod config;
 pub mod defaults;
 pub mod server;
 pub mod image;
+pub mod storage;
 pub mod proto {
     pub mod runtime {
         pub mod v1 {
