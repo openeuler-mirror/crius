@@ -35,3 +35,33 @@ pub const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
 pub const LOCAL_LOG_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%:z";
 
 pub const SERVER_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+pub const MAX_INTERNAL_EVENT_DETAIL_BYTES: usize = 16 * 1024;
+
+pub const INTERNAL_EVENT_PREFIXES: &[&str] = &[
+    "pod.",
+    "container.",
+    "image.",
+    "network.",
+    "gc.",
+    "backend.",
+    "task.",
+    "shim.",
+    "exec.",
+    "attach.",
+    "reconcile.",
+    "orphan_cleanup.",
+];
+
+pub const INTERNAL_EVENT_SUBJECT_KINDS: &[&str] = &[
+    "pod",
+    "container",
+    "image",
+    "network",
+    "gc",
+    "backend",
+    "task",
+    "shim",
+    "reconcile",
+    "orphan_cleanup",
+];

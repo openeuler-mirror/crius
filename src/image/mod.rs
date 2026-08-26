@@ -36,6 +36,7 @@ use crate::proto::runtime::v1::*;
 use crate::error::Error;
 use crate::image::content_store::{RemoteContentProviderKind, ContentTransferRecord};
 use crate::storage::StorageManager;
+use crate::service::event::{InternalEventSeverity, InternalEvent, LedgerInternalEventSink};
 
 use content_store::{FsContentStore, ContentTransferTracker};
 use metadata_store::FilesystemImageMetadataStore;
@@ -649,6 +650,22 @@ impl ImageServiceImpl {
             .and_then(|mut storage| storage.save_content_transfer(&record))
             .map_err(|err| Error::Storage(format!("failed to persist content transfer: {err}")))
     }
+
+    fn publish_image_internal_event(
+        &self,
+        image_ref: &str,
+        kind: &str,
+        severity: InternalEventSeverity,
+        details: serde_json::Value,
+    ) {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return;
+        };
+        let event = InternalEvent::new(kind, "image", image_ref, severity, details);
+        if let Err(err) = LedgerInternalEventSink::new(db_path).publish(&event) {
+            log::debug!("Failed to publish image internal event {kind} for {image_ref}: {err}");
+        }
+    }
 }
 
 #[tonic::async_trait]
@@ -771,6 +788,31 @@ impl ImageService for ImageServiceImpl {
         let transfer_id = transfer.id().to_string();
         self.persist_content_transfer_by_id(&transfer_id)
             .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_start",
+            InternalEventSeverity::Info,
+            serde_json::json!({
+                "requestedRef": requested_ref,
+                "canonicalRef": canonical_ref,
+                "transferId": transfer_id,
+                "provider": self.transfer_provider_kind().as_str(),
+            }),
+        );
+        transfer.update("pulling", 0, 0);
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
+        self.publish_image_internal_event(
+            &canonical_ref,
+            "image.pull_progress",
+            InternalEventSeverity::Info,
+            serde_json::json!({
+                "transferId": transfer_id,
+                "stage": "pulling",
+                "bytesCompleted": 0,
+                "bytesTotal": 0,
+            }),
+        );
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }

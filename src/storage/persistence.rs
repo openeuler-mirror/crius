@@ -14,23 +14,23 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
+use crate::storage::StorageManager;
 
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod storage;
-pub mod service;
-pub mod proto {
-    pub mod runtime {
-        pub mod v1 {
-            tonic::include_proto!("runtime.v1");
-        }
-    }
+/// 状态持久化配置
+#[derive(Debug, Clone)]
+pub struct PersistenceConfig {
+    /// 数据库文件路径
+    pub db_path: std::path::PathBuf,
+    /// 是否启用状态恢复
+    pub enable_recovery: bool,
+    /// 自动保存间隔（秒）
+    pub auto_save_interval: u64,
+}
+
+/// 持久化管理器
+#[derive(Debug)]
+pub struct PersistenceManager {
+    storage: StorageManager,
+    _config: PersistenceConfig,
 }

@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 
+pub mod persistence;
+
 use std::{path::Path, todo};
 
 use anyhow::{Context, Result};
@@ -87,6 +89,9 @@ impl StorageManager {
         todo!("存储传输记录")
     }
 
+    pub fn append_typed_event_at(&mut self, input: TypedEventInput<'_>) -> Result<()> {
+        todo!("在存储中追加事件")
+    }
 
 }
 
@@ -132,4 +137,14 @@ pub struct ContentBlobRefRecord {
     pub owner_id: String,
     pub digest: String,
     pub ref_kind: String,
+}
+
+pub struct TypedEventInput<'a> {
+    pub event_type: &'a str,
+    pub entity_type: &'a str,
+    pub entity_id: &'a str,
+    pub old_state: Option<&'a str>,
+    pub new_state: Option<&'a str>,
+    pub details: Option<&'a str>,
+    pub timestamp: i64,
 }
