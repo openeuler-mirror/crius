@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::todo;
 
 use anyhow::{Context, Result};
 use serde::{Serialize, Deserialize};
@@ -90,6 +91,18 @@ impl ContentTransferTracker {
             finished: false,
         }
     }
+
+    pub fn record(&self, id: &str) -> Option<ContentTransferRecord> {
+        let Ok(inner) = self.inner.lock() else {
+            return None;
+        };
+        inner
+            .active
+            .iter()
+            .chain(inner.recent.iter())
+            .find(|record| record.id == id)
+            .cloned()
+    }
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +124,13 @@ pub struct ContentTransferRecord {
     pub started_at_unix_nanos: i64,
     pub finished_at_unix_nanos: Option<i64>,
     pub error: Option<String>,
+}
+
+impl ContentTransferRecord {
+    
+    pub fn to_storage(&self) -> ContentTransferRecord {
+        todo!("若存储时需要对struct进行处理，再对记录中元素转换")
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -135,6 +155,12 @@ pub struct ContentTransferGuard {
     id: String,
     tracker: ContentTransferTracker,
     finished: bool,
+}
+
+impl ContentTransferGuard {
+    pub fn id(&self) -> &str {
+        &self.id
+    }
 }
 
 

@@ -27,6 +27,10 @@ pub enum Error {
     /// 配置错误
     #[error("config error: {0}")]
     Config(String),
+
+    /// 存储错误
+    #[error("Storage error: {0}")]
+    Storage(String),
 }
 
 /// 本 crate 统一使用的 `Result` 类型别名。
