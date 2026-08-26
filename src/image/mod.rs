@@ -34,6 +34,7 @@ use log::info;
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
 use crate::error::Error;
+use crate::image::content_store::RemoteContentProviderKind;
 
 use content_store::{FsContentStore, ContentTransferTracker};
 use metadata_store::FilesystemImageMetadataStore;
@@ -627,6 +628,10 @@ impl ImageServiceImpl {
         })
         .await
     }
+
+    fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
+        RemoteContentProviderKind::Registry
+    }
 }
 
 #[tonic::async_trait]
@@ -736,6 +741,16 @@ impl ImageService for ImageServiceImpl {
                 image_ref: existing_image.id,
             }));
         }
+
+        info!(
+            "Local image not found, start remote pull: {}",
+            canonical_ref
+        );
+        let transfer = self.transfer_tracker.start(
+            canonical_ref.clone(),
+            self.transfer_provider_kind(),
+            "resolving",
+        );
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }

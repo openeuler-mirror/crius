@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result};
 use serde::{Serialize, Deserialize};
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct FsContentStore {
@@ -60,6 +61,35 @@ impl ContentTransferTracker {
         let tracker = Self::default();
         Ok(tracker)
     }
+
+    pub fn start(
+        &self,
+        source: impl Into<String>,
+        provider: RemoteContentProviderKind,
+        stage: impl Into<String>,
+    ) -> ContentTransferGuard {
+        let record = ContentTransferRecord {
+            id: Uuid::new_v4().to_string(),
+            source: source.into(),
+            provider,
+            state: TransferState::Running,
+            current_stage: stage.into(),
+            bytes_total: 0,
+            bytes_completed: 0,
+            started_at_unix_nanos: now_unix_nanos(),
+            finished_at_unix_nanos: None,
+            error: None,
+        };
+        let id = record.id.clone();
+        if let Ok(mut inner) = self.inner.lock() {
+            inner.active.push(record);
+        }
+        ContentTransferGuard {
+            id,
+            tracker: self.clone(),
+            finished: false,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -98,4 +128,16 @@ pub enum TransferState {
     Succeeded,
     Failed,
     Interrupted,
+}
+
+#[derive(Debug)]
+pub struct ContentTransferGuard {
+    id: String,
+    tracker: ContentTransferTracker,
+    finished: bool,
+}
+
+
+fn now_unix_nanos() -> i64 {
+    chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
 }
