@@ -34,7 +34,8 @@ use log::info;
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
 use crate::error::Error;
-use crate::image::content_store::RemoteContentProviderKind;
+use crate::image::content_store::{RemoteContentProviderKind, ContentTransferRecord};
+use crate::storage::StorageManager;
 
 use content_store::{FsContentStore, ContentTransferTracker};
 use metadata_store::FilesystemImageMetadataStore;
@@ -632,6 +633,22 @@ impl ImageServiceImpl {
     fn transfer_provider_kind(&self) -> RemoteContentProviderKind {
         RemoteContentProviderKind::Registry
     }
+
+    fn persist_content_transfer_by_id(&self, transfer_id: &str) -> Result<(), Error> {
+        let Some(record) = self.transfer_tracker.record(transfer_id) else {
+            return Ok(());
+        };
+        self.persist_content_transfer_record(&record)
+    }
+
+    fn persist_content_transfer_record(&self, record: &ContentTransferRecord) -> Result<(), Error> {
+        let Some(db_path) = self.ledger_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(db_path)
+            .and_then(|mut storage| storage.save_content_transfer(&record))
+            .map_err(|err| Error::Storage(format!("failed to persist content transfer: {err}")))
+    }
 }
 
 #[tonic::async_trait]
@@ -751,6 +768,9 @@ impl ImageService for ImageServiceImpl {
             self.transfer_provider_kind(),
             "resolving",
         );
+        let transfer_id = transfer.id().to_string();
+        self.persist_content_transfer_by_id(&transfer_id)
+            .map_err(|err| Status::internal(err.to_string()))?;
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }

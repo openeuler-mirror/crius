@@ -16,9 +16,12 @@ limitations under the License.
 
 
 use std::{path::Path, todo};
+
 use anyhow::{Context, Result};
 use log::info;
 use rusqlite::Connection;
+
+use crate::image::content_store::ContentTransferRecord;
 
 /// 存储管理器
 #[derive(Debug)]
@@ -78,6 +81,10 @@ impl StorageManager {
         records: &[ContentBlobRefRecord],
     ) -> Result<()> {
         todo!("刷新存储中blob引用记录")
+    }
+
+    pub fn save_content_transfer(&self, record: &ContentTransferRecord) -> Result<()> {
+        todo!("存储传输记录")
     }
 
 
