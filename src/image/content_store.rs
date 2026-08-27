@@ -103,6 +103,17 @@ impl ContentTransferTracker {
             .find(|record| record.id == id)
             .cloned()
     }
+
+    fn update(&self, id: &str, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        if let Some(record) = inner.active.iter_mut().find(|record| record.id == id) {
+            record.current_stage = stage.into();
+            record.bytes_completed = bytes_completed;
+            record.bytes_total = bytes_total;
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -141,6 +152,16 @@ pub enum RemoteContentProviderKind {
     Local,
 }
 
+impl RemoteContentProviderKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Registry => "registry",
+            Self::Test => "test",
+            Self::Local => "local",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum TransferState {
@@ -160,6 +181,11 @@ pub struct ContentTransferGuard {
 impl ContentTransferGuard {
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn update(&self, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
+        self.tracker
+            .update(&self.id, stage, bytes_completed, bytes_total);
     }
 }
 

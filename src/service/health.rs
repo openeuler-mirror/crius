@@ -14,23 +14,6 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
-
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod storage;
-pub mod service;
-pub mod proto {
-    pub mod runtime {
-        pub mod v1 {
-            tonic::include_proto!("runtime.v1");
-        }
-    }
-}
+#[derive(Debug, Clone, Default)]
+pub struct HealthService;
