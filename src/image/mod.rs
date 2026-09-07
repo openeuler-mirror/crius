@@ -22,6 +22,7 @@ use std::path::PathBuf;
 use std::collections::{HashMap};
 use std::sync::{Arc, RwLock};
 use std::path::Path;
+use std::unimplemented;
 
 use tokio::sync::{Mutex, Notify};
 use serde::{Serialize, Deserialize};
@@ -805,6 +806,207 @@ impl ImageServiceImpl {
         }
         Ok(endpoints)
     }
+
+    fn apply_basic_auth(
+        builder: reqwest::RequestBuilder,
+        auth: &RegistryAuth,
+    ) -> reqwest::RequestBuilder {
+        match auth {
+            RegistryAuth::Basic(username, password) => builder.basic_auth(username, Some(password)),
+            RegistryAuth::Anonymous => builder,
+        }
+    }
+
+    fn parse_bearer_challenge(header: &str) -> Option<(String, Option<String>)> {
+        let raw = header.trim();
+        if !raw.to_ascii_lowercase().starts_with("bearer ") {
+            return None;
+        }
+        let fields = &raw[7..];
+        let mut realm: Option<String> = None;
+        let mut service: Option<String> = None;
+        for part in fields.split(',') {
+            let mut kv = part.trim().splitn(2, '=');
+            let key = kv.next()?.trim();
+            let value = kv.next()?.trim().trim_matches('"').to_string();
+            match key {
+                "realm" => realm = Some(value),
+                "service" => service = Some(value),
+                _ => {}
+            }
+        }
+        realm.map(|r| (r, service))
+    }
+
+    async fn request_bearer_token(
+        http: &reqwest::Client,
+        challenge: &str,
+        reference: &Reference,
+        auth: &RegistryAuth,
+    ) -> Result<Option<String>, Status> {
+        let (realm, service) = Self::parse_bearer_challenge(challenge)
+            .ok_or_else(|| Status::internal("invalid bearer challenge"))?;
+        let scope = format!("repository:{}:pull", reference.repository());
+        info!("Requesting bearer token, scope={}", scope);
+        let mut token_req = http.get(&realm).query(&[("scope", scope.as_str())]);
+        if let Some(s) = service.as_deref() {
+            token_req = token_req.query(&[("service", s)]);
+        }
+        token_req = Self::apply_basic_auth(token_req, auth);
+        let token_resp = token_req
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("token request failed: {}", e)))?;
+        if !token_resp.status().is_success() {
+            let status = token_resp.status();
+            let text = token_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "token request failed: {} {}",
+                status, text
+            )));
+        }
+        let token_json: serde_json::Value = token_resp
+            .json()
+            .await
+            .map_err(|e| Status::internal(format!("invalid token response: {}", e)))?;
+        Ok(token_json
+            .get("token")
+            .or_else(|| token_json.get("access_token"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()))
+    }
+
+    async fn pull_via_registry_api(
+        &self,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        initial_bearer_token: Option<&str>,
+    ) -> Result<(String, u64, Vec<PulledLayerData>, PulledImageMetadata), Status> {
+        let mut last_error = None;
+        for endpoint in self.registry_endpoints_for(reference, true)? {
+            match self
+                .pull_via_registry_api_with_endpoint(
+                    &endpoint,
+                    reference,
+                    auth,
+                    initial_bearer_token,
+                )
+                .await
+            {
+                Ok(result) => return Ok(result),
+                Err(err) => {
+                    warn!(
+                        "Registry endpoint {} failed for {}: {}",
+                        endpoint.base_url,
+                        reference,
+                        err.message()
+                    );
+                    last_error = Some(err);
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            Status::internal(format!("no usable registry endpoints for {}", reference))
+        }))
+    }
+
+    /// 通过 Registry HTTP API 拉取镜像（单端点）。
+    async fn pull_via_registry_api_with_endpoint(
+        &self,
+        endpoint: &RegistryEndpoint,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        initial_bearer_token: Option<&str>,
+    ) -> Result<(String, u64, Vec<PulledLayerData>, PulledImageMetadata), Status> {
+        info!(
+            "Using registry API pull flow for {} via {}",
+            reference, endpoint.base_url
+        );
+
+        // 1. 构建客户端 + 认证
+        let (http, token) = self
+            .init_registry_client(endpoint, reference, auth, initial_bearer_token)
+            .await?;
+
+        // 2. 拉取 Manifest（含 Index 多平台展开）
+        // let (manifest_json, manifest_bytes, effective_digest, mut metadata) =
+        //     self.fetch_and_resolve_manifest(&http, endpoint, reference, auth, token.as_deref())
+        //         .await?;
+
+        // 3. 下载 Image Config，填充元数据
+        // self.populate_image_config(
+        //     &http,
+        //     endpoint,
+        //     reference,
+        //     auth,
+        //     token.as_deref(),
+        //     &manifest_json,
+        //     &mut metadata,
+        // )
+        // .await?;
+
+        // 4. 并发下载所有 Layers
+        // let (layer_data, total_size) = self
+        //     .download_manifest_layers(
+        //         &http,
+        //         endpoint,
+        //         reference,
+        //         auth,
+        //         token.as_deref(),
+        //         &manifest_json,
+        //         &mut metadata,
+        //     )
+        //     .await?;
+
+        // 5. 生成镜像 ID
+        // let image_id = Self::canonical_image_id(
+        //     effective_digest.as_deref().unwrap_or_default(),
+        //     &manifest_bytes,
+        // );
+
+        // Ok((image_id, total_size, layer_data, metadata))
+        unimplemented!("按上述有约定逐步实现完整拉取流程")
+    }
+
+    /// 构建 HTTP 客户端，Ping Registry，按需获取 Bearer Token。
+    async fn init_registry_client(
+        &self,
+        endpoint: &RegistryEndpoint,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        initial_bearer_token: Option<&str>,
+    ) -> Result<(reqwest::Client, Option<String>), Status> {
+        let mut http_builder = reqwest::Client::builder();
+        if !self.pull_progress_timeout.is_zero() {
+            http_builder = http_builder.timeout(self.pull_progress_timeout);
+        }
+        if endpoint.skip_verify {
+            http_builder = http_builder.danger_accept_invalid_certs(true);
+        }
+        let http = http_builder
+            .build()
+            .map_err(|e| Status::internal(format!("failed to build registry client: {}", e)))?;
+
+        let ping_url = format!("{}/v2/", endpoint.base_url.trim_end_matches('/'));
+        info!("Registry ping: {}", ping_url);
+        let ping = Self::apply_basic_auth(http.get(&ping_url), auth)
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("registry ping failed: {}", e)))?;
+
+        let mut token: Option<String> = initial_bearer_token.map(str::to_string);
+        if ping.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_none() {
+            let challenge = ping
+                .headers()
+                .get(reqwest::header::WWW_AUTHENTICATE)
+                .and_then(|h| h.to_str().ok())
+                .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
+            token = Self::request_bearer_token(&http, challenge, reference, auth).await?;
+        }
+
+        Ok((http, token))
+    }  
 }
 
 #[tonic::async_trait]
@@ -1132,4 +1334,31 @@ struct RegistryEndpoint {
     can_pull: bool,
     can_resolve: bool,
     skip_verify: bool,
+}
+
+#[derive(Debug)]
+struct PulledLayerData {
+    bytes: Vec<u8>,
+    media_type: String,
+    source_media_type: String,
+    encrypted: bool,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PulledImageMetadata {
+    os: Option<String>,
+    architecture: Option<String>,
+    config_user: Option<String>,
+    config_env: Vec<String>,
+    config_entrypoint: Vec<String>,
+    config_cmd: Vec<String>,
+    config_working_dir: Option<String>,
+    annotations: HashMap<String, String>,
+    declared_volumes: Vec<String>,
+    manifest_media_type: Option<String>,
+    selected_manifest_digest: Option<String>,
+    selected_platform: Option<String>,
+    stored_layers: Vec<StoredLayerMeta>,
+    artifact_type: Option<String>,
+    artifact_blobs: Vec<ArtifactBlobMeta>,
 }
