@@ -29,7 +29,7 @@ use tonic::{Request, Response, Status};
 use oci_distribution::{secrets::RegistryAuth, Reference};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use log::info;
+use log::{info, warn};
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
@@ -664,6 +664,39 @@ impl ImageServiceImpl {
         let event = InternalEvent::new(kind, "image", image_ref, severity, details);
         if let Err(err) = LedgerInternalEventSink::new(db_path).publish(&event) {
             log::debug!("Failed to publish image internal event {kind} for {image_ref}: {err}");
+        }
+    }
+
+    fn should_retry_pull_status(status: &Status) -> bool {
+        matches!(
+            status.code(),
+            tonic::Code::Internal | tonic::Code::DeadlineExceeded
+        )
+    }
+
+    async fn execute_pull_with_retries<F, Fut, T>(
+        mut attempts_remaining: u32,
+        mut operation: F,
+    ) -> Result<T, Status>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = Result<T, Status>>,
+    {
+        loop {
+            match operation().await {
+                Ok(value) => return Ok(value),
+                Err(status)
+                    if attempts_remaining > 0 && Self::should_retry_pull_status(&status) =>
+                {
+                    attempts_remaining -= 1;
+                    warn!(
+                        "Image pull operation failed with {}, retrying ({} retries remaining)",
+                        status.message(),
+                        attempts_remaining
+                    );
+                }
+                Err(status) => return Err(status),
+            }
         }
     }
 }
