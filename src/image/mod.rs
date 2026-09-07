@@ -894,6 +894,15 @@ impl ImageServiceImpl {
         }
     }
 
+    fn blob_url(base_url: &str, reference: &Reference, digest: &str) -> String {
+        format!(
+            "{}/v2/{}/blobs/{}",
+            base_url.trim_end_matches('/'),
+            reference.repository(),
+            digest
+        )
+    }
+
     async fn read_response_bytes_with_progress_timeout(
         &self,
         response: reqwest::Response,
@@ -988,16 +997,16 @@ impl ImageServiceImpl {
                 .await?;
 
         // 3. 下载 Image Config，填充元数据
-        // self.populate_image_config(
-        //     &http,
-        //     endpoint,
-        //     reference,
-        //     auth,
-        //     token.as_deref(),
-        //     &manifest_json,
-        //     &mut metadata,
-        // )
-        // .await?;
+        self.populate_image_config(
+            &http,
+            endpoint,
+            reference,
+            auth,
+            token.as_deref(),
+            &manifest_json,
+            &mut metadata,
+        )
+        .await?;
 
         // 4. 并发下载所有 Layers
         // let (layer_data, total_size) = self
@@ -1216,6 +1225,80 @@ impl ImageServiceImpl {
 
         Ok((manifest_json, manifest_bytes, effective_digest, metadata))
     }  
+
+    async fn populate_image_config(
+        &self,
+        http: &reqwest::Client,
+        endpoint: &RegistryEndpoint,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        token: Option<&str>,
+        manifest_json: &serde_json::Value,
+        metadata: &mut PulledImageMetadata,
+    ) -> Result<(), Status> {
+        if metadata.artifact_type.is_some() {
+            return Ok(());
+        }
+        let Some(config_digest) = manifest_json
+            .get("config")
+            .and_then(|config| config.get("digest"))
+            .and_then(|value| value.as_str())
+        else {
+            return Ok(());
+        };
+
+        let config_url =
+            Self::blob_url(&endpoint.base_url, reference, config_digest).to_string();
+        let mut config_req = Self::apply_basic_auth(http.get(config_url), auth);
+        if let Some(t) = token {
+            config_req = config_req.bearer_auth(t);
+        }
+        let config_resp = config_req
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("config request failed: {}", e)))?;
+        if !config_resp.status().is_success() {
+            let status = config_resp.status();
+            let text = config_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "config request failed: {} {}",
+                status, text
+            )));
+        }
+        let config_bytes = self
+            .read_response_bytes_with_progress_timeout(config_resp, "read image config")
+            .await?;
+        let config_json: serde_json::Value = serde_json::from_slice(&config_bytes)
+            .map_err(|e| Status::internal(format!("parse config failed: {}", e)))?;
+
+        metadata.os = json_string(&config_json, "os");
+        metadata.architecture = json_string(&config_json, "architecture");
+        let image_config = config_json.get("config");
+        metadata.config_user = image_config.and_then(|c| json_non_empty_string(c, "User"));
+        metadata.config_env = image_config
+            .map(|c| json_string_vec(c, "Env"))
+            .unwrap_or_default();
+        metadata.config_entrypoint = image_config
+            .map(|c| json_string_vec(c, "Entrypoint"))
+            .unwrap_or_default();
+        metadata.config_cmd = image_config
+            .map(|c| json_string_vec(c, "Cmd"))
+            .unwrap_or_default();
+        metadata.config_working_dir = image_config
+            .and_then(|c| c.get("WorkingDir"))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+        metadata.annotations = image_config
+            .map(|c| json_string_map(c, "Labels"))
+            .unwrap_or_default();
+        metadata.declared_volumes = image_config
+            .map(|c| json_sorted_object_keys(c, "Volumes"))
+            .unwrap_or_default();
+
+        Ok(())
+    }
 }
 
 #[tonic::async_trait]
@@ -1583,4 +1666,27 @@ fn json_non_empty_string(json: &serde_json::Value, key: &str) -> Option<String> 
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
+}
+
+fn json_string_vec(json: &serde_json::Value, key: &str) -> Vec<String> {
+    json.get(key)
+        .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn json_string_map(json: &serde_json::Value, key: &str) -> HashMap<String, String> {
+    json.get(key)
+        .and_then(|v| serde_json::from_value::<HashMap<String, String>>(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn json_sorted_object_keys(json: &serde_json::Value, key: &str) -> Vec<String> {
+    json.get(key)
+        .and_then(|v| v.as_object())
+        .map(|obj| {
+            let mut keys: Vec<String> = obj.keys().cloned().collect();
+            keys.sort();
+            keys
+        })
+        .unwrap_or_default()
 }
