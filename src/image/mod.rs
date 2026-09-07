@@ -31,6 +31,7 @@ use oci_distribution::{secrets::RegistryAuth, Reference};
 use base64::Engine;
 use sha2::{Digest, Sha256};
 use log::{info, warn};
+use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
 use crate::proto::runtime::v1::*;
@@ -903,6 +904,153 @@ impl ImageServiceImpl {
         )
     }
 
+    async fn collect_with_concurrency_limit<T, O, F, Fut>(
+        max_concurrent: usize,
+        jobs: Vec<T>,
+        fetch: F,
+    ) -> Result<Vec<O>, Status>
+    where
+        T: Send,
+        F: Fn(T) -> Fut + Clone,
+        Fut: std::future::Future<Output = Result<O, Status>> + Send,
+        O: Send,
+    {
+        stream::iter(jobs.into_iter().map(|job| {
+            let fetch = fetch.clone();
+            async move { fetch(job).await }
+        }))
+        .buffer_unordered(max_concurrent)
+        .try_collect()
+        .await
+    }
+
+    async fn download_layer_via_registry_api(
+        &self,
+        http: &reqwest::Client,
+        auth: &RegistryAuth,
+        token: Option<&str>,
+        request: LayerDownloadRequest<'_>,
+    ) -> Result<(usize, Vec<u8>, u64), Status> {
+        let blob_url = Self::blob_url(
+            &request.endpoint.base_url,
+            request.reference,
+            request.layer_digest,
+        );
+        info!("Downloading layer {} from {}", request.idx, blob_url);
+        let mut blob_req = Self::apply_basic_auth(http.get(blob_url), auth);
+        if let Some(t) = token {
+            blob_req = blob_req.bearer_auth(t);
+        }
+        let blob_resp = blob_req
+            .send()
+            .await
+            .map_err(|e| Status::internal(format!("blob request failed: {}", e)))?;
+        if !blob_resp.status().is_success() {
+            let status = blob_resp.status();
+            let text = blob_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "blob request failed: {} {}",
+                status, text
+            )));
+        }
+        let len = blob_resp.content_length().unwrap_or(0);
+        let layer = self
+            .read_response_bytes_with_progress_timeout(blob_resp, "blob download")
+            .await?;
+        Ok((request.idx, layer, len))
+    }
+
+    fn image_decryption_enabled(&self) -> bool {
+        !self
+            .current_reloadable_config()
+            .decryption_keys_path
+            .as_ref()
+            .map(|path| path.as_os_str().is_empty())
+            .unwrap_or(true)
+    }
+
+    fn decrypted_media_type_for(source_media_type: &str) -> Result<(String, &'static str), Status> {
+        match source_media_type.trim() {
+            "application/vnd.oci.image.layer.v1.tar+gzip+encrypted"
+            | "application/vnd.docker.image.rootfs.diff.tar.gzip+encrypted" => Ok((
+                "application/vnd.oci.image.layer.v1.tar+gzip".to_string(),
+                "tar.gz",
+            )),
+            "application/vnd.oci.image.layer.v1.tar+encrypted"
+            | "application/vnd.docker.image.rootfs.diff.tar+encrypted" => {
+                Ok(("application/vnd.oci.image.layer.v1.tar".to_string(), "tar"))
+            }
+            other => Err(Status::failed_precondition(format!(
+                "unsupported encrypted layer media type {}",
+                other
+            ))),
+        }
+    }
+
+    fn plain_media_type_to_extension(media_type: &str) -> &'static str {
+        match media_type.trim() {
+            "application/vnd.oci.image.layer.v1.tar"
+            | "application/vnd.docker.image.rootfs.diff.tar" => "tar",
+            _ => "tar.gz",
+        }
+    }
+
+    fn decrypt_layer_bytes(
+        &self,
+        source_media_type: &str,
+        encrypted_bytes: &[u8],
+    ) -> Result<(Vec<u8>, String), Status> {
+        let (decrypted_media_type, _) = Self::decrypted_media_type_for(source_media_type)?;
+        let reloadable = self.current_reloadable_config();
+        let keys_path = reloadable.decryption_keys_path.as_ref().ok_or_else(|| {
+            Status::failed_precondition(
+                "encrypted image layer requires image.decryption_keys_path to be configured",
+            )
+        })?;
+        let mut command = std::process::Command::new(reloadable.decryption_decoder_path.trim());
+        command.arg("--decryption-keys-path").arg(keys_path);
+        if let Some(config) = reloadable.decryption_keyprovider_config.as_ref() {
+            command.env("OCICRYPT_KEYPROVIDER_CONFIG", config.as_os_str());
+        }
+        command.stdin(std::process::Stdio::piped());
+        command.stdout(std::process::Stdio::piped());
+        command.stderr(std::process::Stdio::piped());
+        let mut child = command.spawn().map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to start image decryption decoder {}: {}",
+                reloadable.decryption_decoder_path, err
+            ))
+        })?;
+        if let Some(stdin) = child.stdin.as_mut() {
+            use std::io::Write;
+            stdin.write_all(encrypted_bytes).map_err(|err| {
+                Status::internal(format!(
+                    "failed to write encrypted layer to decoder stdin: {}",
+                    err
+                ))
+            })?;
+        }
+        let output = child.wait_with_output().map_err(|err| {
+            Status::internal(format!(
+                "failed to wait for image decryption decoder: {}",
+                err
+            ))
+        })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(Status::failed_precondition(format!(
+                "image decryption failed for media type {}: {}",
+                source_media_type,
+                if stderr.is_empty() {
+                    format!("decoder exited with {}", output.status)
+                } else {
+                    stderr
+                }
+            )));
+        }
+        Ok((output.stdout, decrypted_media_type))
+    }
+
     async fn read_response_bytes_with_progress_timeout(
         &self,
         response: reqwest::Response,
@@ -1009,17 +1157,17 @@ impl ImageServiceImpl {
         .await?;
 
         // 4. 并发下载所有 Layers
-        // let (layer_data, total_size) = self
-        //     .download_manifest_layers(
-        //         &http,
-        //         endpoint,
-        //         reference,
-        //         auth,
-        //         token.as_deref(),
-        //         &manifest_json,
-        //         &mut metadata,
-        //     )
-        //     .await?;
+        let (layer_data, total_size) = self
+            .download_manifest_layers(
+                &http,
+                endpoint,
+                reference,
+                auth,
+                token.as_deref(),
+                &manifest_json,
+                &mut metadata,
+            )
+            .await?;
 
         // 5. 生成镜像 ID
         // let image_id = Self::canonical_image_id(
@@ -1298,6 +1446,146 @@ impl ImageServiceImpl {
             .unwrap_or_default();
 
         Ok(())
+    }
+
+    async fn download_manifest_layers(
+        &self,
+        http: &reqwest::Client,
+        endpoint: &RegistryEndpoint,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        token: Option<&str>,
+        manifest_json: &serde_json::Value,
+        metadata: &mut PulledImageMetadata,
+    ) -> Result<(Vec<PulledLayerData>, u64), Status> {
+        let layers = manifest_json
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| Status::internal("manifest missing layers"))?;
+
+        info!("Start downloading {} layers", layers.len());
+        let layer_jobs: Vec<(usize, String, String)> = layers
+            .iter()
+            .enumerate()
+            .map(|(idx, layer)| {
+                let annotations = layer
+                    .get("annotations")
+                    .and_then(|value| {
+                        serde_json::from_value::<HashMap<String, String>>(value.clone()).ok()
+                    })
+                    .unwrap_or_default();
+                let path = annotations
+                    .get("org.opencontainers.image.title")
+                    .cloned()
+                    .or_else(|| {
+                        annotations
+                            .get("org.opencontainers.image.filepath")
+                            .cloned()
+                    })
+                    .unwrap_or_else(|| format!("blob-{idx}"));
+                metadata.artifact_blobs.push(ArtifactBlobMeta {
+                    digest: layer
+                        .get("digest")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    media_type: layer
+                        .get("mediaType")
+                        .and_then(|value| value.as_str())
+                        .unwrap_or_default()
+                        .to_string(),
+                    path,
+                    size: layer
+                        .get("size")
+                        .and_then(|value| value.as_u64())
+                        .unwrap_or_default(),
+                    annotations,
+                });
+                let media_type = layer
+                    .get("mediaType")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("application/vnd.oci.image.layer.v1.tar+gzip");
+                layer
+                    .get("digest")
+                    .and_then(|v| v.as_str())
+                    .map(|digest| (idx, digest.to_string(), media_type.to_string()))
+                    .ok_or_else(|| Status::internal("layer missing digest"))
+            })
+            .collect::<Result<_, _>>()?;
+
+        let downloaded_results =
+            Self::collect_with_concurrency_limit(self.max_concurrent_downloads, layer_jobs, {
+                let http = http.clone();
+                let auth = auth.clone();
+                let reference = reference.clone();
+                let token = token.map(str::to_string);
+                let endpoint = endpoint.clone();
+                move |(idx, digest, media_type): (usize, String, String)| {
+                    let http = http.clone();
+                    let auth = auth.clone();
+                    let reference = reference.clone();
+                    let token = token.clone();
+                    let endpoint = endpoint.clone();
+                    async move {
+                        let (idx, bytes, len) = self
+                            .download_layer_via_registry_api(
+                                &http,
+                                &auth,
+                                token.as_deref(),
+                                LayerDownloadRequest {
+                                    endpoint: &endpoint,
+                                    reference: &reference,
+                                    layer_digest: &digest,
+                                    idx,
+                                },
+                            )
+                            .await?;
+                        Ok::<_, Status>((idx, bytes, len, media_type))
+                    }
+                }
+            })
+            .await?;
+
+        let total_size: u64 = downloaded_results
+            .iter()
+            .map(|(_, bytes, len, _)| (*len).max(bytes.len() as u64))
+            .sum();
+        let mut downloaded_layers = downloaded_results;
+        downloaded_layers.sort_by_key(|(idx, _, _, _)| *idx);
+
+        let mut layer_data = Vec::with_capacity(downloaded_layers.len());
+        let mut stored_layers = Vec::with_capacity(downloaded_layers.len());
+        for (idx, bytes, _len, source_media_type) in downloaded_layers {
+            let encrypted = source_media_type.ends_with("+encrypted");
+            let (bytes, media_type) = if encrypted {
+                if !self.image_decryption_enabled() {
+                    return Err(Status::failed_precondition(format!(
+                        "encrypted image layer requires image.decryption_keys_path and a compatible decoder; source media type {}",
+                        source_media_type
+                    )));
+                }
+                self.decrypt_layer_bytes(&source_media_type, &bytes)?
+            } else {
+                (bytes, source_media_type.clone())
+            };
+            let extension = Self::plain_media_type_to_extension(&media_type);
+            stored_layers.push(StoredLayerMeta {
+                digest: String::new(),
+                path: format!("{idx}.{extension}"),
+                media_type: media_type.clone(),
+                source_media_type: source_media_type.clone(),
+                encrypted,
+            });
+            layer_data.push(PulledLayerData {
+                bytes,
+                media_type,
+                source_media_type,
+                encrypted,
+            });
+        }
+        metadata.stored_layers = stored_layers;
+
+        Ok((layer_data, total_size))
     }
 }
 
@@ -1634,6 +1922,13 @@ struct PulledLayerData {
     media_type: String,
     source_media_type: String,
     encrypted: bool,
+}
+
+struct LayerDownloadRequest<'a> {
+    endpoint: &'a RegistryEndpoint,
+    reference: &'a Reference,
+    layer_digest: &'a str,
+    idx: usize,
 }
 
 #[derive(Debug, Clone, Default)]
