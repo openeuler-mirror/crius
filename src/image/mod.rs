@@ -699,6 +699,112 @@ impl ImageServiceImpl {
             }
         }
     }
+
+    fn registry_hosts_toml_path(&self, registry: &str) -> Option<PathBuf> {
+        let reloadable = self.current_reloadable_config();
+        let config_dir = reloadable.registry_config_dir.as_ref()?;
+        for alias in Self::registry_auth_aliases(registry) {
+            let exact = config_dir.join(&alias).join("hosts.toml");
+            if exact.exists() {
+                return Some(exact);
+            }
+        }
+
+        let default = config_dir.join("_default").join("hosts.toml");
+        default.exists().then_some(default)
+    }
+
+    fn load_registry_endpoints(&self, registry: &str) -> Result<Vec<RegistryEndpoint>, Status> {
+        let Some(path) = self.registry_hosts_toml_path(registry) else {
+            return Ok(Vec::new());
+        };
+
+        let raw = std::fs::read_to_string(&path).map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to read image.registry_config_dir hosts file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        let value: toml::Value = raw.parse().map_err(|err| {
+            Status::failed_precondition(format!(
+                "failed to parse image.registry_config_dir hosts file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+
+        let mut endpoints = Vec::new();
+        if let Some(hosts) = value.get("host").and_then(|host| host.as_table()) {
+            let mut entries = hosts
+                .iter()
+                .filter_map(|(url, entry)| {
+                    let table = entry.as_table()?;
+                    let capabilities = table
+                        .get("capabilities")
+                        .and_then(|value| value.as_array())
+                        .map(|items| {
+                            items
+                                .iter()
+                                .filter_map(|item| item.as_str())
+                                .map(|item| item.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_else(|| vec!["pull".to_string(), "resolve".to_string()]);
+                    let skip_verify = table
+                        .get("skip_verify")
+                        .and_then(|value| value.as_bool())
+                        .unwrap_or(false);
+                    Some(RegistryEndpoint {
+                        base_url: url.trim_end_matches('/').to_string(),
+                        can_pull: capabilities.iter().any(|item| item == "pull"),
+                        can_resolve: capabilities.iter().any(|item| item == "resolve"),
+                        skip_verify,
+                    })
+                })
+                .collect::<Vec<_>>();
+            entries.sort_by(|left, right| left.base_url.cmp(&right.base_url));
+            endpoints.extend(entries);
+        }
+
+        if let Some(server) = value.get("server").and_then(|server| server.as_str()) {
+            let server = server.trim();
+            if !server.is_empty() {
+                endpoints.push(RegistryEndpoint {
+                    base_url: server.trim_end_matches('/').to_string(),
+                    can_pull: true,
+                    can_resolve: true,
+                    skip_verify: false,
+                });
+            }
+        }
+
+        Ok(endpoints)
+    }
+
+    fn registry_endpoints_for(
+        &self,
+        reference: &Reference,
+        require_resolve: bool,
+    ) -> Result<Vec<RegistryEndpoint>, Status> {
+        let mut endpoints = self.load_registry_endpoints(reference.resolve_registry())?;
+        endpoints.retain(|endpoint| {
+            if require_resolve {
+                endpoint.can_resolve
+            } else {
+                endpoint.can_pull
+            }
+        });
+        if endpoints.is_empty() {
+            endpoints.push(RegistryEndpoint {
+                base_url: format!("https://{}", reference.resolve_registry()),
+                can_pull: true,
+                can_resolve: true,
+                skip_verify: false,
+            });
+        }
+        Ok(endpoints)
+    }
 }
 
 #[tonic::async_trait]
@@ -846,6 +952,8 @@ impl ImageService for ImageServiceImpl {
                 "bytesTotal": 0,
             }),
         );
+
+        
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
@@ -1016,4 +1124,12 @@ pub struct CriusImage {
     pub stored_layers: Vec<StoredLayerMeta>,
     pub artifact_type: Option<String>,
     pub artifact_blobs: Vec<ArtifactBlobMeta>,
+}
+
+#[derive(Debug, Clone)]
+struct RegistryEndpoint {
+    base_url: String,
+    can_pull: bool,
+    can_resolve: bool,
+    skip_verify: bool,
 }
