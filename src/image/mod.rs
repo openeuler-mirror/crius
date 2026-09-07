@@ -876,6 +876,59 @@ impl ImageServiceImpl {
             .map(|s| s.to_string()))
     }
 
+    fn manifest_url(base_url: &str, reference: &Reference) -> String {
+        if let Some(digest) = reference.digest() {
+            format!(
+                "{}/v2/{}/manifests/{}",
+                base_url.trim_end_matches('/'),
+                reference.repository(),
+                digest
+            )
+        } else {
+            format!(
+                "{}/v2/{}/manifests/{}",
+                base_url.trim_end_matches('/'),
+                reference.repository(),
+                reference.tag().unwrap_or("latest")
+            )
+        }
+    }
+
+    async fn read_response_bytes_with_progress_timeout(
+        &self,
+        response: reqwest::Response,
+        context: &str,
+    ) -> Result<Vec<u8>, Status> {
+        let timeout = self.pull_progress_timeout;
+        if timeout.is_zero() {
+            return response
+                .bytes()
+                .await
+                .map(|bytes| bytes.to_vec())
+                .map_err(|e| Status::internal(format!("{} failed: {}", context, e)));
+        }
+
+        let mut body = Vec::new();
+        let mut response = response;
+        loop {
+            let next_chunk = tokio::time::timeout(timeout, response.chunk())
+                .await
+                .map_err(|_| {
+                    Status::deadline_exceeded(format!(
+                        "{} timed out after {:?} without progress",
+                        context, timeout
+                    ))
+                })?;
+            let Some(chunk) =
+                next_chunk.map_err(|e| Status::internal(format!("{} failed: {}", context, e)))?
+            else {
+                break;
+            };
+            body.extend_from_slice(&chunk);
+        }
+        Ok(body)
+    }
+
     async fn pull_via_registry_api(
         &self,
         reference: &Reference,
@@ -930,9 +983,9 @@ impl ImageServiceImpl {
             .await?;
 
         // 2. 拉取 Manifest（含 Index 多平台展开）
-        // let (manifest_json, manifest_bytes, effective_digest, mut metadata) =
-        //     self.fetch_and_resolve_manifest(&http, endpoint, reference, auth, token.as_deref())
-        //         .await?;
+        let (manifest_json, manifest_bytes, effective_digest, mut metadata) =
+            self.fetch_and_resolve_manifest(&http, endpoint, reference, auth, token.as_deref())
+                .await?;
 
         // 3. 下载 Image Config，填充元数据
         // self.populate_image_config(
@@ -1006,6 +1059,162 @@ impl ImageServiceImpl {
         }
 
         Ok((http, token))
+    }
+
+    async fn fetch_and_resolve_manifest(
+        &self,
+        http: &reqwest::Client,
+        endpoint: &RegistryEndpoint,
+        reference: &Reference,
+        auth: &RegistryAuth,
+        token: Option<&str>,
+    ) -> Result<(serde_json::Value, Vec<u8>, Option<String>, PulledImageMetadata), Status> {
+        let manifest_url = Self::manifest_url(&endpoint.base_url, reference);
+        info!("Fetching manifest: {}", manifest_url);
+
+        let mut token = token.map(str::to_string);
+        let manifest_resp;
+        loop {
+            let mut req = Self::apply_basic_auth(http.get(&manifest_url), auth).header(
+                reqwest::header::ACCEPT,
+                "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+            );
+            if let Some(t) = token.as_deref() {
+                req = req.bearer_auth(t);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("manifest request failed: {}", e)))?;
+            if resp.status() == reqwest::StatusCode::UNAUTHORIZED && token.is_none() {
+                let challenge = resp
+                    .headers()
+                    .get(reqwest::header::WWW_AUTHENTICATE)
+                    .and_then(|h| h.to_str().ok())
+                    .ok_or_else(|| Status::internal("missing WWW-Authenticate header"))?;
+                token = Self::request_bearer_token(http, challenge, reference, auth).await?;
+                continue;
+            }
+            manifest_resp = resp;
+            break;
+        }
+
+        if !manifest_resp.status().is_success() {
+            let status = manifest_resp.status();
+            let text = manifest_resp.text().await.unwrap_or_default();
+            return Err(Status::internal(format!(
+                "manifest request failed: {} {}",
+                status, text
+            )));
+        }
+
+        let digest = manifest_resp
+            .headers()
+            .get("Docker-Content-Digest")
+            .and_then(|h| h.to_str().ok())
+            .map(|s| s.to_string());
+        let manifest_bytes = self
+            .read_response_bytes_with_progress_timeout(manifest_resp, "read manifest")
+            .await?;
+        let mut manifest_json: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+            .map_err(|e| Status::internal(format!("parse manifest failed: {}", e)))?;
+        let mut metadata = PulledImageMetadata {
+            manifest_media_type: json_string(&manifest_json, "mediaType"),
+            artifact_type: json_non_empty_string(&manifest_json, "artifactType"),
+            ..Default::default()
+        };
+        let mut effective_digest = digest;
+
+        // Manifest Index（多平台）→ 选择当前平台的子 Manifest 并展开
+        if manifest_json
+            .get("layers")
+            .and_then(|v| v.as_array())
+            .is_none()
+        {
+            let target_arch = match std::env::consts::ARCH {
+                "x86_64" => "amd64",
+                "aarch64" => "arm64",
+                "loongarch64" => "loong64",
+                other => other,
+            };
+            let target_os = std::env::consts::OS;
+            let manifests = manifest_json
+                .get("manifests")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Status::internal("manifest index missing manifests"))?;
+
+            let selected = manifests.iter().find(|m| {
+                let os = m
+                    .get("platform")
+                    .and_then(|p| p.get("os"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                let arch = m
+                    .get("platform")
+                    .and_then(|p| p.get("architecture"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                os == target_os && arch == target_arch
+            });
+            let selected_digest = if let Some(entry) = selected {
+                entry
+                    .get("digest")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Status::internal("selected manifest missing digest"))?
+            } else {
+                manifests
+                    .first()
+                    .and_then(|m| m.get("digest"))
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Status::internal("manifest index has no usable digest"))?
+            };
+            info!(
+                "Manifest index detected, selected child manifest digest={} (platform={}/{})",
+                selected_digest, target_os, target_arch
+            );
+            metadata.selected_manifest_digest = Some(selected_digest.to_string());
+            metadata.selected_platform = Some(format!("{target_os}/{target_arch}"));
+
+            let child_url = format!(
+                "{}/v2/{}/manifests/{}",
+                endpoint.base_url.trim_end_matches('/'),
+                reference.repository(),
+                selected_digest
+            );
+            let mut child_req = Self::apply_basic_auth(http.get(child_url), auth).header(
+                reqwest::header::ACCEPT,
+                "application/vnd.oci.image.manifest.v1+json,application/vnd.docker.distribution.manifest.v2+json",
+            );
+            if let Some(t) = token.as_deref() {
+                child_req = child_req.bearer_auth(t);
+            }
+            let child_resp = child_req
+                .send()
+                .await
+                .map_err(|e| Status::internal(format!("child manifest request failed: {}", e)))?;
+            if !child_resp.status().is_success() {
+                let status = child_resp.status();
+                let text = child_resp.text().await.unwrap_or_default();
+                return Err(Status::internal(format!(
+                    "child manifest request failed: {} {}",
+                    status, text
+                )));
+            }
+            effective_digest = child_resp
+                .headers()
+                .get("Docker-Content-Digest")
+                .and_then(|h| h.to_str().ok())
+                .map(|s| s.to_string())
+                .or_else(|| Some(selected_digest.to_string()));
+            let child_bytes = self
+                .read_response_bytes_with_progress_timeout(child_resp, "read child manifest")
+                .await?;
+            manifest_json = serde_json::from_slice(&child_bytes)
+                .map_err(|e| Status::internal(format!("parse child manifest failed: {}", e)))?;
+            metadata.manifest_media_type = json_string(&manifest_json, "mediaType");
+        }
+
+        Ok((manifest_json, manifest_bytes, effective_digest, metadata))
     }  
 }
 
@@ -1361,4 +1570,17 @@ struct PulledImageMetadata {
     stored_layers: Vec<StoredLayerMeta>,
     artifact_type: Option<String>,
     artifact_blobs: Vec<ArtifactBlobMeta>,
+}
+
+fn json_string(json: &serde_json::Value, key: &str) -> Option<String> {
+    json.get(key)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+}
+
+fn json_non_empty_string(json: &serde_json::Value, key: &str) -> Option<String> {
+    json.get(key)
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
 }
