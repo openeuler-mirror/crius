@@ -1170,13 +1170,12 @@ impl ImageServiceImpl {
             .await?;
 
         // 5. 生成镜像 ID
-        // let image_id = Self::canonical_image_id(
-        //     effective_digest.as_deref().unwrap_or_default(),
-        //     &manifest_bytes,
-        // );
+        let image_id = Self::canonical_image_id(
+            effective_digest.as_deref().unwrap_or_default(),
+            &manifest_bytes,
+        );
 
-        // Ok((image_id, total_size, layer_data, metadata))
-        unimplemented!("按上述有约定逐步实现完整拉取流程")
+        Ok((image_id, total_size, layer_data, metadata))
     }
 
     /// 构建 HTTP 客户端，Ping Registry，按需获取 Bearer Token。
@@ -1587,6 +1586,26 @@ impl ImageServiceImpl {
 
         Ok((layer_data, total_size))
     }
+
+    fn canonical_image_id(digest: &str, fallback_seed: &[u8]) -> String {
+        let digest = digest.trim();
+        if digest.is_empty() || digest == "sha256:unknown" {
+            return format!("sha256:{:x}", Sha256::digest(fallback_seed));
+        }
+
+        if digest.contains(':') {
+            digest.to_string()
+        } else {
+            format!("sha256:{}", digest)
+        }
+    }
+
+    async fn persist_pulled_image(
+        &self,
+        pull: PersistedPullImage,
+    ) -> Result<Response<PullImageResponse>, Status> {
+        unimplemented!()
+    }
 }
 
 #[tonic::async_trait]
@@ -1735,7 +1754,31 @@ impl ImageService for ImageServiceImpl {
             }),
         );
 
-        
+        let pull_outcome = Self::execute_pull_with_retries(self.pull_retry_count, || async {
+            transfer.update("attempt", 0, 0);
+            self.persist_content_transfer_by_id(&transfer_id)
+                .map_err(|err| Status::internal(err.to_string()))?;
+            let _pull_cgroup_scope = self
+                .pull_cgroup
+                .enter(&pull_cgroup_target)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            
+            let reference = reference.clone();
+            let (image_id, image_size, layers_to_persist, pulled_metadata) = self
+                .pull_via_registry_api(&reference, &auth, supplied_bearer_token.as_deref())
+                .await?;
+            self.persist_pulled_image(PersistedPullImage {
+                requested_ref: requested_ref.clone(),
+                canonical_ref: canonical_ref.clone(),
+                reference,
+                image_id,
+                image_size,
+                layers_to_persist,
+                pulled_metadata,
+            })
+            .await
+        })
+        .await;
 
         Err(tonic::Status::unimplemented("pull image: not implemented"))
     }
@@ -1948,6 +1991,16 @@ struct PulledImageMetadata {
     stored_layers: Vec<StoredLayerMeta>,
     artifact_type: Option<String>,
     artifact_blobs: Vec<ArtifactBlobMeta>,
+}
+
+struct PersistedPullImage {
+    requested_ref: String,
+    canonical_ref: String,
+    reference: Reference,
+    image_id: String,
+    image_size: u64,
+    layers_to_persist: Vec<PulledLayerData>,
+    pulled_metadata: PulledImageMetadata,
 }
 
 fn json_string(json: &serde_json::Value, key: &str) -> Option<String> {
