@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use std::collections::{HashMap};
 use std::sync::{Arc, RwLock};
 use std::path::Path;
-use std::unimplemented;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::io;
 
 use tokio::sync::{Mutex, Notify};
 use serde::{Serialize, Deserialize};
@@ -30,7 +31,7 @@ use tonic::{Request, Response, Status};
 use oci_distribution::{secrets::RegistryAuth, Reference};
 use base64::Engine;
 use sha2::{Digest, Sha256};
-use log::{info, warn};
+use log::{info, warn, error};
 use futures::{stream, StreamExt, TryStreamExt};
 
 use crate::proto::runtime::v1::{Image, image_service_server::ImageService};
@@ -40,7 +41,7 @@ use crate::image::content_store::{RemoteContentProviderKind, ContentTransferReco
 use crate::storage::StorageManager;
 use crate::service::event::{InternalEventSeverity, InternalEvent, LedgerInternalEventSink};
 
-use content_store::{FsContentStore, ContentTransferTracker};
+use content_store::{FsContentStore, ContentTransferTracker, ContentStore};
 use metadata_store::FilesystemImageMetadataStore;
 use pull_cgroup::PullCgroupExecutor;
 
@@ -1600,11 +1601,144 @@ impl ImageServiceImpl {
         }
     }
 
+    fn repo_digest_for_reference(reference: &Reference, image_id: &str) -> Option<String> {
+        if !image_id.contains(':') {
+            return None;
+        }
+        Some(format!(
+            "{}/{}@{}",
+            reference.resolve_registry(),
+            reference.repository(),
+            image_id
+        ))
+    }
+
+    fn local_record_dir(root: &Path, id: &str, artifact: bool) -> PathBuf {
+        FilesystemImageMetadataStore::local_record_dir(root, id, artifact)
+    }
+
+    fn now_nanos() -> i64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
+    }
+
     async fn persist_pulled_image(
         &self,
         pull: PersistedPullImage,
     ) -> Result<Response<PullImageResponse>, Status> {
-        unimplemented!()
+        let PersistedPullImage {
+            requested_ref,
+            canonical_ref,
+            reference,
+            image_id,
+            image_size,
+            layers_to_persist,
+            pulled_metadata,
+        } = pull;
+        // 从原始引用中计算 repo digest
+        let repo_digests = Self::repo_digest_for_reference(&reference, &image_id)
+            .into_iter()
+            .collect::<Vec<_>>();
+
+        // 判断是否为 artifact 格式
+        let is_artifact = pulled_metadata
+            .artifact_type
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+
+        // 创建本地存储记录
+        let record_dir = Self::local_record_dir(&self.storage_path, &image_id, is_artifact);
+        std::fs::create_dir_all(&record_dir).map_err(|e: io::Error| {
+            Status::internal(format!("Failed to create image record directory: {}", e))
+        })?;
+
+        // 持久化层数据到 Content Store
+        let persisted_layers = layers_to_persist
+            .into_iter()
+            .map(|layer| {
+                self.content_store
+                    .put_blob("", &layer.media_type, &layer.bytes)
+                    .map(|info| StoredLayerMeta {
+                        digest: info.digest,
+                        path: info.relative_path.display().to_string(),
+                        media_type: layer.media_type.clone(),
+                        source_media_type: layer.source_media_type,
+                        encrypted: layer.encrypted,
+                    })
+                    .map_err(|err| {
+                        Status::internal(format!("Failed to persist layer blob: {}", err))
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut pulled_metadata = pulled_metadata;
+        pulled_metadata.stored_layers = persisted_layers;
+        let reloadable = self.current_reloadable_config();
+
+        // 保存镜像元数据
+        self.save_image_metadata(&CriusImage {
+            id: image_id.clone(),
+            repo_tags: vec![canonical_ref.clone()],
+            repo_digests: repo_digests.clone(),
+            size: image_size,
+            pinned: Self::image_is_pinned_by_patterns(
+                &reloadable.pinned_image_patterns,
+                [canonical_ref.as_str(), requested_ref.as_str()],
+            ),
+            pulled_at: Self::now_nanos(),
+            source_reference: (canonical_ref != requested_ref).then_some(requested_ref.clone()),
+            os: pulled_metadata.os.clone(),
+            architecture: pulled_metadata.architecture.clone(),
+            config_user: pulled_metadata.config_user.clone(),
+            config_env: pulled_metadata.config_env.clone(),
+            config_entrypoint: pulled_metadata.config_entrypoint.clone(),
+            config_cmd: pulled_metadata.config_cmd.clone(),
+            config_working_dir: pulled_metadata.config_working_dir.clone(),
+            annotations: pulled_metadata.annotations.clone(),
+            declared_volumes: pulled_metadata.declared_volumes.clone(),
+            manifest_media_type: pulled_metadata.manifest_media_type.clone(),
+            selected_manifest_digest: pulled_metadata.selected_manifest_digest.clone(),
+            selected_platform: pulled_metadata.selected_platform.clone(),
+            stored_layers: pulled_metadata.stored_layers.clone(),
+            artifact_type: pulled_metadata.artifact_type.clone(),
+            artifact_blobs: pulled_metadata.artifact_blobs.clone(),
+        })
+        .await
+        .map_err(|e| {
+            error!("Failed to save image metadata: {}", e);
+            Status::internal(format!("Failed to save image metadata: {}", e))
+        })?;
+
+        let image = Image {
+            id: image_id.clone(),
+            repo_tags: vec![canonical_ref.clone()],
+            repo_digests,
+            size: image_size,
+            pinned: Self::image_is_pinned_by_patterns(
+                &reloadable.pinned_image_patterns,
+                [canonical_ref.as_str(), requested_ref.as_str()],
+            ),
+            spec: Some(ImageSpec {
+                image: canonical_ref.clone(),
+                user_specified_image: requested_ref.clone(),
+                annotations: pulled_metadata.annotations.clone(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        // 注册到内存索引
+        let mut images = self.images.lock().await;
+        images.insert(canonical_ref, image);
+        drop(images);
+
+        info!("Image {} pulled successfully", image_id);
+
+        Ok(Response::new(PullImageResponse {
+            image_ref: image_id,
+        }))
     }
 }
 
@@ -1780,7 +1914,43 @@ impl ImageService for ImageServiceImpl {
         })
         .await;
 
-        Err(tonic::Status::unimplemented("pull image: not implemented"))
+        if let Some(notify) = self.in_progress_pulls.lock().await.remove(&pull_key) {
+            notify.notify_waiters();
+        }
+
+        match pull_outcome {
+            Ok(response) => {
+                transfer.succeed();
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_success",
+                    InternalEventSeverity::Info,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "imageRef": response.get_ref().image_ref,
+                    }),
+                );
+                Ok(response)
+            }
+            Err(status) => {
+                transfer.fail(status.message().to_string());
+                self.persist_content_transfer_by_id(&transfer_id)
+                    .map_err(|err| Status::internal(err.to_string()))?;
+                self.publish_image_internal_event(
+                    &canonical_ref,
+                    "image.pull_fail",
+                    InternalEventSeverity::Error,
+                    serde_json::json!({
+                        "transferId": transfer_id,
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                );
+                Err(status)
+            }
+        }
     }
 
     async fn remove_image(

@@ -17,7 +17,8 @@ limitations under the License.
 
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::todo;
+use std::{todo, unimplemented};
+use std::fs::File;
 
 use anyhow::{Context, Result};
 use serde::{Serialize, Deserialize};
@@ -44,6 +45,45 @@ impl FsContentStore {
     }
 }
 
+pub trait ContentStore: Send + Sync {
+    fn put_blob(&self, digest: &str, media_type: &str, bytes: &[u8]) -> Result<BlobInfo>;
+    fn get_blob(&self, digest: &str) -> Result<BlobHandle>;
+    fn delete_blob(&self, digest: &str) -> Result<()>;
+    fn stat_blob(&self, digest: &str) -> Result<BlobInfo>;
+}
+
+#[derive(Debug, Clone)]
+pub struct BlobInfo {
+    pub digest: String,
+    pub media_type: String,
+    pub size: u64,
+    pub relative_path: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct BlobHandle {
+    pub info: BlobInfo,
+    pub file: File,
+}
+
+impl ContentStore for FsContentStore {
+    fn stat_blob(&self, digest: &str) -> Result<BlobInfo> {
+        unimplemented!()
+    }
+
+    fn put_blob(&self, digest: &str, media_type: &str, bytes: &[u8]) -> Result<BlobInfo> {
+        unimplemented!()
+    }
+
+    fn delete_blob(&self, digest: &str) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn get_blob(&self, digest: &str) -> Result<BlobHandle> {
+        unimplemented!()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ContentTransferTracker {
     inner: Arc<Mutex<ContentTransferTrackerInner>>,
@@ -58,6 +98,8 @@ impl Default for ContentTransferTracker {
 }
 
 impl ContentTransferTracker {
+    const RECENT_LIMIT: usize = 16;
+
     pub fn new_with_ledger(ledger_db_path: Option<PathBuf>) -> Result<Self> {
         let tracker = Self::default();
         Ok(tracker)
@@ -113,6 +155,21 @@ impl ContentTransferTracker {
             record.bytes_completed = bytes_completed;
             record.bytes_total = bytes_total;
         }
+    }
+
+    fn finish(&self, id: &str, state: TransferState, error: Option<String>) {
+        let Ok(mut inner) = self.inner.lock() else {
+            return;
+        };
+        let Some(index) = inner.active.iter().position(|record| record.id == id) else {
+            return;
+        };
+        let mut record = inner.active.remove(index);
+        record.state = state;
+        record.finished_at_unix_nanos = Some(now_unix_nanos());
+        record.error = error;
+        inner.recent.insert(0, record);
+        inner.recent.truncate(Self::RECENT_LIMIT);
     }
 }
 
@@ -186,6 +243,18 @@ impl ContentTransferGuard {
     pub fn update(&self, stage: impl Into<String>, bytes_completed: u64, bytes_total: u64) {
         self.tracker
             .update(&self.id, stage, bytes_completed, bytes_total);
+    }
+
+    pub fn succeed(mut self) {
+        self.finished = true;
+        self.tracker
+            .finish(&self.id, TransferState::Succeeded, None);
+    }
+
+    pub fn fail(mut self, error: impl Into<String>) {
+        self.finished = true;
+        self.tracker
+            .finish(&self.id, TransferState::Failed, Some(error.into()));
     }
 }
 
