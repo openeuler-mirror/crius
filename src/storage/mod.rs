@@ -17,7 +17,7 @@ limitations under the License.
 
 pub mod persistence;
 
-use std::{path::Path, todo};
+use std::{path::Path, todo, unimplemented};
 
 use anyhow::{Context, Result};
 use log::info;
@@ -93,6 +93,22 @@ impl StorageManager {
         todo!("在存储中追加事件")
     }
 
+    pub fn get_content_blob(&mut self, digest: &str) -> Result<Option<ContentBlobRecord>> {
+        unimplemented!()
+    }
+
+    pub fn touch_content_blob(&mut self, digest: &str, last_used_at: i64) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn save_content_blob(&mut self, record: &ContentBlobRecord) -> Result<()> {
+        unimplemented!()
+    }
+
+    pub fn delete_content_blob(&mut self, digest: &str) -> Result<()> {
+        unimplemented!()
+    }
+
 }
 
 /// 镜像记录
@@ -147,4 +163,15 @@ pub struct TypedEventInput<'a> {
     pub new_state: Option<&'a str>,
     pub details: Option<&'a str>,
     pub timestamp: i64,
+}
+
+/// 内容 blob 记录
+#[derive(Debug, Clone)]
+pub struct ContentBlobRecord {
+    pub digest: String,
+    pub media_type: String,
+    pub size: u64,
+    pub relative_path: String,
+    pub created_at: i64,
+    pub last_used_at: i64,
 }
