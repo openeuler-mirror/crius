@@ -324,6 +324,22 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn delete_image(&mut self, image_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM content_blob_refs WHERE owner_kind = 'image' AND owner_id = ?1",
+                [image_id],
+            )
+            .context("Failed to delete image content blob refs")?;
+        self.conn
+            .execute("DELETE FROM image_refs WHERE image_id = ?1", [image_id])
+            .context("Failed to delete image refs")?;
+        self.conn
+            .execute("DELETE FROM images WHERE id = ?1", [image_id])
+            .context("Failed to delete image")?;
+        Ok(())
+    }
+
     pub fn replace_image_refs(&mut self, image_id: &str, refs: &[ImageRefRecord]) -> Result<()> {
         self.conn
             .execute("DELETE FROM image_refs WHERE image_id = ?1", [image_id])

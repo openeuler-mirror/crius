@@ -19,7 +19,7 @@ pub mod metadata_store;
 pub mod pull_cgroup;
 
 use std::path::PathBuf;
-use std::collections::{HashMap};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -1951,6 +1951,101 @@ impl ImageServiceImpl {
         );
         Ok(info)
     }
+
+    fn artifact_mount_candidates(
+        root: &Path,
+        requested_ref: &str,
+    ) -> Result<Option<(ImageMeta, PathBuf)>, Status> {
+        let records_dir = Self::artifact_records_dir(root);
+        if !records_dir.exists() {
+            return Ok(None);
+        }
+
+        for entry in std::fs::read_dir(&records_dir).map_err(|err| {
+            Status::internal(format!(
+                "failed to read artifact records directory {}: {}",
+                records_dir.display(),
+                err
+            ))
+        })? {
+            let entry = entry.map_err(|err| {
+                Status::internal(format!(
+                    "failed to read artifact record entry in {}: {}",
+                    records_dir.display(),
+                    err
+                ))
+            })?;
+            let Some(meta) = Self::load_meta_from_record_dir(&entry.path()) else {
+                continue;
+            };
+            if !Self::is_artifact_meta(&meta) {
+                continue;
+            }
+            let image = Self::image_from_meta(&meta);
+            if Self::image_matches_ref(&image, requested_ref) {
+                return Ok(Some((meta, entry.path())));
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn additional_artifact_store_roots(&self) -> impl Iterator<Item = &Path> {
+        self.additional_artifact_stores.iter().map(PathBuf::as_path)
+    }
+
+    fn artifact_records_dir(root: &Path) -> PathBuf {
+        FilesystemImageMetadataStore::artifact_records_dir(root)
+    }
+
+    fn is_artifact_meta(meta: &ImageMeta) -> bool {
+        meta.artifact_type
+            .as_ref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+    }
+
+    fn load_meta_from_record_dir(record_dir: &Path) -> Option<ImageMeta> {
+        FilesystemImageMetadataStore::load_meta_from_record_dir(record_dir)
+    }
+
+    async fn persist_image_from_proto(&self, image: &Image) -> Result<(), Error> {
+        let existing = self.load_image_metadata(&image.id).unwrap_or_default();
+        let reloadable = self.current_reloadable_config();
+        let pinned = Self::image_is_pinned_by_patterns(
+            &reloadable.pinned_image_patterns,
+            image
+                .repo_tags
+                .iter()
+                .map(String::as_str)
+                .chain(existing.source_reference.as_deref()),
+        );
+        self.save_image_metadata(&CriusImage {
+            id: image.id.clone(),
+            repo_tags: image.repo_tags.clone(),
+            repo_digests: image.repo_digests.clone(),
+            size: image.size,
+            pinned,
+            pulled_at: existing.pulled_at,
+            source_reference: existing.source_reference,
+            os: existing.os,
+            architecture: existing.architecture,
+            config_user: existing.config_user,
+            config_env: existing.config_env,
+            config_entrypoint: existing.config_entrypoint,
+            config_cmd: existing.config_cmd,
+            config_working_dir: existing.config_working_dir,
+            annotations: existing.annotations,
+            declared_volumes: existing.declared_volumes,
+            manifest_media_type: existing.manifest_media_type,
+            selected_manifest_digest: existing.selected_manifest_digest,
+            selected_platform: existing.selected_platform,
+            stored_layers: existing.stored_layers,
+            artifact_type: existing.artifact_type,
+            artifact_blobs: existing.artifact_blobs,
+        })
+        .await
+    }
 }
 
 #[tonic::async_trait]
@@ -2257,11 +2352,148 @@ impl ImageService for ImageServiceImpl {
         }
     }
 
+    // 删除镜像
     async fn remove_image(
         &self,
-        _request: Request<RemoveImageRequest>,
+        request: Request<RemoveImageRequest>,
     ) -> Result<Response<RemoveImageResponse>, Status> {
-        Err(tonic::Status::unimplemented("remove image: not implemented"))
+        let req = request.into_inner();
+
+        match req.image {
+            Some(image_spec) => {
+                let requested_ref = image_spec.image;
+                for root in self.additional_artifact_store_roots() {
+                    if Self::artifact_mount_candidates(root, &requested_ref)
+                        .ok()
+                        .flatten()
+                        .is_some()
+                    {
+                        return Err(Status::failed_precondition(format!(
+                            "image {} is provided by a read-only additional OCI artifact store",
+                            requested_ref
+                        )));
+                    }
+                }
+
+                let exact_tag_candidate = {
+                    let images = self.images.lock().await;
+                    images
+                        .values()
+                        .find(|image| image.repo_tags.iter().any(|tag| tag == &requested_ref))
+                        .cloned()
+                        .map(|image| {
+                            let sibling_tags = images
+                                .values()
+                                .filter(|candidate| candidate.id == image.id)
+                                .flat_map(|candidate| candidate.repo_tags.iter().cloned())
+                                .collect::<HashSet<_>>();
+                            (image, sibling_tags)
+                        })
+                };
+
+                if let Some((mut image, sibling_tags)) = exact_tag_candidate {
+                    let requested_is_id_or_digest =
+                        Self::image_id_matches(&image.id, &requested_ref)
+                            || image
+                                .repo_digests
+                                .iter()
+                                .any(|digest| digest == &requested_ref);
+                    if !requested_is_id_or_digest && sibling_tags.len() > 1 {
+                        let remaining_tags = sibling_tags
+                            .into_iter()
+                            .filter(|tag| tag != &requested_ref)
+                            .collect::<Vec<_>>();
+                        image.repo_tags = remaining_tags.clone();
+                        image.spec = remaining_tags.first().cloned().map(|tag| ImageSpec {
+                            image: tag.clone(),
+                            user_specified_image: tag,
+                            ..Default::default()
+                        });
+
+                        let mut images = self.images.lock().await;
+                        images.remove(&requested_ref);
+                        for candidate in images.values_mut() {
+                            if candidate.id == image.id {
+                                candidate.repo_tags = remaining_tags.clone();
+                                candidate.spec = image.spec.clone();
+                            }
+                        }
+                        drop(images);
+
+                        self.persist_image_from_proto(&image).await.map_err(|e| {
+                            Status::internal(format!(
+                                "Failed to persist image metadata after untag: {}",
+                                e
+                            ))
+                        })?;
+                        return Ok(Response::new(RemoveImageResponse {}));
+                    }
+                }
+
+                let (candidate_ids, candidate_refs): (HashSet<String>, HashSet<String>) = {
+                    let images = self.images.lock().await;
+                    if let Some(image) = images.get(&requested_ref) {
+                        let mut ids = HashSet::new();
+                        ids.insert(image.id.clone());
+                        let mut refs = HashSet::new();
+                        refs.insert(requested_ref.clone());
+                        refs.extend(image.repo_tags.iter().cloned());
+                        (ids, refs)
+                    } else {
+                        let matched_images: Vec<&Image> = images
+                            .values()
+                            .filter(|image| Self::image_matches_ref(image, &requested_ref))
+                            .collect();
+                        let ids = matched_images
+                            .iter()
+                            .map(|image| image.id.clone())
+                            .collect::<HashSet<_>>();
+                        let refs = matched_images
+                            .iter()
+                            .flat_map(|image| image.repo_tags.iter().cloned())
+                            .chain(std::iter::once(requested_ref.clone()))
+                            .collect::<HashSet<_>>();
+                        (ids, refs)
+                    }
+                };
+
+                if candidate_ids.is_empty() {
+                    Ok(Response::new(RemoveImageResponse {}))
+                } else {
+                    // self.image_is_in_use;
+
+                    let image_ids_to_remove: Vec<String> = {
+                        let mut images = self.images.lock().await;
+                        images.retain(|key, image| {
+                            !(candidate_ids.contains(&image.id)
+                                || candidate_refs.contains(key)
+                                || image
+                                    .repo_tags
+                                    .iter()
+                                    .any(|tag| candidate_refs.contains(tag)))
+                        });
+                        candidate_ids.iter().cloned().collect()
+                    };
+
+                    for image_id in image_ids_to_remove {
+                        let is_artifact = self
+                            .load_image_metadata(&image_id)
+                            .as_ref()
+                            .map(Self::is_artifact_meta)
+                            .unwrap_or(false);
+                        if let Err(err) = self.metadata_store.delete_by_id(&image_id, is_artifact) {
+                            error!("Failed to delete image metadata for {}: {}", image_id, err);
+                        }
+                    }
+
+                    Ok(Response::new(RemoveImageResponse {}))
+                }
+            }
+            None => {
+                // 如果没有指定镜像，返回成功而不是错误
+                Ok(Response::new(RemoveImageResponse {}))
+            }
+        }
     }
 
     async fn image_fs_info(
