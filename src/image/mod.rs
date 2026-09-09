@@ -2496,11 +2496,35 @@ impl ImageService for ImageServiceImpl {
         }
     }
 
+    // 获取镜像文件信息
     async fn image_fs_info(
         &self,
         _request: Request<ImageFsInfoRequest>,
     ) -> Result<Response<ImageFsInfoResponse>, Status> {
-        Err(tonic::Status::unimplemented("image fs info: not implemented"))
+        let (metadata_bytes, metadata_inodes) = self
+            .metadata_store
+            .usage()
+            .map_err(|e| Status::internal(format!("Failed to collect metadata usage: {}", e)))?;
+        let (content_bytes, content_inodes) = self
+            .content_store
+            .total_usage()
+            .map_err(|e| Status::internal(format!("Failed to collect content usage: {}", e)))?;
+        let used_bytes = metadata_bytes.saturating_add(content_bytes);
+        let inodes_used = metadata_inodes.saturating_add(content_inodes);
+
+        let usage = FilesystemUsage {
+            timestamp: Self::now_nanos(),
+            fs_id: Some(FilesystemIdentifier {
+                mountpoint: self.storage_path.display().to_string(),
+            }),
+            used_bytes: Some(UInt64Value { value: used_bytes }),
+            inodes_used: Some(UInt64Value { value: inodes_used }),
+        };
+
+        Ok(Response::new(ImageFsInfoResponse {
+            image_filesystems: vec![usage],
+            container_filesystems: Vec::new(),
+        }))
     }
 }
 
