@@ -27,6 +27,7 @@ use uuid::Uuid;
 use sha2::{Digest, Sha256};
 
 use crate::storage::{ContentBlobRecord, StorageManager};
+use crate::storage::ContentTransferRecord as StoredContentTransferRecord;
 
 #[derive(Debug, Clone)]
 pub struct FsContentStore {
@@ -380,8 +381,19 @@ pub struct ContentTransferRecord {
 
 impl ContentTransferRecord {
     
-    pub fn to_storage(&self) -> ContentTransferRecord {
-        todo!("若存储时需要对struct进行处理，再对记录中元素转换")
+    pub fn to_storage(&self) -> StoredContentTransferRecord {
+        StoredContentTransferRecord {
+            id: self.id.clone(),
+            source: self.source.clone(),
+            provider: self.provider.as_str().to_string(),
+            state: self.state.as_str().to_string(),
+            current_stage: self.current_stage.clone(),
+            bytes_total: self.bytes_total,
+            bytes_completed: self.bytes_completed,
+            started_at: self.started_at_unix_nanos,
+            finished_at: self.finished_at_unix_nanos,
+            error: self.error.clone(),
+        }
     }
 }
 
@@ -410,6 +422,17 @@ pub enum TransferState {
     Succeeded,
     Failed,
     Interrupted,
+}
+
+impl TransferState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
 }
 
 #[derive(Debug)]
