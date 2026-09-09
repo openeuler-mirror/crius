@@ -650,7 +650,7 @@ impl ImageServiceImpl {
             return Ok(());
         };
         StorageManager::new(db_path)
-            .and_then(|mut storage| storage.save_content_transfer(&record))
+            .and_then(|mut storage| storage.save_content_transfer(&record.to_storage()))
             .map_err(|err| Error::Storage(format!("failed to persist content transfer: {err}")))
     }
 
