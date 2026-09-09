@@ -80,6 +80,18 @@ impl FilesystemImageMetadataStore {
         Ok((bytes, inodes))
     }
 
+    pub fn delete_by_id(&self, image_id: &str, artifact: bool) -> Result<()> {
+        if let Some(db_path) = self.ledger_db_path.as_ref() {
+            let mut storage = StorageManager::new(db_path)?;
+            storage.delete_image(image_id)?;
+        }
+        let record_dir = Self::local_record_dir(&self.storage_root, image_id, artifact);
+        if record_dir.exists() {
+            std::fs::remove_dir_all(&record_dir)
+                .with_context(|| format!("failed to remove {}", record_dir.display()))?;
+        }
+        Ok(())
+    }
 }
 
 impl FilesystemImageMetadataStore {
