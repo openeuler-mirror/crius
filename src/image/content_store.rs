@@ -154,6 +154,14 @@ impl FsContentStore {
             .with_context(|| format!("failed to write blob metadata {}", path.display()))?;
         Ok(())
     }
+
+    pub fn blobs_root(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
+    pub fn total_usage(&self) -> Result<(u64, u64)> {
+        collect_path_usage(&self.blobs_root())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -468,4 +476,27 @@ impl ContentTransferGuard {
 
 fn now_unix_nanos() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()
+}
+
+pub fn collect_path_usage(path: &Path) -> Result<(u64, u64)> {
+    if !path.exists() {
+        return Ok((0, 0));
+    }
+    let mut bytes = 0u64;
+    let mut inodes = 0u64;
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("failed to read directory {}", path.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        inodes = inodes.saturating_add(1);
+        if metadata.is_dir() {
+            let (child_bytes, child_inodes) = collect_path_usage(&entry.path())?;
+            bytes = bytes.saturating_add(child_bytes);
+            inodes = inodes.saturating_add(child_inodes);
+        } else {
+            bytes = bytes.saturating_add(metadata.len());
+        }
+    }
+    Ok((bytes, inodes))
 }

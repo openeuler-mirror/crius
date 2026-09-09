@@ -1844,6 +1844,113 @@ impl ImageServiceImpl {
 
         Some(Self::normalized_image(merged))
     }
+
+    fn build_image_verbose_info(
+        image: &Image,
+        metadata_store: &FilesystemImageMetadataStore,
+        content_store: &FsContentStore,
+        storage_driver: &str,
+        storage_options: &[String],
+        parsed_storage_options: &OverlayImageStorageOptions,
+    ) -> Result<HashMap<String, String>, Status> {
+        let stored = metadata_store.load_by_id(&image.id);
+        let image_dir = stored
+            .as_ref()
+            .map(|record| record.record_dir.clone())
+            .unwrap_or_else(|| {
+                FilesystemImageMetadataStore::image_records_dir(metadata_store.storage_root())
+                    .join(&image.id)
+            });
+        let meta = stored.as_ref().map(|record| &record.meta);
+        let layer_files = meta
+            .map(|meta| {
+                if !meta.stored_layers.is_empty() {
+                    return meta
+                        .stored_layers
+                        .iter()
+                        .filter_map(StoredLayerMeta::relative_display_path)
+                        .collect::<Vec<_>>();
+                }
+                Vec::new()
+            })
+            .filter(|layers| !layers.is_empty())
+            .unwrap_or_else(|| {
+                std::fs::read_dir(&image_dir)
+                    .ok()
+                    .into_iter()
+                    .flat_map(|entries| entries.flatten())
+                    .filter_map(|entry| {
+                        let path = entry.path();
+                        path.file_name()
+                            .and_then(|name| name.to_str())
+                            .filter(|_| {
+                                matches!(
+                                    path.extension().and_then(|ext| ext.to_str()),
+                                    Some("gz" | "tar")
+                                )
+                            })
+                            .map(|name| name.to_string())
+                    })
+                    .collect::<Vec<_>>()
+            });
+        let (metadata_bytes, metadata_inodes) = metadata_store.usage().unwrap_or((0, 0));
+        let (content_bytes, content_inodes) = content_store.total_usage().unwrap_or((0, 0));
+        let collected_at = Self::now_nanos();
+
+        let payload = serde_json::json!({
+            "id": image.id,
+            "repoTags": image.repo_tags,
+            "repoDigests": image.repo_digests,
+            "size": image.size,
+            "pinned": image.pinned,
+            "pulledAt": meta.map(|meta| meta.pulled_at),
+            "sourceReference": meta.and_then(|meta| meta.source_reference.clone()),
+            "os": meta.and_then(|meta| meta.os.clone()),
+            "architecture": meta.and_then(|meta| meta.architecture.clone()),
+            "configUser": meta.and_then(|meta| meta.config_user.clone()),
+            "annotations": meta
+                .map(|meta| meta.annotations.clone())
+                .unwrap_or_default(),
+            "declaredVolumes": meta
+                .map(|meta| meta.declared_volumes.clone())
+                .unwrap_or_default(),
+            "manifestMediaType": meta
+                .and_then(|meta| meta.manifest_media_type.clone()),
+            "selectedManifestDigest": meta
+                .and_then(|meta| meta.selected_manifest_digest.clone()),
+            "selectedPlatform": meta
+                .and_then(|meta| meta.selected_platform.clone()),
+            "storedLayers": meta
+                .map(|meta| meta.stored_layers.clone())
+                .unwrap_or_default(),
+            "artifactType": meta.and_then(|meta| meta.artifact_type.clone()),
+            "artifactBlobs": meta
+                .map(|meta| meta.artifact_blobs.clone())
+                .unwrap_or_default(),
+            "storagePath": image_dir.display().to_string(),
+            "storageDriver": storage_driver,
+            "storageOptions": storage_options,
+            "effectiveStorageOptions": parsed_storage_options,
+            "layers": layer_files,
+            "snapshotStats": {
+                "metadataBytes": metadata_bytes,
+                "metadataInodes": metadata_inodes,
+                "contentBytes": content_bytes,
+                "contentInodes": content_inodes,
+                "layerCount": layer_files.len(),
+                "collectedAt": collected_at,
+            },
+        });
+
+        let mut info = HashMap::new();
+        info.insert(
+            "info".to_string(),
+            serde_json::to_string(&payload).map_err(|e| {
+                Status::internal(format!("Failed to encode image verbose info: {}", e))
+            })?,
+        );
+        Ok(info)
+    }
 }
 
 #[tonic::async_trait]
@@ -1893,11 +2000,66 @@ impl ImageService for ImageServiceImpl {
         }))
     }
 
+    // 获取镜像状态
     async fn image_status(
         &self,
-        _request: Request<ImageStatusRequest>,
+        request: Request<ImageStatusRequest>,
     ) -> Result<Response<ImageStatusResponse>, Status> {
-        Err(tonic::Status::unimplemented("image status: not implemented"))
+        let req = request.into_inner();
+        let image_spec = req
+            .image
+            .ok_or_else(|| Status::invalid_argument("Image not specified"))?;
+        let requested_ref = image_spec.image;
+        let images: Vec<Image> = {
+            let images = self.images.lock().await;
+            images.values().cloned().collect()
+        };
+
+        if let Some(matched_image) = images
+            .iter()
+            .find(|image| Self::image_matches_ref(image, &requested_ref))
+        {
+            let meta = self.load_image_metadata(&matched_image.id);
+            if let Some(mut image) = Self::aggregate_image_records(
+                images
+                    .iter()
+                    .filter(|candidate| candidate.id == matched_image.id),
+                meta.as_ref(),
+            ) {
+                let annotations = image
+                    .spec
+                    .as_ref()
+                    .map(|spec| spec.annotations.clone())
+                    .unwrap_or_default();
+                image.spec = Some(ImageSpec {
+                    image: requested_ref.clone(),
+                    user_specified_image: requested_ref.clone(),
+                    annotations,
+                    ..Default::default()
+                });
+
+                return Ok(Response::new(ImageStatusResponse {
+                    image: Some(image.clone()),
+                    info: if req.verbose {
+                        Self::build_image_verbose_info(
+                            &image,
+                            &self.metadata_store,
+                            &self.content_store,
+                            &self.storage_driver,
+                            &self.storage_options,
+                            &self.parsed_storage_options,
+                        )?
+                    } else {
+                        HashMap::new()
+                    },
+                }));
+            }
+        }
+
+        Ok(Response::new(ImageStatusResponse {
+            image: None,
+            info: HashMap::new(),
+        }))
     }
 
     async fn pull_image(
@@ -2196,6 +2358,19 @@ pub struct StoredLayerMeta {
     pub media_type: String,
     pub source_media_type: String,
     pub encrypted: bool,
+}
+
+impl StoredLayerMeta {
+    pub fn relative_display_path(&self) -> Option<String> {
+        let path = Path::new(self.path.trim());
+        if self.path.trim().is_empty() {
+            return None;
+        }
+        path.strip_prefix("blobs")
+            .ok()
+            .map(|value| value.display().to_string())
+            .or_else(|| Some(self.path.clone()))
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

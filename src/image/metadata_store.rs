@@ -48,6 +48,38 @@ impl FilesystemImageMetadataStore {
             ledger_db_path,
         }
     }
+
+    pub fn storage_root(&self) -> &Path {
+        &self.storage_root
+    }
+
+    pub fn usage(&self) -> Result<(u64, u64)> {
+        let mut bytes = 0u64;
+        let mut inodes = 0u64;
+        if let Some(db_path) = self.ledger_db_path.as_ref() {
+            if db_path.exists() {
+                let metadata = std::fs::metadata(db_path)
+                    .with_context(|| format!("failed to stat {}", db_path.display()))?;
+                bytes = bytes.saturating_add(metadata.len());
+                inodes = inodes.saturating_add(1);
+            }
+        }
+        for root in std::iter::once(self.storage_root.as_path())
+            .chain(self.additional_artifact_stores.iter().map(PathBuf::as_path))
+        {
+            for path in [
+                Self::image_records_dir(root),
+                Self::artifact_records_dir(root),
+            ] {
+                let (path_bytes, path_inodes) =
+                    crate::image::content_store::collect_path_usage(&path)?;
+                bytes = bytes.saturating_add(path_bytes);
+                inodes = inodes.saturating_add(path_inodes);
+            }
+        }
+        Ok((bytes, inodes))
+    }
+
 }
 
 impl FilesystemImageMetadataStore {
