@@ -1740,15 +1740,157 @@ impl ImageServiceImpl {
             image_ref: image_id,
         }))
     }
+
+    fn normalized_image(mut image: Image) -> Image {
+        if image.spec.is_none() {
+            if let Some(tag) = image.repo_tags.first().cloned() {
+                image.spec = Some(ImageSpec {
+                    image: tag.clone(),
+                    user_specified_image: tag,
+                    ..Default::default()
+                });
+            }
+        }
+        image
+    }
+    
+    fn aggregate_image_records<'a, I>(images: I, meta: Option<&ImageMeta>) -> Option<Image>
+    where
+        I: IntoIterator<Item = &'a Image>,
+    {
+        let mut iter = images.into_iter();
+        let first = iter.next()?;
+        let mut merged = first.clone();
+        merged.repo_tags.clear();
+        merged.repo_digests.clear();
+
+        for tag in &first.repo_tags {
+            Self::push_unique(&mut merged.repo_tags, tag);
+        }
+        for digest in &first.repo_digests {
+            Self::push_unique(&mut merged.repo_digests, digest);
+        }
+
+        for image in iter {
+            if merged.size == 0 {
+                merged.size = image.size;
+            } else {
+                merged.size = merged.size.max(image.size);
+            }
+            merged.pinned |= image.pinned;
+            if merged.uid.is_none() && image.uid.is_some() {
+                merged.uid = image.uid.clone();
+            }
+            if merged.username.is_empty() && !image.username.is_empty() {
+                merged.username = image.username.clone();
+            }
+            if merged.spec.is_none() && image.spec.is_some() {
+                merged.spec = image.spec.clone();
+            }
+            if let Some(spec) = merged.spec.as_mut() {
+                if spec.annotations.is_empty() {
+                    spec.annotations = image
+                        .spec
+                        .as_ref()
+                        .map(|candidate| candidate.annotations.clone())
+                        .unwrap_or_default();
+                }
+            }
+            for tag in &image.repo_tags {
+                Self::push_unique(&mut merged.repo_tags, tag);
+            }
+            for digest in &image.repo_digests {
+                Self::push_unique(&mut merged.repo_digests, digest);
+            }
+        }
+
+        if let Some(meta) = meta {
+            if merged.size == 0 {
+                merged.size = meta.size;
+            }
+            merged.pinned |= meta.pinned;
+            let (uid, username) =
+                Self::image_user_fields_from_config_user(meta.config_user.as_deref());
+            if merged.uid.is_none() {
+                merged.uid = uid;
+            }
+            if merged.username.is_empty() {
+                merged.username = username;
+            }
+            if merged.spec.is_none() {
+                merged.spec = meta.repo_tags.first().map(|tag| ImageSpec {
+                    image: tag.clone(),
+                    user_specified_image: tag.clone(),
+                    annotations: meta.annotations.clone(),
+                    ..Default::default()
+                });
+            } else if let Some(spec) = merged.spec.as_mut() {
+                if spec.annotations.is_empty() {
+                    spec.annotations = meta.annotations.clone();
+                }
+            }
+            for tag in &meta.repo_tags {
+                Self::push_unique(&mut merged.repo_tags, tag);
+            }
+            for digest in &meta.repo_digests {
+                Self::push_unique(&mut merged.repo_digests, digest);
+            }
+        }
+
+        merged.repo_tags.sort();
+        merged.repo_tags.dedup();
+        merged.repo_digests.sort();
+        merged.repo_digests.dedup();
+
+        Some(Self::normalized_image(merged))
+    }
 }
 
 #[tonic::async_trait]
 impl ImageService for ImageServiceImpl {
+    // 列出镜像
     async fn list_images(
         &self,
-        _request: Request<ListImagesRequest>,
+        request: Request<ListImagesRequest>,
     ) -> Result<Response<ListImagesResponse>, Status> {
-        Err(tonic::Status::unimplemented("list image: not implemented"))
+        let req = request.into_inner();
+        let requested_ref = req
+            .filter
+            .and_then(|filter| filter.image)
+            .map(|image| image.image)
+            .filter(|image| !image.is_empty());
+        let images: Vec<Image> = {
+            let images = self.images.lock().await;
+            info!("Number of images in memory: {}", images.len());
+            for (key, image) in images.iter() {
+                info!("Image: {} -> {}", key, image.id);
+            }
+            images.values().cloned().collect()
+        };
+        let mut grouped: HashMap<String, Vec<Image>> = HashMap::new();
+        for image in images {
+            grouped.entry(image.id.clone()).or_default().push(image);
+        }
+
+        let mut images_list = Vec::new();
+        for (image_id, group) in grouped {
+            let meta = self.load_image_metadata(&image_id);
+            let Some(image) = Self::aggregate_image_records(group.iter(), meta.as_ref()) else {
+                continue;
+            };
+            let matched = requested_ref
+                .as_ref()
+                .map(|requested_ref| Self::image_matches_ref(&image, requested_ref))
+                .unwrap_or(true);
+            if matched {
+                images_list.push(image);
+            }
+        }
+        images_list.sort_by(|left, right| left.id.cmp(&right.id));
+
+        Ok(Response::new(ListImagesResponse {
+            images: images_list,
+        }))
     }
 
     async fn image_status(
