@@ -142,6 +142,16 @@ pub struct Daemon {
     exit_code_file: Option<PathBuf>,
     /// attach/resize socket 根目录
     attach_socket_dir: Option<PathBuf>,
+    /// shim 创建的宿主 IO 工件默认 UID。
+    io_uid: u32,
+    /// shim 创建的宿主 IO 工件默认 GID。
+    io_gid: u32,
+    /// CRI 单条日志记录切分阈值（字节）。
+    max_container_log_line_size: usize,
+    /// 是否额外写 journald。
+    log_to_journald: bool,
+    /// 是否在日志轮转和容器退出时跳过 sync。
+    no_sync_log: bool,
     /// 是否禁用 pivot_root，改用 MS_MOVE。
     no_pivot: bool,
     /// 是否禁止创建新的 session keyring。
@@ -152,6 +162,8 @@ pub struct Daemon {
     work_dir: PathBuf,
     /// 统一账本路径。
     state_db_path: Option<PathBuf>,
+    /// IO管理器
+    io_manager: IoManager,
     /// 是否正在运行
     running: Arc<AtomicBool>,
     /// task 生命周期状态。
@@ -196,10 +208,14 @@ impl Daemon {
             state_db_path,
             exit_code_file,
             attach_socket_dir,
+            io_uid,
+            io_gid,
+            max_container_log_line_size,
+            log_to_journald,
+            no_sync_log,
             no_pivot,
             no_new_keyring,
             systemd_cgroup,
-            ..
         } = options;
         Self {
             container_id,
@@ -211,9 +227,15 @@ impl Daemon {
             state_db_path,
             exit_code_file,
             attach_socket_dir,
+            io_uid,
+            io_gid,
+            max_container_log_line_size,
+            log_to_journald,
+            no_sync_log,
             no_pivot,
             no_new_keyring,
             systemd_cgroup,
+            io_manager: IoManager::new(),
             running: Arc::new(AtomicBool::new(true)),
             task_state: Arc::new(Mutex::new(DaemonTaskState::Init)),
             container_pid: Arc::new(Mutex::new(None)),
@@ -508,15 +530,130 @@ impl Daemon {
             .unwrap_or(container_state.tty))
     }
 
+    fn create_io_pipe() -> Result<(File, File)> {
+        let mut fds = [0; 2];
+        let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if result < 0 {
+            return Err(anyhow::anyhow!(
+                "failed to create container IO pipe: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let read = unsafe { File::from_raw_fd(fds[0]) };
+        let write = unsafe { File::from_raw_fd(fds[1]) };
+        Ok((read, write))
+    }
+
+    fn spawn_pipe_pump(
+        mut pipe: File,
+        io_manager: IoManager,
+        stream: &'static str,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            let mut buffer = [0u8; 8192];
+            loop {
+                match std::io::Read::read(&mut pipe, &mut buffer) {
+                    Ok(0) => {
+                        Self::finish_pipe_stream(&io_manager, stream);
+                        break;
+                    }
+                    Ok(n) => {
+                        let result = match stream {
+                            "stdout" => io_manager.write_stdout(&buffer[..n]),
+                            "stderr" => io_manager.write_stderr(&buffer[..n]),
+                            _ => unreachable!("unsupported pipe stream {}", stream),
+                        };
+                        if let Err(e) = result {
+                            debug!("{} pump stopped: {}", stream, e);
+                            Self::finish_pipe_stream(&io_manager, stream);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        debug!("{} pump stopped: {}", stream, e);
+                        Self::finish_pipe_stream(&io_manager, stream);
+                        break;
+                    }
+                }
+            }
+        })
+    }
+
+    fn finish_pipe_stream(io_manager: &IoManager, stream: &str) {
+        let result = match stream {
+            "stdout" => io_manager.finish_stdout(),
+            "stderr" => io_manager.finish_stderr(),
+            _ => unreachable!("unsupported pipe stream {}", stream),
+        };
+        if let Err(e) = result {
+            debug!("failed to finish {} stream: {}", stream, e);
+        }
+    }
+
     /// 设置IO
+    fn setup_io(&mut self) -> Result<()> {
+        let bundle_config = self.load_bundle_config()?;
+        let container_state = self
+            .load_container_state(&bundle_config)
+            .unwrap_or_default();
+        let io_config = IoConfig {
+            stdin: None,
+            stdout: container_state.log_path.as_ref().map(PathBuf::from),
+            stderr: None,
+            terminal: bundle_config
+                .process
+                .as_ref()
+                .and_then(|process| process.terminal)
+                .unwrap_or(container_state.tty),
+            attach_socket: Some(self.attach_socket_container_dir().join("attach.sock")),
+            resize_socket: bundle_config
+                .process
+                .as_ref()
+                .and_then(|process| process.terminal)
+                .unwrap_or(container_state.tty)
+                .then(|| self.attach_socket_container_dir().join("resize.sock")),
+            reopen_socket: container_state
+                .log_path
+                .as_ref()
+                .map(|_| self.shim_dir().join("reopen.sock")),
+            journald: self.log_to_journald.then(|| JournalConfig {
+                socket_path: PathBuf::from(DEFAULT_JOURNALD_SOCKET_PATH),
+                container_id: self.container_id.clone(),
+                container_name: container_state.metadata_name.clone(),
+                syslog_identifier: "crius-shim".to_string(),
+            }),
+            no_sync_log: self.no_sync_log,
+            io_uid: self.io_uid,
+            io_gid: self.io_gid,
+            max_log_line_size: self.max_container_log_line_size,
+        };
+        self.io_manager.configure(io_config)?;
+        self.io_manager.start_attach_server()?;
+        self.io_manager.start_resize_server()?;
+        self.io_manager.start_reopen_log_server()?;
+        info!("IO setup complete");
+        Ok(())
+    }
+
+    fn setup_io_once(&self) -> Result<()> {
+        let current = *self.task_state.lock().unwrap();
+        if !matches!(current, DaemonTaskState::Init) {
+            return Ok(());
+        }
+        let mut daemon = self.clone();
+        daemon.setup_io()
+    }
 
     /// 创建TTY容器
+
     fn run_non_terminal_container(&self) -> Result<i32> {
         let bundle_config = self.load_bundle_config()?;
         let container_state = self
             .load_container_state(&bundle_config)
             .unwrap_or_default();
 
+        let (stdout_read, stdout_write) = Self::create_io_pipe()?;
+        let (stderr_read, stderr_write) = Self::create_io_pipe()?;
         let mut cmd = self.runtime_command();
         cmd.arg("run").arg("--bundle").arg(&self.bundle);
         if self.no_pivot {
@@ -528,35 +665,50 @@ impl Daemon {
         cmd.arg(&self.container_id);
 
         if container_state.stdin {
-            cmd.stdin(Stdio::piped());
+            cmd.stdin(std::process::Stdio::piped());
         } else {
-            cmd.stdin(Stdio::null());
+            cmd.stdin(std::process::Stdio::null());
         }
-        match container_state.log_path.as_ref() {
-            Some(log_path) => {
-                let file = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(log_path)
-                    .with_context(|| format!("failed to open log file {}", log_path))?;
-                let stderr = file.try_clone().context("failed to clone log file")?;
-                cmd.stdout(Stdio::from(file));
-                cmd.stderr(Stdio::from(stderr));
-            }
-            None => {
-                cmd.stdout(Stdio::null());
-                cmd.stderr(Stdio::null());
-            }
-        }
+        cmd.stdout(Stdio::from(stdout_write));
+        cmd.stderr(Stdio::from(stderr_write));
 
         let mut child = cmd.spawn().context("Failed to execute runc run")?;
-        if let Some(stdin) = child.stdin.take() {
-            drop(stdin);
-        }
+        drop(cmd);
         info!(
             "Container {} started via foreground runc run (stdin={}, stdin_once={})",
             self.container_id, container_state.stdin, container_state.stdin_once
         );
+
+        let stdout_handle = Some(Self::spawn_pipe_pump(
+            stdout_read,
+            self.io_manager.clone(),
+            "stdout",
+        ));
+        let stderr_handle = Some(Self::spawn_pipe_pump(
+            stderr_read,
+            self.io_manager.clone(),
+            "stderr",
+        ));
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let io_manager = self.io_manager.clone();
+            std::thread::spawn(move || loop {
+                match io_manager.read_stdin() {
+                    Ok(data) if !data.is_empty() => {
+                        if let Err(e) = std::io::Write::write_all(&mut stdin, &data) {
+                            debug!("stdin pump stopped: {}", e);
+                            break;
+                        }
+                        let _ = std::io::Write::flush(&mut stdin);
+                    }
+                    Ok(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+                    Err(e) => {
+                        debug!("stdin pump stopped: {}", e);
+                        break;
+                    }
+                }
+            });
+        }
 
         let shutdown_grace = std::time::Duration::from_secs(5);
         let mut shutdown_deadline: Option<std::time::Instant> = None;
@@ -586,10 +738,18 @@ impl Daemon {
             _ => 1,
         };
 
+        if let Some(handle) = stdout_handle {
+            let _ = handle.join();
+        }
+        if let Some(handle) = stderr_handle {
+            let _ = handle.join();
+        }
+
         self.cleanup_container()?;
+        self.io_manager.shutdown()?;
+        self.cleanup_attach_socket_directory();
         Ok(exit_code)
     }
-
 
     /// 监控容器进程
 
@@ -694,6 +854,10 @@ impl Daemon {
         if let Some(handle) = self.task_thread.lock().unwrap().take() {
             let _ = handle.join();
         }
+        if let Err(err) = self.io_manager.shutdown() {
+            warn!("Failed to shutdown IO manager during delete: {}", err);
+        }
+        self.cleanup_attach_socket_directory();
         self.set_task_state(DaemonTaskState::Deleted);
         Ok(())
     }
@@ -704,6 +868,7 @@ impl ShimRpcHandler for Daemon {
         match request {
             ShimRpcRequest::Ping => Ok(ShimRpcResponse::Empty),
             ShimRpcRequest::CreateTask(_) => {
+                self.setup_io_once()?;
                 self.set_task_state(DaemonTaskState::Created);
                 Ok(ShimRpcResponse::Empty)
             }
@@ -724,6 +889,14 @@ impl ShimRpcHandler for Daemon {
                 self.delete_task_internal(&request)?;
                 Ok(ShimRpcResponse::Empty)
             }
+            ShimRpcRequest::ReopenLog(ReopenLogRequest { .. }) => {
+                self.io_manager.reopen_log_file()?;
+                Ok(ShimRpcResponse::Empty)
+            }
+            ShimRpcRequest::ResizePty(ResizePtyRequest { width, height, .. }) => {
+                self.io_manager.apply_terminal_resize(width, height)?;
+                Ok(ShimRpcResponse::Empty)
+            }
             ShimRpcRequest::Status(StatusRequest { .. }) => {
                 Ok(ShimRpcResponse::Status(self.task_status()))
             }
@@ -731,7 +904,7 @@ impl ShimRpcHandler for Daemon {
                 ShimRpcResponse::ContainerPid(*self.container_pid.lock().unwrap()),
             ),
             _ => Err(anyhow::anyhow!(
-                "RPC is not implemented by this shim milestone (task lifecycle)"
+                "RPC is not implemented by this shim milestone (CRI logging)"
             )),
         }
     }
