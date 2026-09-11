@@ -14,27 +14,13 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
+//! crius-shim 模块
 //!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
+//! 提供OCI容器运行时shim功能
 
-#[cfg(feature = "shim")]
-pub mod shim;
+pub mod io;
+pub mod process;
+pub mod subreaper;
 
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod storage;
-pub mod service;
-pub mod crs;
-pub mod proto {
-    pub mod runtime {
-        pub mod v1 {
-            tonic::include_proto!("runtime.v1");
-        }
-    }
-}
+pub use io::{IoConfig, IoManager};
