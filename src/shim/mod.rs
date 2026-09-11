@@ -19,8 +19,10 @@ limitations under the License.
 //!
 //! 提供OCI容器运行时shim功能
 
+pub mod daemon;
 pub mod io;
 pub mod process;
 pub mod subreaper;
 
+pub use daemon::{Daemon, DaemonOptions};
 pub use io::{IoConfig, IoManager};
