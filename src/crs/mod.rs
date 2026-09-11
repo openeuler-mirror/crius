@@ -21,6 +21,8 @@ pub(crate) mod client;
 pub(crate) mod context;
 pub(crate) mod parsers;
 pub(crate) mod commands;
+pub(crate) mod format;
+pub(crate) mod ids;
 
 use std::ffi::OsString;
 

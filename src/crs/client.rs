@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::time::Duration;
 use std::path::Path;
+use std::future::Future;
 
 use tonic::transport::{Channel, Endpoint as TonicEndpoint};
 use hyper::Uri;
@@ -89,6 +90,29 @@ impl CrsClient {
         &self.endpoint
     }
 
+    #[allow(dead_code, clippy::result_large_err)]
+    pub(crate) fn image(&self) -> Result<ImageServiceClient<Channel>, CliError> {
+        self.image.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "image service client is not connected; call CrsClient::connect first",
+            )
+        })
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn with_rpc_timeout<F, T>(&self, future: F) -> Result<T, CliError>
+    where
+        F: Future<Output = Result<T, CliError>>,
+    {
+        if self.rpc_timeout.is_zero() {
+            return future.await;
+        }
+
+        tokio::time::timeout(self.rpc_timeout, future)
+            .await
+            .map_err(|_| CliError::timeout("RPC timed out", self.endpoint()))?
+    }
 
 }
 

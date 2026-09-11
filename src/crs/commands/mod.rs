@@ -14,6 +14,10 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+pub(crate) mod shortcuts;
+pub(crate) mod image;
+pub(crate) mod status;
+
 use std::unimplemented;
 
 use crate::crs::{
@@ -28,7 +32,7 @@ pub(crate) async fn dispatch(
 ) -> Result<CommandResult, CliError> {
     match command {
         Command::Version(args) => unimplemented!(),
-        Command::Images(args) => unimplemented!(),
+        Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
         Command::Pull(args) => unimplemented!(),
         Command::Rmi { image: image_name } => unimplemented!(),
         Command::Image(args) => unimplemented!(),
