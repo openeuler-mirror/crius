@@ -18,6 +18,11 @@ path = "src/main.rs"
 name = "crs"
 path = "src/crs/main.rs"
 
+[[bin]]
+name = "crius-shim"
+path = "src/shim/main.rs"
+required-features = ["shim"]
+
 [features]
 default = []
 shim = ["fern", "ctrlc", "libc"]
