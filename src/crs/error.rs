@@ -114,6 +114,11 @@ impl ErrorContext {
         self.endpoint = Some(endpoint.into());
         self
     }
+
+    fn with_command(mut self, command: impl Into<String>) -> Self {
+        self.command = Some(command.into());
+        self
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -368,6 +373,42 @@ impl CliError {
     fn redacted_context_json(&self) -> serde_json::Value {
         serde_json::to_value(self.redacted_context()).unwrap_or_else(|_| json!({}))
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn from_tonic_status(status: tonic::Status) -> Self {
+        Self::Grpc {
+            code: status.code(),
+            message: status.message().to_string(),
+            context: Box::default(),
+        }
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_command(mut self, command: impl Into<String>) -> Self {
+        *self.context_mut() = self.context().clone().with_command(command);
+        self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        *self.context_mut() = self.context().clone().with_endpoint(endpoint);
+        self
+    }
+
+    fn context_mut(&mut self) -> &mut ErrorContext {
+        match self {
+            Self::NotImplemented { context, .. }
+            | Self::Timeout { context, .. }
+            | Self::DiagnosticsUnavailable { context, .. }
+            | Self::DaemonUnavailable { context, .. }
+            | Self::Grpc { context, .. }
+            | Self::Interrupted { context }
+            | Self::InvalidInput { context, .. }
+            | Self::Internal { context, .. } => context,
+        }
+    }
+
+    
 }
 
 pub(crate) fn redact_sensitive(input: &str) -> String {

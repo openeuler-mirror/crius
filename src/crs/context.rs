@@ -65,6 +65,16 @@ impl CliContext {
     pub(crate) fn rpc_timeout(&self) -> Duration{
         self.rpc_timeout
     }
+
+    #[allow(dead_code)]
+    pub(crate) fn quiet(&self) -> bool {
+        self.quiet
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn no_trunc(&self) -> bool {
+        self.no_trunc
+    }
 }
 
 
