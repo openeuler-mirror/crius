@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "crius"
 path = "src/main.rs"
 
+[[bin]]
+name = "crs"
+path = "src/crs/main.rs"
+
 [features]
 default = []
 shim = ["fern", "ctrlc", "libc"]
