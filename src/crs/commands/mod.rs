@@ -33,7 +33,7 @@ pub(crate) async fn dispatch(
     match command {
         Command::Version(args) => unimplemented!(),
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
-        Command::Pull(args) => unimplemented!(),
+        Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
         Command::Rmi { image: image_name } => unimplemented!(),
         Command::Image(args) => unimplemented!(),
         Command::Inspect(args) => unimplemented!(),

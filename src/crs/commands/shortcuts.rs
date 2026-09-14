@@ -19,7 +19,7 @@ use crate::crs::commands::image;
 
 use crate::crs::{
     CliContext, CrsClient,
-    args::ImageListArgs,
+    args::{ImageListArgs, ImagePullArgs},
     CommandResult,commands::CliError
 };
 
@@ -29,4 +29,12 @@ pub(crate) async fn handle_images(
     args: ImageListArgs,
 ) -> Result<CommandResult, CliError> {
     image::handle_list(ctx, client, args).await
+}
+
+pub(crate) async fn handle_pull(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ImagePullArgs,
+) -> Result<CommandResult, CliError> {
+    image::handle_pull(ctx, client, args, "crs pull").await
 }

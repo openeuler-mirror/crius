@@ -114,6 +114,15 @@ impl CrsClient {
             .map_err(|_| CliError::timeout("RPC timed out", self.endpoint()))?
     }
 
+    #[allow(dead_code, clippy::result_large_err)]
+    pub(crate) fn runtime(&self) -> Result<RuntimeServiceClient<Channel>, CliError> {
+        self.runtime.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "runtime service client is not connected; call CrsClient::connect first",
+            )
+        })
+    }
 }
 
 async fn connect_unix_channel(path: &str) -> Result<Channel, CliError> {
