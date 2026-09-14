@@ -31,6 +31,16 @@ pub mod image;
 pub mod storage;
 pub mod service;
 pub mod crs;
+
+#[cfg(feature = "shim")]
+pub mod shim_rpc;
+#[cfg(feature = "shim")]
+pub mod attach;
+#[cfg(feature = "shim")]
+pub mod runtime;
+#[cfg(feature = "shim")]
+pub mod cgroups;
+
 pub mod proto {
     pub mod runtime {
         pub mod v1 {
