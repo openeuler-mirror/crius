@@ -64,6 +64,36 @@ use crate::storage::StorageManager;
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
+fn parse_mount_options(options: &[String]) -> Result<(libc::c_ulong, Option<String>)> {
+    let mut flags: libc::c_ulong = 0;
+    let mut data = Vec::new();
+    for option in options {
+        match option.as_str() {
+            "" | "rw" => {}
+            "ro" => flags |= libc::MS_RDONLY as libc::c_ulong,
+            "bind" => flags |= libc::MS_BIND as libc::c_ulong,
+            "rbind" => flags |= (libc::MS_BIND | libc::MS_REC) as libc::c_ulong,
+            "rec" => flags |= libc::MS_REC as libc::c_ulong,
+            "private" => flags |= libc::MS_PRIVATE as libc::c_ulong,
+            "rprivate" => flags |= (libc::MS_PRIVATE | libc::MS_REC) as libc::c_ulong,
+            "shared" => flags |= libc::MS_SHARED as libc::c_ulong,
+            "rshared" => flags |= (libc::MS_SHARED | libc::MS_REC) as libc::c_ulong,
+            "slave" => flags |= libc::MS_SLAVE as libc::c_ulong,
+            "rslave" => flags |= (libc::MS_SLAVE | libc::MS_REC) as libc::c_ulong,
+            "nosuid" => flags |= libc::MS_NOSUID as libc::c_ulong,
+            "nodev" => flags |= libc::MS_NODEV as libc::c_ulong,
+            "noexec" => flags |= libc::MS_NOEXEC as libc::c_ulong,
+            "sync" => flags |= libc::MS_SYNCHRONOUS as libc::c_ulong,
+            "dirsync" => flags |= libc::MS_DIRSYNC as libc::c_ulong,
+            "noatime" => flags |= libc::MS_NOATIME as libc::c_ulong,
+            "nodiratime" => flags |= libc::MS_NODIRATIME as libc::c_ulong,
+            "relatime" => flags |= libc::MS_RELATIME as libc::c_ulong,
+            other => data.push(other.to_string()),
+        }
+    }
+    Ok((flags, (!data.is_empty()).then(|| data.join(","))))
+}
+
 #[derive(Debug, Deserialize, Default)]
 struct ShimBundleProcess {
     terminal: Option<bool>,
@@ -192,6 +222,17 @@ pub struct Daemon {
     attach_streams: Arc<Mutex<HashMap<String, AttachStreamHandle>>>,
     /// Monotonic attach stream sequence for deterministic ids.
     next_attach_stream_id: Arc<Mutex<u64>>,
+    /// shim-owned rootfs handle from CreateTask.
+    rootfs_handle: Arc<Mutex<Option<ShimRootfsHandle>>>,
+}
+
+#[derive(Debug, Clone)]
+struct ShimRootfsHandle {
+    snapshot_key: Option<String>,
+    rootfs_path: PathBuf,
+    mount_options: Vec<String>,
+    rootfs: Option<RootfsHandle>,
+    mounted_targets: Vec<PathBuf>,
 }
 
 pub struct DaemonOptions {
@@ -262,9 +303,9 @@ impl Daemon {
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),
             attach_streams: Arc::new(Mutex::new(HashMap::new())),
             next_attach_stream_id: Arc::new(Mutex::new(1)),
+            rootfs_handle: Arc::new(Mutex::new(None)),
         }
     }
-
 
     /// 运行守护进程
     pub fn run(self) -> Result<()> {
@@ -359,6 +400,201 @@ impl Daemon {
             }),
         );
         LedgerInternalEventSink::new(path).publish(&event)
+    }
+
+    fn apply_rootfs_override(&self, rootfs_path: &Path) -> Result<()> {
+        let config_path = self.bundle.join("config.json");
+        let raw = fs::read(&config_path)
+            .with_context(|| format!("Failed to read bundle config {}", config_path.display()))?;
+        let mut config: serde_json::Value = serde_json::from_slice(&raw)
+            .with_context(|| format!("Failed to parse bundle config {}", config_path.display()))?;
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("bundle config is not a JSON object"))?
+            .entry("root")
+            .or_insert_with(|| serde_json::json!({}));
+        let root_object = root
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("bundle config root entry is not a JSON object"))?;
+        root_object.insert(
+            "path".to_string(),
+            serde_json::Value::String(rootfs_path.display().to_string()),
+        );
+        fs::write(&config_path, serde_json::to_vec_pretty(&config)?)
+            .with_context(|| format!("Failed to persist bundle config {}", config_path.display()))
+    }
+
+    fn apply_rootfs_handle_mounts(&self, rootfs: Option<&RootfsHandle>) -> Result<Vec<PathBuf>> {
+        let Some(rootfs) = rootfs else {
+            return Ok(Vec::new());
+        };
+        match rootfs.kind {
+            RootfsHandleKind::InternalPath => Ok(Vec::new()),
+            RootfsHandleKind::ExternalMountSpec => {
+                let mut mounted_targets: Vec<PathBuf> = Vec::new();
+                for mount in &rootfs.mounts {
+                    if let Err(err) = Self::mount_rootfs_spec(mount) {
+                        for target in mounted_targets.iter().rev() {
+                            let _ = Self::unmount_rootfs_target(target);
+                        }
+                        if let Some(snapshot_key) = rootfs.snapshot_key.as_deref() {
+                            let _ = self.update_snapshot_state(snapshot_key, "broken");
+                        }
+                        return Err(err);
+                    }
+                    mounted_targets.push(mount.target.clone());
+                }
+                Ok(mounted_targets)
+            }
+        }
+    }
+
+    fn mount_rootfs_spec(mount: &RootfsMountSpec) -> Result<()> {
+        if mount.mount_type.trim().is_empty() {
+            return Err(anyhow::anyhow!("rootfs mount spec type must not be empty"));
+        }
+        if mount.target.as_os_str().is_empty() {
+            return Err(anyhow::anyhow!(
+                "rootfs mount spec target must not be empty"
+            ));
+        }
+        fs::create_dir_all(&mount.target).with_context(|| {
+            format!(
+                "Failed to create rootfs mount target {}",
+                mount.target.display()
+            )
+        })?;
+        let fstype = CString::new(mount.mount_type.as_bytes())
+            .context("rootfs mount type contains interior NUL")?;
+        let source = if mount.source.as_os_str().is_empty() {
+            None
+        } else {
+            Some(
+                CString::new(mount.source.as_os_str().as_bytes())
+                    .context("rootfs mount source contains interior NUL")?,
+            )
+        };
+        let target = CString::new(mount.target.as_os_str().as_bytes())
+            .context("rootfs mount target contains interior NUL")?;
+        let (flags, data) = parse_mount_options(&mount.options)?;
+        let data_cstring = data
+            .as_ref()
+            .map(|value| CString::new(value.as_bytes()))
+            .transpose()
+            .context("rootfs mount data contains interior NUL")?;
+        let data_ptr = data_cstring
+            .as_ref()
+            .map(|value| value.as_ptr() as *const libc::c_void)
+            .unwrap_or(std::ptr::null());
+
+        let rc = unsafe {
+            libc::mount(
+                source
+                    .as_ref()
+                    .map(|value| value.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                target.as_ptr(),
+                fstype.as_ptr(),
+                flags,
+                data_ptr,
+            )
+        };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).with_context(|| {
+                format!(
+                    "Failed to mount rootfs {} on {} as {} with options {:?}",
+                    mount.source.display(),
+                    mount.target.display(),
+                    mount.mount_type,
+                    mount.options
+                )
+            });
+        }
+        Ok(())
+    }
+
+    fn unmount_rootfs_target(target: &Path) -> Result<()> {
+        let target = CString::new(target.as_os_str().as_bytes())
+            .context("rootfs unmount target contains interior NUL")?;
+        let rc = unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+        if rc != 0 {
+            return Err(std::io::Error::last_os_error()).context("Failed to unmount rootfs target");
+        }
+        Ok(())
+    }
+
+    fn record_rootfs_handle(&self, request: &CreateTaskRequest) -> Result<()> {
+        let mounted_targets = self.apply_rootfs_handle_mounts(request.rootfs.as_ref())?;
+        *self.rootfs_handle.lock().unwrap() = Some(ShimRootfsHandle {
+            snapshot_key: request.snapshot_key.clone(),
+            rootfs_path: request.rootfs_path.clone(),
+            mount_options: request.mount_options.clone(),
+            rootfs: request.rootfs.clone(),
+            mounted_targets,
+        });
+        let Some(snapshot_key) = request.snapshot_key.as_deref() else {
+            return Ok(());
+        };
+        self.update_snapshot_state(snapshot_key, "mounted")
+    }
+
+    fn update_snapshot_state(&self, snapshot_key: &str, state: &str) -> Result<()> {
+        let Some(path) = self.state_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(path)?.update_snapshot_state(snapshot_key, state)
+    }
+
+    fn delete_snapshot_record(&self, snapshot_key: &str) -> Result<()> {
+        let Some(path) = self.state_db_path.as_ref() else {
+            return Ok(());
+        };
+        StorageManager::new(path)?.delete_snapshot(snapshot_key)
+    }
+
+    fn cleanup_rootfs_handle(&self, request: &DeleteTaskRequest) -> Result<()> {
+        let stored = self.rootfs_handle.lock().unwrap().take();
+        let snapshot_key = request.snapshot_key.clone().or_else(|| {
+            stored
+                .as_ref()
+                .and_then(|handle| handle.snapshot_key.clone())
+        });
+        let rootfs_path = request
+            .rootfs_path
+            .clone()
+            .or_else(|| stored.as_ref().map(|handle| handle.rootfs_path.clone()));
+
+        if let Some(handle) = stored.as_ref() {
+            for target in handle.mounted_targets.iter().rev() {
+                Self::unmount_rootfs_target(target)
+                    .with_context(|| format!("Failed to unmount rootfs {}", target.display()))?;
+            }
+        }
+
+        if let Some(path) = rootfs_path.as_ref().filter(|path| path.exists()) {
+            fs::remove_dir_all(path).with_context(|| {
+                format!("Failed to remove shim-owned rootfs {}", path.display())
+            })?;
+        }
+
+        if let Some(snapshot_key) = snapshot_key.as_deref() {
+            self.update_snapshot_state(snapshot_key, "deleted")?;
+            self.delete_snapshot_record(snapshot_key)?;
+        }
+
+        if let Some(handle) = stored.as_ref() {
+            debug!(
+                "Deleted shim rootfs handle for container {} snapshot {:?} rootfs {} mount options {:?} rootfs {:?} mounted targets {:?}",
+                self.container_id,
+                handle.snapshot_key,
+                handle.rootfs_path.display(),
+                handle.mount_options,
+                handle.rootfs,
+                handle.mounted_targets
+            );
+        }
+
+        Ok(())
     }
 
     fn task_status(&self) -> StatusResponse {
@@ -1453,6 +1689,7 @@ impl Daemon {
         }
         Ok(())
     }
+
     fn delete_task_internal(&self, request: &DeleteTaskRequest) -> Result<()> {
         self.running.store(false, Ordering::SeqCst);
         if matches!(
@@ -1494,10 +1731,10 @@ impl Daemon {
             warn!("Failed to shutdown IO manager during delete: {}", err);
         }
         self.cleanup_attach_socket_directory();
+        self.cleanup_rootfs_handle(request)?;
         self.set_task_state(DaemonTaskState::Deleted);
         Ok(())
     }
-
 
     fn exec_process_internal(&self, request: &ExecProcessRequest) -> Result<ExecProcessResponse> {
         if request.command.is_empty() {
@@ -1593,12 +1830,109 @@ impl Daemon {
             stderr,
         })
     }
+
+    fn update_resources_internal(&self, request: &UpdateResourcesRequest) -> Result<()> {
+        let resources: crate::proto::runtime::v1::LinuxContainerResources =
+            request.resources.clone().into();
+        let limits = RuncRuntime::cri_to_limits(&resources);
+        let cgroup_manager = crate::cgroups::CgroupManager::new(request.container_id.clone())
+            .context("Failed to create cgroup manager")?;
+        cgroup_manager
+            .set_resources(&limits)
+            .context("Failed to set cgroup resources")?;
+        Ok(())
+    }
+
+    fn checkpoint_task_internal(&self, request: &CheckpointTaskRequest) -> Result<()> {
+        std::fs::create_dir_all(&request.image_path).with_context(|| {
+            format!(
+                "Failed to create checkpoint image directory {}",
+                request.image_path.display()
+            )
+        })?;
+        std::fs::create_dir_all(&request.work_path).with_context(|| {
+            format!(
+                "Failed to create checkpoint work directory {}",
+                request.work_path.display()
+            )
+        })?;
+        let image_path = request.image_path.to_string_lossy().to_string();
+        let work_path = request.work_path.to_string_lossy().to_string();
+        let mut checkpoint_args = vec![
+            "checkpoint",
+            "--file-locks",
+            "--image-path",
+            image_path.as_str(),
+            "--work-path",
+            work_path.as_str(),
+            "--leave-running",
+            request.container_id.as_str(),
+        ];
+        let output = self
+            .runtime_command()
+            .args(&checkpoint_args)
+            .output()
+            .context("Failed to execute runtime checkpoint")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow::anyhow!(
+                "failed to checkpoint container {}: {}",
+                request.container_id,
+                stderr
+            ));
+        }
+        checkpoint_args.clear();
+        Ok(())
+    }
+
+    fn restore_task_internal(&self, request: &RestoreTaskRequest) -> Result<()> {
+        self.setup_io_once()?;
+        std::fs::create_dir_all(&request.work_path).with_context(|| {
+            format!(
+                "Failed to create restore work directory {}",
+                request.work_path.display()
+            )
+        })?;
+        let mut command = self.runtime_command();
+        command
+            .arg("restore")
+            .arg("-d")
+            .arg("--image-path")
+            .arg(&request.image_path)
+            .arg("--work-path")
+            .arg(&request.work_path)
+            .arg("--bundle")
+            .arg(&request.bundle_path);
+        if !request.criu_path.as_os_str().is_empty() {
+            command.arg("--criu").arg(&request.criu_path);
+        }
+        if request.no_pivot {
+            command.arg("--no-pivot");
+        }
+        command.arg(&request.container_id);
+        let output = command
+            .output()
+            .context("Failed to execute runtime restore")?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow::anyhow!(
+                "failed to restore container {}: {}",
+                request.container_id,
+                stderr
+            ));
+        }
+        self.set_task_state(DaemonTaskState::Running);
+        Ok(())
+    }
 }
+
 impl ShimRpcHandler for Daemon {
     fn handle_request(&self, request: ShimRpcRequest) -> Result<ShimRpcResponse> {
         match request {
             ShimRpcRequest::Ping => Ok(ShimRpcResponse::Empty),
-            ShimRpcRequest::CreateTask(_) => {
+            ShimRpcRequest::CreateTask(request) => {
+                self.apply_rootfs_override(&request.rootfs_path)?;
+                self.record_rootfs_handle(&request)?;
                 self.setup_io_once()?;
                 self.set_task_state(DaemonTaskState::Created);
                 Ok(ShimRpcResponse::Empty)
@@ -1633,6 +1967,18 @@ impl ShimRpcHandler for Daemon {
                 self.delete_task_internal(&request)?;
                 Ok(ShimRpcResponse::Empty)
             }
+            ShimRpcRequest::UpdateResources(request) => {
+                self.update_resources_internal(&request)?;
+                Ok(ShimRpcResponse::Empty)
+            }
+            ShimRpcRequest::CheckpointTask(request) => {
+                self.checkpoint_task_internal(&request)?;
+                Ok(ShimRpcResponse::Empty)
+            }
+            ShimRpcRequest::RestoreTask(request) => {
+                self.restore_task_internal(&request)?;
+                Ok(ShimRpcResponse::Empty)
+            }
             ShimRpcRequest::ReopenLog(ReopenLogRequest { .. }) => {
                 self.io_manager.reopen_log_file()?;
                 Ok(ShimRpcResponse::Empty)
@@ -1648,18 +1994,46 @@ impl ShimRpcHandler for Daemon {
             ShimRpcRequest::Status(StatusRequest { .. }) => {
                 Ok(ShimRpcResponse::Status(self.task_status()))
             }
+            ShimRpcRequest::PauseTask(PauseTaskRequest { container_id }) => {
+                let output = self
+                    .runtime_command()
+                    .args(["pause", container_id.as_str()])
+                    .output()
+                    .context("Failed to execute runtime pause")?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    return Err(anyhow::anyhow!(
+                        "failed to pause container {}: {}",
+                        container_id,
+                        stderr
+                    ));
+                }
+                self.set_task_state(DaemonTaskState::Paused);
+                Ok(ShimRpcResponse::Empty)
+            }
+            ShimRpcRequest::ResumeTask(ResumeTaskRequest { container_id }) => {
+                let output = self
+                    .runtime_command()
+                    .args(["resume", container_id.as_str()])
+                    .output()
+                    .context("Failed to execute runtime resume")?;
+                if !output.status.success() {
+                    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                    return Err(anyhow::anyhow!(
+                        "failed to resume container {}: {}",
+                        container_id,
+                        stderr
+                    ));
+                }
+                self.set_task_state(DaemonTaskState::Running);
+                Ok(ShimRpcResponse::Empty)
+            }
             ShimRpcRequest::ContainerPid(StatusRequest { .. }) => Ok(
                 ShimRpcResponse::ContainerPid(*self.container_pid.lock().unwrap()),
             ),
-            ShimRpcRequest::UpdateResources(_) | ShimRpcRequest::CheckpointTask(_)
-            | ShimRpcRequest::RestoreTask(_) | ShimRpcRequest::PauseTask(_)
-            | ShimRpcRequest::ResumeTask(_) => Err(anyhow::anyhow!(
-                "RPC is not implemented by this shim milestone (exec/attach)"
-            )),
         }
     }
 }
-
 
 fn wait_exec_reader(
     reader: Option<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
@@ -1727,3 +2101,5 @@ fn move_pid_to_cgroup(pid: u32, target: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests;
