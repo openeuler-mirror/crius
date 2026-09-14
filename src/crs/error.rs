@@ -119,6 +119,11 @@ impl ErrorContext {
         self.command = Some(command.into());
         self
     }
+
+    fn with_object(mut self, object: impl Into<String>) -> Self {
+        self.object = Some(object.into());
+        self
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -393,6 +398,19 @@ impl CliError {
     pub(crate) fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
         *self.context_mut() = self.context().clone().with_endpoint(endpoint);
         self
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn with_object(mut self, object: impl Into<String>) -> Self {
+        *self.context_mut() = self.context().clone().with_object(object);
+        self
+    }
+
+    pub(crate) fn invalid_input(message: impl Into<String>) -> Self {
+        Self::InvalidInput {
+            message: message.into(),
+            context: Box::default(),
+        }
     }
 
     fn context_mut(&mut self) -> &mut ErrorContext {

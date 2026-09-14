@@ -81,6 +81,11 @@ where
             warnings: Vec::new(),
         }
     }
+
+    pub(crate) fn with_summary(mut self, summary: Value) -> Self {
+        self.summary = summary;
+        self
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -116,6 +121,38 @@ impl FormatOptions {
 pub(crate) struct RenderedOutput {
     pub stdout: String,
     pub stderr: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageOperationView {
+    pub image: String,
+    pub image_ref: String,
+    pub action: String,
+    pub success: bool,
+}
+
+impl TableRow for ImageOperationView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "IMAGE REF", "ACTION", "SUCCESS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.image_ref.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        if self.image_ref.is_empty() {
+            self.image.clone()
+        } else {
+            self.image_ref.clone()
+        }
+    }
 }
 
 pub(crate) trait TableRow {
@@ -280,5 +317,13 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
         format!("{bytes}B")
     } else {
         format!("{value:.1}{}", UNITS[unit])
+    }
+}
+
+pub(crate) fn format_bool(value: bool) -> &'static str {
+    if value {
+        "true"
+    } else {
+        "false"
     }
 }
