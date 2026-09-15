@@ -509,6 +509,14 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn update_snapshot_state(&self, _snapshot_key: &str, _state: &str) -> Result<()> {
+        Ok(())
+    }
+
+    pub fn delete_snapshot(&self, _snapshot_key: &str) -> Result<()> {
+        Ok(())
+    }
+
 }
 
 /// 镜像记录

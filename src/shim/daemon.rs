@@ -50,7 +50,7 @@ use std::time::{Duration, Instant};
 use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 use crate::image::snapshotter::{RootfsHandle, RootfsHandleKind, RootfsMountSpec};
 use crate::runtime::RuncRuntime;
-use crate::services::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
+use crate::service::event::{InternalEvent, InternalEventSeverity, LedgerInternalEventSink};
 use crate::shim_rpc::server::{default_task_socket_path, serve, ShimRpcHandler};
 use crate::shim_rpc::{
     CheckpointTaskRequest, CreateTaskRequest, DeleteTaskRequest, ExecProcessRequest,
