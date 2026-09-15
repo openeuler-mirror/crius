@@ -31,10 +31,4 @@ pub mod image;
 pub mod storage;
 pub mod service;
 pub mod crs;
-pub mod proto {
-    pub mod runtime {
-        pub mod v1 {
-            tonic::include_proto!("runtime.v1");
-        }
-    }
-}
+pub mod proto;

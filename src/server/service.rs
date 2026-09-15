@@ -15,15 +15,20 @@ limitations under the License.
 */
 
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
+
+use tonic::Response;
 
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
 
 use crate::image::{ImageServiceOptions, ImageServiceImpl};
+use crate::service::InternalServices;
+use crate::storage::persistence::{PersistenceManager, PersistenceConfig};
 
 /// 运行时配置
 #[derive(Debug, Clone)]
@@ -169,6 +174,7 @@ pub struct RuntimeServiceImpl {
     pub(super) removed_pod_sandbox_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) config: RuntimeServiceConfig,
     pub(super) image_service: ImageServiceImpl,
+    pub(super) internal_services: crate::service::InternalServices,
     pub(super) shim_work_dir: PathBuf,
     pub(super) attach_socket_dir: PathBuf,
     pub(super) container_exits_dir: PathBuf,
@@ -222,20 +228,34 @@ impl RuntimeServiceImpl {
             disable_cgroup: config.disable_cgroup,
         })
         .expect("Failed to initialize image service");
+        let persistence_config = PersistenceConfig {
+            db_path: config.root_dir.join("crius.db"),
+            enable_recovery: true,
+            auto_save_interval: 30,
+        };
+        let persistence = PersistenceManager::new(persistence_config)
+            .expect("Failed to create persistence manager");
+        let persistence = Arc::new(Mutex::new(persistence));
+        let (events, _) = tokio::sync::broadcast::channel(256);
+        let internal_services = InternalServices::new(
+            crate::service::event::EventService::from_sender(events.clone())
+               .with_ledger(persistence.clone()),
+        );
         let service = Self { 
             containers, 
             pod_sandboxes, 
             container_names, 
             pod_names, 
-            removed_container_ids: Arc::new(Mutex::new(HashSet::new())), 
-            removed_pod_sandbox_ids: Arc::new(Mutex::new(HashSet::new())), 
+            removed_container_ids: Arc::new(StdMutex::new(HashSet::new())), 
+            removed_pod_sandbox_ids: Arc::new(StdMutex::new(HashSet::new())), 
             config, 
             image_service: image_service, 
+            internal_services,
             shim_work_dir: PathBuf::new(), 
             attach_socket_dir: PathBuf::new(), 
             container_exits_dir: PathBuf::new(), 
             clean_shutdown_file: PathBuf::new(), 
-            last_startup_clean_shutdown: Arc::new(Mutex::new(None)), 
+            last_startup_clean_shutdown: Arc::new(StdMutex::new(None)), 
         };
         service
     }
@@ -307,59 +327,57 @@ impl RuntimeService for RuntimeServiceImpl {
     // TODO: 在指定 Pod 沙箱中创建容器
     async fn create_container(
         &self,
-        _request: tonic::Request<CreateContainerRequest>,
+        request: tonic::Request<CreateContainerRequest>,
     ) -> std::result::Result<tonic::Response<CreateContainerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("create_container: not implemented"))
+        RuntimeServiceImpl::create_container_impl(self, request).await
     }
 
     // TODO: 启动容器
     async fn start_container(
         &self,
-        _request: tonic::Request<StartContainerRequest>,
+        request: tonic::Request<StartContainerRequest>,
     ) -> std::result::Result<tonic::Response<StartContainerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("start_container: not implemented"))
+        RuntimeServiceImpl::start_container_impl(self, request).await
     }
 
     // TODO: 停止容器（带 grace period）
     async fn stop_container(
         &self,
-        _request: tonic::Request<StopContainerRequest>,
+        request: tonic::Request<StopContainerRequest>,
     ) -> std::result::Result<tonic::Response<StopContainerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("stop_container: not implemented"))
+        RuntimeServiceImpl::stop_container(self, request).await
     }
 
     // TODO: 移除容器
     async fn remove_container(
         &self,
-        _request: tonic::Request<RemoveContainerRequest>,
+        request: tonic::Request<RemoveContainerRequest>,
     ) -> std::result::Result<tonic::Response<RemoveContainerResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("remove_container: not implemented"))
+        RuntimeServiceImpl::remove_container(self, request).await
     }
 
     // TODO: 按过滤器列出容器
     async fn list_containers(
         &self,
-        _request: tonic::Request<ListContainersRequest>,
+        request: tonic::Request<ListContainersRequest>,
     ) -> std::result::Result<tonic::Response<ListContainersResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("list_containers: not implemented"))
+        RuntimeServiceImpl::list_containers(self, request).await
     }
 
     // TODO: 返回容器状态
     async fn container_status(
         &self,
-        _request: tonic::Request<ContainerStatusRequest>,
+        request: tonic::Request<ContainerStatusRequest>,
     ) -> std::result::Result<tonic::Response<ContainerStatusResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("container_status: not implemented"))
+        RuntimeServiceImpl::container_status(self, request).await
     }
 
     // TODO: 更新容器资源配置
     async fn update_container_resources(
         &self,
-        _request: tonic::Request<UpdateContainerResourcesRequest>,
+        request: tonic::Request<UpdateContainerResourcesRequest>,
     ) -> std::result::Result<tonic::Response<UpdateContainerResourcesResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "update_container_resources: not implemented",
-        ))
+        RuntimeServiceImpl::update_container_resources(self, request).await
     }
 
     // TODO: 重新打开容器日志文件
@@ -377,25 +395,25 @@ impl RuntimeService for RuntimeServiceImpl {
     // TODO: 同步执行容器内命令
     async fn exec_sync(
         &self,
-        _request: tonic::Request<ExecSyncRequest>,
+        request: tonic::Request<ExecSyncRequest>,
     ) -> std::result::Result<tonic::Response<ExecSyncResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("exec_sync: not implemented"))
+        RuntimeServiceImpl::exec_sync(self, request).await
     }
 
     // TODO: 准备 exec 流式端点
     async fn exec(
         &self,
-        _request: tonic::Request<ExecRequest>,
+        request: tonic::Request<ExecRequest>,
     ) -> std::result::Result<tonic::Response<ExecResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("exec: not implemented"))
+        RuntimeServiceImpl::exec(self, request).await
     }
 
     // TODO: 准备 attach 流式端点
     async fn attach(
         &self,
-        _request: tonic::Request<AttachRequest>,
+        request: tonic::Request<AttachRequest>,
     ) -> std::result::Result<tonic::Response<AttachResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("attach: not implemented"))
+        RuntimeServiceImpl::attach(self, request).await
     }
 
     // TODO: 准备端口转发流式端点
@@ -411,9 +429,9 @@ impl RuntimeService for RuntimeServiceImpl {
     // TODO: 返回容器统计信息
     async fn container_stats(
         &self,
-        _request: tonic::Request<ContainerStatsRequest>,
+        request: tonic::Request<ContainerStatsRequest>,
     ) -> std::result::Result<tonic::Response<ContainerStatsResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("container_stats: not implemented"))
+        RuntimeServiceImpl::container_stats(self, request).await
     }
 
     // TODO: 列出所有运行中容器的统计信息
@@ -459,9 +477,9 @@ impl RuntimeService for RuntimeServiceImpl {
     // TODO: 返回运行时状态
     async fn status(
         &self,
-        _request: tonic::Request<StatusRequest>,
+        request: tonic::Request<StatusRequest>,
     ) -> std::result::Result<tonic::Response<StatusResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("status: not implemented"))
+        RuntimeServiceImpl::status(self, request).await
     }
 
     // TODO: 容器检查点
@@ -478,17 +496,14 @@ impl RuntimeService for RuntimeServiceImpl {
 
     type GetContainerEventsStream =
         tokio_stream::wrappers::ReceiverStream<
-            std::result::Result<ContainerEventResponse, tonic::Status>,
-        >;
+            std::result::Result<ContainerEventResponse, tonic::Status>,>;
 
     // TODO: 获取容器事件流
     async fn get_container_events(
         &self,
         _request: tonic::Request<GetEventsRequest>,
     ) -> std::result::Result<tonic::Response<Self::GetContainerEventsStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "get_container_events: not implemented",
-        ))
+        Ok(Response::new(self.internal_services.events.stream()))
     }
 
     // ---- Metrics ----
@@ -520,7 +535,13 @@ impl RuntimeService for RuntimeServiceImpl {
         &self,
         _request: tonic::Request<RuntimeConfigRequest>,
     ) -> std::result::Result<tonic::Response<RuntimeConfigResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("runtime_config: not implemented"))
+        let config = RuntimeConfigResponse {
+            linux: Some(crate::proto::runtime::v1::LinuxRuntimeConfiguration {
+                cgroup_driver: self.cgroup_driver() as i32,
+            }),
+        };
+
+        Ok(Response::new(config))
     }
 
     // TODO: 更新 Pod 沙箱资源配置
