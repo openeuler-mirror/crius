@@ -16,6 +16,10 @@ limitations under the License.
 
 
 pub mod service;
+pub mod container_handlers;
+pub mod status;
+pub mod streaming_handlers;
+pub mod stats;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

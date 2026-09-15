@@ -31,6 +31,7 @@ pub mod image;
 pub mod storage;
 pub mod service;
 pub mod crs;
+pub mod proto;
 
 #[cfg(feature = "shim")]
 pub mod shim_rpc;
