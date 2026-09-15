@@ -25,20 +25,77 @@ use crate::proto::runtime::v1::{
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
+    NamespaceMode, PodSandboxConfig
 };
 use crate::server::service::RuntimeServiceImpl;
+
+enum ContainerOwner {
+    Local { runtime_handler: Option<String> },
+    Pod { pod_sandbox_id: String },
+}
+
+struct ContainerCreateInput {
+    config: crate::proto::runtime::v1::ContainerConfig,
+    sandbox_config: Option<PodSandboxConfig>,
+    owner: ContainerOwner,
+}
 
 impl RuntimeServiceImpl {
     pub async fn create_local_container_impl(
         &self,
         request: Request<crate::proto::local::v1::CreateLocalContainerRequest>,
     ) -> Result<Response<crate::proto::local::v1::CreateLocalContainerResponse>, Status> {
-        unimplemented!()
+        log::info!("CreateLocalContainer called");
+        let req = request.into_inner();
+        let config = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("Container config not specified"))?;
+        let runtime_handler = (!req.runtime_handler.trim().is_empty())
+            .then(|| req.runtime_handler.trim().to_string());
+        let mut sandbox_config = crate::proto::runtime::v1::PodSandboxConfig::default();
+        sandbox_config.linux = Some(crate::proto::runtime::v1::LinuxPodSandboxConfig {
+            cgroup_parent: req.cgroup_parent,
+            sysctls: req
+                .sysctls
+                .iter()
+                .filter_map(|raw| raw.split_once('='))
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            security_context: Some(crate::proto::runtime::v1::LinuxSandboxSecurityContext {
+                namespace_options: Some(crate::proto::runtime::v1::NamespaceOption {
+                    network: NamespaceMode::Pod as i32,
+                    pid: NamespaceMode::Pod as i32,
+                    ipc: NamespaceMode::Pod as i32,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }),
+            ..Default::default()
+        });
+        let response = self
+            .create_container_from_input(ContainerCreateInput {
+                config,
+                sandbox_config: Some(sandbox_config),
+                owner: ContainerOwner::Local { runtime_handler },
+            })
+            .await?;
+        Ok(Response::new(
+            crate::proto::local::v1::CreateLocalContainerResponse {
+                container_id: response.into_inner().container_id,
+            },
+        ))
     }
 
     pub(super) async fn create_container_impl(
         &self,
         request: Request<CreateContainerRequest>,
+    ) -> Result<Response<CreateContainerResponse>, Status> {
+        unimplemented!()
+    }
+
+    async fn create_container_from_input(
+        &self,
+        input: ContainerCreateInput,
     ) -> Result<Response<CreateContainerResponse>, Status> {
         unimplemented!()
     }
