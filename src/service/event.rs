@@ -15,6 +15,11 @@ limitations under the License.
 */
 
 
+use std::unimplemented;
+
+use tonic::Status;
+use tokio_stream::wrappers::ReceiverStream;
+
 use crate::proto::runtime::v1::ContainerEventResponse;
 use crate::defaults::{MAX_INTERNAL_EVENT_DETAIL_BYTES, INTERNAL_EVENT_PREFIXES, INTERNAL_EVENT_SUBJECT_KINDS};
 
@@ -25,6 +30,24 @@ pub struct EventService {
     ledger:
         Option<std::sync::Arc<tokio::sync::Mutex<crate::storage::persistence::PersistenceManager>>>,
     internal_retention_per_subject: usize,
+}
+
+impl EventService {
+    pub fn stream(&self) -> ReceiverStream<Result<ContainerEventResponse, Status>> {
+        unimplemented!()
+    }
+
+    pub fn from_sender(sender: tokio::sync::broadcast::Sender<ContainerEventResponse>) -> Self {
+        unimplemented!()
+    }
+
+    pub fn with_ledger(
+        mut self,
+        ledger: std::sync::Arc<tokio::sync::Mutex<crate::storage::persistence::PersistenceManager>>,
+    ) -> Self {
+        self.ledger = Some(ledger);
+        self
+    }
 }
 
 #[derive(Debug, Clone)]

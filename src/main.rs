@@ -32,6 +32,8 @@ use tokio::net::UnixListener as TokioUnixListener;
 use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
 
 use crius::proto::runtime::v1::{runtime_service_server::RuntimeServiceServer, image_service_server::ImageServiceServer};
+use crius::proto::local::v1::local_service_server::LocalServiceServer;
+use crius::service::local::LocalServiceImpl;
 
 use crius::config::Config;
 use crius::defaults::{LOCAL_LOG_TIME_FORMAT, SERVER_SHUTDOWN_GRACE_PERIOD};
@@ -160,12 +162,16 @@ async fn main() -> Result<(), Error> {
     let image_service_server = ImageServiceServer::new(image_service)
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let local_service_server = LocalServiceServer::new(LocalServiceImpl::new(runtime_service.clone()))
+        .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+        .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     // 注册路由
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(reflection_service)
-        .add_service(image_service_server);    
+        .add_service(image_service_server)
+        .add_service(local_service_server);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();
 

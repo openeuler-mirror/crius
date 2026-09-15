@@ -15,6 +15,8 @@ limitations under the License.
 */
 
 
+use anyhow::Result;
+
 use crate::storage::StorageManager;
 
 /// 状态持久化配置
@@ -33,4 +35,16 @@ pub struct PersistenceConfig {
 pub struct PersistenceManager {
     storage: StorageManager,
     _config: PersistenceConfig,
+}
+
+impl PersistenceManager {
+    /// 创建新的持久化管理器
+    pub fn new(config: PersistenceConfig) -> Result<Self> {
+        let storage = StorageManager::new(&config.db_path)?;
+
+        Ok(Self {
+            storage,
+            _config: config,
+        })
+    }
 }

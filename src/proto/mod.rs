@@ -14,29 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-
-pub mod event;
-pub mod health;
-pub mod introspection;
-pub mod local;
-
-use event::EventService;
-use health::HealthService;
-use introspection::IntrospectionService;
-
-#[derive(Debug, Clone)]
-pub struct InternalServices {
-    pub events: EventService,
-    pub health: HealthService,
-    pub introspection: IntrospectionService,
+pub mod runtime {
+    #[allow(clippy::doc_lazy_continuation)]
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/runtime.v1.rs"));
+    }
 }
 
-impl InternalServices {
-    pub fn new(events: EventService) -> Self {
-        Self {
-            events,
-            health: HealthService,
-            introspection: IntrospectionService,
-        }
+pub mod local {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/local.v1.rs"));
     }
 }
