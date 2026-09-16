@@ -65,3 +65,6 @@ pub const INTERNAL_EVENT_SUBJECT_KINDS: &[&str] = &[
     "reconcile",
     "orphan_cleanup",
 ];
+
+pub(crate) const CRS_RUN_ANNOTATION: &str = "io.crius.internal/crs-run";
+pub(crate) const CRS_RUN_ANNOTATION_VALUE: &str = "true";

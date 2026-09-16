@@ -29,6 +29,7 @@ use crate::proto::runtime::v1::{
     PodSandboxMetadata, PodSandboxState
 };
 use crate::server::service::RuntimeServiceImpl;
+use crate::defaults::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
 
 enum ContainerOwner {
     Local { runtime_handler: Option<String> },
@@ -107,7 +108,7 @@ impl RuntimeServiceImpl {
         &self,
         input: ContainerCreateInput,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        /// 请求解析与校验
+        // 请求解析与校验
         let ContainerCreateInput {
             mut config,
             sandbox_config,
@@ -142,6 +143,14 @@ impl RuntimeServiceImpl {
                     .ok_or_else(|| Status::failed_precondition("Pod sandbox metadata is missing"))?
             }
         };
+
+        // 生成容器ID和日志路径
+        let container_id = uuid::Uuid::new_v4().to_simple().to_string();
+        if config.log_path.trim().is_empty()
+            && Self::should_assign_default_log_path(&owner, &config)
+        {
+            config.log_path = self.default_container_log_path(&container_id);
+        }
 
         unimplemented!()
     }
@@ -188,5 +197,25 @@ impl RuntimeServiceImpl {
             pod_sandbox_id, state_name
         ))
     }
+
+    fn should_assign_default_log_path(
+        owner: &ContainerOwner,
+        config: &crate::proto::runtime::v1::ContainerConfig,
+    ) -> bool {
+        matches!(owner, ContainerOwner::Local { .. })
+            || config
+                .annotations
+                .get(CRS_RUN_ANNOTATION)
+                .is_some_and(|value| value == CRS_RUN_ANNOTATION_VALUE)
+    }
     
+    fn default_container_log_path(&self, container_id: &str) -> String {
+        self.config
+            .log_dir
+            .join("containers")
+            .join(format!("{container_id}.log"))
+            .display()
+            .to_string()
+    }
+
 }
