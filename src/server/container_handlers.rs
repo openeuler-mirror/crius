@@ -26,10 +26,16 @@ use crate::proto::runtime::v1::{
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
     NamespaceMode, PodSandboxConfig,
-    PodSandboxMetadata, PodSandboxState
+    PodSandboxMetadata, PodSandboxState,
+    ContainerMetadata
 };
-use crate::server::service::RuntimeServiceImpl;
-use crate::defaults::{CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE};
+use crate::server::service::{
+    RuntimeServiceImpl, NameReservationGuard
+};
+use crate::defaults::{
+    CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
+    RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
+};
 
 enum ContainerOwner {
     Local { runtime_handler: Option<String> },
@@ -152,6 +158,15 @@ impl RuntimeServiceImpl {
             config.log_path = self.default_container_log_path(&container_id);
         }
 
+        // 仿照docker容器命名机制
+        let mut container_name_guard = self
+            .reserve_container_name_like_docker(
+                &container_id,
+                &mut container_metadata,
+                &pod_metadata,
+            )
+            .await?;
+
         unimplemented!()
     }
 
@@ -217,5 +232,92 @@ impl RuntimeServiceImpl {
             .display()
             .to_string()
     }
+
+    async fn reserve_container_name_like_docker(
+        &self,
+        container_id: &str,
+        metadata: &mut ContainerMetadata,
+        pod_metadata: &PodSandboxMetadata,
+    ) -> Result<NameReservationGuard, Status> {
+        // 使用用户指定名称
+        if !metadata.name.trim().is_empty() {
+            let name_key = Self::container_name_key(metadata, pod_metadata);
+            return self
+                .reserve_container_name_for_create(container_id, &name_key)
+                .await;
+        }
+
+        // 使用随机名生成 + 冲突重试
+        for retry in 0..6 {
+            metadata.name = Self::random_container_name(retry);
+            let name_key = Self::container_name_key(metadata, pod_metadata);
+            match self
+                .reserve_container_name_for_create(container_id, &name_key)
+                .await
+            {
+                Ok(guard) => return Ok(guard),
+                Err(status) if status.code() == tonic::Code::AlreadyExists => continue,
+                Err(status) => return Err(status),
+            }
+        }
+
+        // 通过container ID前short_id 进行兜底
+        metadata.name = crate::crs::ids::short_id(container_id).to_string();
+        let name_key = Self::container_name_key(metadata, pod_metadata);
+        self.reserve_container_name_for_create(container_id, &name_key)
+            .await
+    }
+
+    fn random_container_name(retry: usize) -> String {
+        use rand::Rng;
+
+        let mut rng = rand::thread_rng();
+        loop {
+            let left = RANDOM_NAME_LEFT[rng.gen_range(0..RANDOM_NAME_LEFT.len())];
+            let right = RANDOM_NAME_RIGHT[rng.gen_range(0..RANDOM_NAME_RIGHT.len())];
+            let mut name = format!("{left}_{right}");
+            if name == "boring_wozniak" {
+                continue;
+            }
+            if retry > 0 {
+                name.push_str(&rng.gen_range(0..10).to_string());
+            }
+            return name;
+        }
+    }
+
+    pub(super) fn reserve_container_name(
+        &self,
+        container_id: &str,
+        name: &str,
+    ) -> Result<NameReservationGuard, Status> {
+        let mut registry = self
+            .container_names
+            .lock()
+            .map_err(|_| Status::internal("container name registry lock poisoned"))?;
+        if let Err(existing_id) = registry.reserve(name, container_id) {
+            return Err(Status::already_exists(format!(
+                "container with name {name:?} already exists as {existing_id}"
+            )));
+        }
+        drop(registry);
+        Ok(NameReservationGuard::new(
+            container_id,
+            self.container_names.clone(),
+        ))
+    }
+
+    pub(super) async fn reserve_container_name_for_create(
+        &self,
+        container_id: &str,
+        name: &str,
+    ) -> Result<NameReservationGuard, Status> {
+        match self.reserve_container_name(container_id, name) {
+            Ok(guard) => Ok(guard),
+            Err(status)if status.code() == tonic::Code::AlreadyExists => unimplemented!(),
+            Err(status) => Err(status),
+        }
+    }
+
 
 }

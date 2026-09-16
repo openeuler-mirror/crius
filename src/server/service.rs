@@ -164,6 +164,27 @@ pub(super) struct NameRegistry {
     names_by_id: HashMap<String, String>,
 }
 
+impl NameRegistry {
+    pub(super) fn reserve(&mut self, name: &str, id: &str) -> Result<(), String> {
+        match self.ids_by_name.get(name) {
+            Some(existing_id) if existing_id == id => {
+                self.names_by_id.insert(id.to_string(), name.to_string());
+                Ok(())
+            }
+            Some(existing_id) => Err(existing_id.clone()),
+            None => {
+                if let Some(previous_name) =
+                    self.names_by_id.insert(id.to_string(), name.to_string())
+                {
+                    self.ids_by_name.remove(&previous_name);
+                }
+                self.ids_by_name.insert(name.to_string(), id.to_string());
+                Ok(())
+            }
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct RuntimeServiceImpl {
     pub(super) containers: Arc<Mutex<HashMap<String, Container>>>,
@@ -276,6 +297,20 @@ impl RuntimeServiceImpl {
             ));
         }
         Ok(image)
+    }
+
+    pub(super) fn container_name_key(
+        metadata: &ContainerMetadata,
+        pod_metadata: &PodSandboxMetadata,
+    ) -> String {
+        format!(
+            "{}:{}:{}:{}:{}",
+            metadata.name,
+            pod_metadata.name,
+            pod_metadata.namespace,
+            pod_metadata.uid,
+            metadata.attempt
+        )
     }
 }
 
@@ -566,5 +601,23 @@ impl RuntimeService for RuntimeServiceImpl {
         Err(tonic::Status::unimplemented(
             "update_pod_sandbox_resources: not implemented",
         ))
+    }
+}
+
+
+#[derive(Debug)]
+pub(super) struct NameReservationGuard {
+    id: String,
+    registry: StdArc<StdMutex<NameRegistry>>,
+    active: bool,
+}
+
+impl NameReservationGuard {
+    pub fn new(id: impl Into<String>, registry: StdArc<StdMutex<NameRegistry>>) -> Self {
+        Self {
+            id: id.into(),
+            registry,
+            active: true,
+        }
     }
 }
