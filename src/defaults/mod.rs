@@ -126,3 +126,32 @@ pub const RANDOM_NAME_RIGHT: &[&str] = &[
     "volhard",
     "yonath",
 ];
+
+pub const INTERNAL_POD_STATE_KEY: &str = "io.crius.internal/pod-state";
+pub const INTERNAL_ANNOTATION_PREFIX: &str = "io.crius.internal/";
+
+pub const CRIO_SANDBOX_ID_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxID";
+pub const CRIO_SANDBOX_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.SandboxName";
+pub const CRIO_POD_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.Name";
+pub const CRIO_POD_NAMESPACE_ANNOTATION: &str = "io.kubernetes.cri-o.Namespace";
+pub const CRIO_SECCOMP_NOTIFIER_ACTION_ANNOTATION: &str = "io.kubernetes.cri-o.seccompNotifierAction";
+pub const CRIO_RUNTIME_HANDLER_ANNOTATION: &str = "io.kubernetes.cri-o.RuntimeHandler";
+
+pub const CRIO_CONTAINER_ID_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerID";
+pub const CRIO_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerName";
+pub const CRIO_CONTAINER_TYPE_ANNOTATION: &str = "io.kubernetes.cri-o.ContainerType";
+
+pub const CRIO_USER_REQUESTED_IMAGE_ANNOTATION: &str = "io.kubernetes.cri-o.Image";
+pub const CRIO_IMAGE_NAME_ANNOTATION: &str = "io.kubernetes.cri-o.ImageName";
+pub const CRIO_LOG_PATH_ANNOTATION: &str = "io.kubernetes.cri-o.LogPath";
+
+pub const CONTAINERD_SANDBOX_ID_ANNOTATION: &str = "io.kubernetes.cri.sandbox-id";
+pub const CONTAINERD_SANDBOX_NAME_ANNOTATION: &str = "io.kubernetes.cri.sandbox-name";
+pub const CONTAINERD_SANDBOX_NAMESPACE_ANNOTATION: &str = "io.kubernetes.cri.sandbox-namespace";
+pub const CONTAINERD_SANDBOX_UID_ANNOTATION: &str = "io.kubernetes.cri.sandbox-uid";
+pub const CONTAINERD_RUNTIME_HANDLER_ANNOTATION: &str = "io.containerd.cri.runtime-handler";
+pub const CONTAINERD_CONTAINER_TYPE_ANNOTATION: &str = "io.kubernetes.cri.container-type";
+pub const CONTAINERD_IMAGE_NAME_ANNOTATION: &str = "io.kubernetes.cri.image-name";
+pub const CONTAINERD_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.cri.container-name";
+
+pub const KUBERNETES_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.container.name";

@@ -16,6 +16,7 @@ limitations under the License.
 
 
 use std::unimplemented;
+use std::collections::HashMap;
 
 use tonic::{Request, Response, Status};
 use serde_json::json;
@@ -34,9 +35,11 @@ use crate::server::service::{
     RuntimeServiceImpl, NameReservationGuard,
 };
 use crate::service::event::InternalEventSeverity;
+use crate::server::state_model::StoredPodState;
 use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
+    INTERNAL_POD_STATE_KEY,
 };
 
 enum ContainerOwner {
@@ -182,7 +185,33 @@ impl RuntimeServiceImpl {
             }),
         )
         .await;
+      
+        log::info!("Creating container with ID: {}", container_id);
+        log::debug!("Container config: {:?}", config);
 
+        // 提取pod state和 annotations
+        let pod_state = match &owner {
+            ContainerOwner::Local { .. } => None,
+            ContainerOwner::Pod { pod_sandbox_id } => {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                pod_sandboxes.get(pod_sandbox_id).and_then(|pod| {
+                    Self::read_internal_state::<StoredPodState>(
+                        &pod.annotations,
+                        INTERNAL_POD_STATE_KEY,
+                    )
+                })
+            }
+        };
+        let pod_external_annotations = match &owner {
+            ContainerOwner::Local { .. } => HashMap::new(),
+            ContainerOwner::Pod { pod_sandbox_id } => {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                pod_sandboxes
+                    .get(pod_sandbox_id)
+                    .map(|pod| Self::external_pod_annotations(&pod.annotations))
+                    .unwrap_or_default()
+            }
+        };
 
         unimplemented!()
     }

@@ -21,6 +21,8 @@ pub mod status;
 pub mod streaming_handlers;
 pub mod stats;
 pub mod events;
+pub mod annotations;
+pub mod state_model;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
