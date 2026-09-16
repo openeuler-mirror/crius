@@ -20,6 +20,7 @@ pub mod container_handlers;
 pub mod status;
 pub mod streaming_handlers;
 pub mod stats;
+pub mod events;
 
 use std::collections::HashMap;
 use std::path::PathBuf;

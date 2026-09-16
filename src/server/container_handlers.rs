@@ -18,6 +18,7 @@ limitations under the License.
 use std::unimplemented;
 
 use tonic::{Request, Response, Status};
+use serde_json::json;
 
 use crate::proto::runtime::v1::{
     CreateContainerRequest, CreateContainerResponse,
@@ -30,8 +31,9 @@ use crate::proto::runtime::v1::{
     ContainerMetadata
 };
 use crate::server::service::{
-    RuntimeServiceImpl, NameReservationGuard
+    RuntimeServiceImpl, NameReservationGuard,
 };
+use crate::service::event::InternalEventSeverity;
 use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
@@ -166,6 +168,21 @@ impl RuntimeServiceImpl {
                 &pod_metadata,
             )
             .await?;
+
+        // 注册容器生命周期事件
+        config.metadata = Some(container_metadata.clone());
+        self.publish_container_lifecycle_event(
+            &container_id,
+            "create_start",
+            InternalEventSeverity::Info,
+            json!({
+                "podSandboxId": pod_sandbox_id.clone(),
+                "name": container_metadata.name.clone(),
+                "attempt": container_metadata.attempt,
+            }),
+        )
+        .await;
+
 
         unimplemented!()
     }

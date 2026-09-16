@@ -48,6 +48,12 @@ impl EventService {
         self.ledger = Some(ledger);
         self
     }
+
+    pub async fn publish_internal(&self, event: InternalEvent) -> anyhow::Result<()> {
+        event.validate_schema()?;
+        unimplemented!()
+    }
+
 }
 
 #[derive(Debug, Clone)]
