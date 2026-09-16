@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
-use tonic::Response;
+use tonic::{Response, Status};
 
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
@@ -262,6 +262,20 @@ impl RuntimeServiceImpl {
 
     pub fn image_service(&self) -> ImageServiceImpl {
         self.image_service.clone()
+    }
+
+    pub(super) fn validate_container_image_spec(
+        config: &crate::proto::runtime::v1::ContainerConfig,
+    ) -> Result<&ImageSpec, Status> {
+        let image = config.image.as_ref().ok_or_else(|| {
+            Status::invalid_argument("CreateContainerRequest.ContainerConfig.Image is nil")
+        })?;
+        if image.image.trim().is_empty() {
+            return Err(Status::invalid_argument(
+                "CreateContainerRequest.ContainerConfig.Image.Image is empty",
+            ));
+        }
+        Ok(image)
     }
 }
 

@@ -25,13 +25,23 @@ use crate::proto::runtime::v1::{
     UpdateContainerResourcesRequest, UpdateContainerResourcesResponse,
     StopContainerRequest, StopContainerResponse,
     RemoveContainerRequest, RemoveContainerResponse,
-    NamespaceMode, PodSandboxConfig
+    NamespaceMode, PodSandboxConfig,
+    PodSandboxMetadata, PodSandboxState
 };
 use crate::server::service::RuntimeServiceImpl;
 
 enum ContainerOwner {
     Local { runtime_handler: Option<String> },
     Pod { pod_sandbox_id: String },
+}
+
+impl ContainerOwner {
+    fn pod_sandbox_id(&self) -> &str {
+        match self {
+            Self::Local { .. } => "",
+            Self::Pod { pod_sandbox_id } => pod_sandbox_id,
+        }
+    }
 }
 
 struct ContainerCreateInput {
@@ -97,6 +107,42 @@ impl RuntimeServiceImpl {
         &self,
         input: ContainerCreateInput,
     ) -> Result<Response<CreateContainerResponse>, Status> {
+        /// 请求解析与校验
+        let ContainerCreateInput {
+            mut config,
+            sandbox_config,
+            owner,
+        } = input;
+        let pod_sandbox_id = owner.pod_sandbox_id().to_string();
+        let mut container_metadata = config
+            .metadata
+            .clone()
+            .ok_or_else(|| Status::invalid_argument("Container config metadata not specified"))?;
+        Self::validate_container_image_spec(&config)?;
+        let pod_metadata = match &owner {
+            ContainerOwner::Local { .. } => PodSandboxMetadata {
+                name: "local".to_string(),
+                namespace: "local".to_string(),
+                uid: "local".to_string(),
+                attempt: 0,
+            },
+            ContainerOwner::Pod { pod_sandbox_id } => {
+                let pod_sandboxes = self.pod_sandboxes.lock().await;
+                let pod = pod_sandboxes
+                    .get(pod_sandbox_id)
+                    .ok_or_else(|| Status::not_found("Pod sandbox not found"))?;
+                if pod.state != PodSandboxState::SandboxReady as i32 {
+                    return Err(Self::create_container_sandbox_not_ready_error(
+                        pod_sandbox_id,
+                        pod.state,
+                    ));
+                }
+                pod.metadata
+                    .clone()
+                    .ok_or_else(|| Status::failed_precondition("Pod sandbox metadata is missing"))?
+            }
+        };
+
         unimplemented!()
     }
 
@@ -128,5 +174,19 @@ impl RuntimeServiceImpl {
         unimplemented!()
     }
 
+    fn create_container_sandbox_not_ready_error(
+        pod_sandbox_id: &str,
+        sandbox_state: i32,
+    ) -> Status {
+        let state_name = match sandbox_state {
+            x if x == PodSandboxState::SandboxReady as i32 => "ready",
+            x if x == PodSandboxState::SandboxNotready as i32 => "notready",
+            _ => "unknown",
+        };
+        Status::failed_precondition(format!(
+            "CreateContainer failed as the sandbox is not ready: {} (state: {})",
+            pod_sandbox_id, state_name
+        ))
+    }
     
 }
