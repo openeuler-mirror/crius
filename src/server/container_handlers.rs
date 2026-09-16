@@ -35,7 +35,9 @@ use crate::server::service::{
     RuntimeServiceImpl, NameReservationGuard,
 };
 use crate::service::event::InternalEventSeverity;
-use crate::server::state_model::StoredPodState;
+use crate::server::state_model::{
+    StoredPodState, StoredNamespaceOptions
+};
 use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
@@ -212,6 +214,59 @@ impl RuntimeServiceImpl {
                     .unwrap_or_default()
             }
         };
+
+        // 提取容器和pod相关配置
+        let sandbox_linux = sandbox_config
+            .as_ref()
+            .and_then(|config| config.linux.as_ref());
+        let security = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.security_context.as_ref());
+        let sandbox_namespace_options = sandbox_linux
+            .and_then(|linux| linux.security_context.as_ref())
+            .and_then(|security| security.namespace_options.as_ref())
+            .map(StoredNamespaceOptions::from)
+            .or_else(|| {
+                pod_state
+                    .as_ref()
+                    .and_then(|state| state.namespace_options.clone())
+            });
+        let namespace_options = self.effective_container_namespace_options(
+            security.and_then(|security| security.namespace_options.as_ref()),
+            sandbox_namespace_options.as_ref(),
+        );
+        let run_as_user = security
+            .and_then(|security| security.run_as_user.as_ref())
+            .map(|user| user.value.to_string())
+            .or_else(|| {
+                security.and_then(|security| {
+                    if security.run_as_username.is_empty() {
+                        None
+                    } else {
+                        Some(security.run_as_username.clone())
+                    }
+                })
+            });
+        let run_as_group = security
+            .and_then(|security| security.run_as_group.as_ref())
+            .and_then(|group| u32::try_from(group.value).ok());
+        let supplemental_groups: Vec<u32> = security
+            .map(|security| {
+                security
+                    .supplemental_groups
+                    .iter()
+                    .filter_map(|group| u32::try_from(*group).ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.validate_minimum_mappable_ids(
+            namespace_options.as_ref(),
+            run_as_user.as_deref(),
+            run_as_group,
+            &supplemental_groups,
+        )?;
+
 
         unimplemented!()
     }

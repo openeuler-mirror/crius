@@ -19,7 +19,45 @@ use std::collections::HashMap;
 
 use serde::{Serialize, Deserialize};
 
+use crate::proto::runtime::v1::NamespaceOption;
 use crate::server::service::RuntimeServiceImpl;
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredNamespaceOptions {
+    pub(super) network: i32,
+    pub(super) pid: i32,
+    pub(super) ipc: i32,
+    pub(super) target_id: String,
+    pub(super) userns_options: Option<StoredUserNamespace>,
+}
+
+impl StoredNamespaceOptions {
+    pub(super) fn to_proto(&self) -> NamespaceOption {
+        NamespaceOption {
+            network: self.network,
+            pid: self.pid,
+            ipc: self.ipc,
+            target_id: self.target_id.clone(),
+            userns_options: self
+                .userns_options
+                .as_ref()
+                .map(StoredUserNamespace::to_proto),
+        }
+    }
+}
+
+impl From<&NamespaceOption> for StoredNamespaceOptions {
+    fn from(value: &NamespaceOption) -> Self {
+        Self {
+            network: value.network,
+            pid: value.pid,
+            ipc: value.ipc,
+            target_id: value.target_id.clone(),
+            userns_options: value.userns_options.as_ref().map(StoredUserNamespace::from),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 
 #[serde(default)]
@@ -63,20 +101,30 @@ pub(super) struct StoredPortMapping {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 
 #[serde(default)]
-pub(super) struct StoredNamespaceOptions {
-    pub(super) network: i32,
-    pub(super) pid: i32,
-    pub(super) ipc: i32,
-    pub(super) target_id: String,
-    pub(super) userns_options: Option<StoredUserNamespace>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, Default)] 
-#[serde(default)]
 pub(super) struct StoredUserNamespace {
     pub(super) mode: i32,
     pub(super) uids: Vec<StoredIdMapping>,
     pub(super) gids: Vec<StoredIdMapping>,
+}
+
+impl StoredUserNamespace {
+    pub(super) fn to_proto(&self) -> crate::proto::runtime::v1::UserNamespace {
+        crate::proto::runtime::v1::UserNamespace {
+            mode: self.mode,
+            uids: self.uids.iter().map(StoredIdMapping::to_proto).collect(),
+            gids: self.gids.iter().map(StoredIdMapping::to_proto).collect(),
+        }
+    }
+}
+
+impl From<&crate::proto::runtime::v1::UserNamespace> for StoredUserNamespace {
+    fn from(value: &crate::proto::runtime::v1::UserNamespace) -> Self {
+        Self {
+            mode: value.mode,
+            uids: value.uids.iter().map(StoredIdMapping::from).collect(),
+            gids: value.gids.iter().map(StoredIdMapping::from).collect(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 
@@ -85,6 +133,26 @@ pub(super) struct StoredIdMapping {
     pub(super) host_id: u32,
     pub(super) container_id: u32,
     pub(super) length: u32,
+}
+
+impl StoredIdMapping {
+    pub(super) fn to_proto(&self) -> crate::proto::runtime::v1::IdMapping {
+        crate::proto::runtime::v1::IdMapping {
+            host_id: self.host_id,
+            container_id: self.container_id,
+            length: self.length,
+        }
+    }
+}
+
+impl From<&crate::proto::runtime::v1::IdMapping> for StoredIdMapping {
+    fn from(value: &crate::proto::runtime::v1::IdMapping) -> Self {
+        Self {
+            host_id: value.host_id,
+            container_id: value.container_id,
+            length: value.length,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 

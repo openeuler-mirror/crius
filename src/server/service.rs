@@ -29,6 +29,7 @@ use crate::proto::runtime::v1::*;
 use crate::image::{ImageServiceOptions, ImageServiceImpl};
 use crate::service::InternalServices;
 use crate::storage::persistence::{PersistenceManager, PersistenceConfig};
+use crate::server::state_model::StoredNamespaceOptions;
 
 /// 运行时配置
 #[derive(Debug, Clone)]
@@ -311,6 +312,158 @@ impl RuntimeServiceImpl {
             pod_metadata.uid,
             metadata.attempt
         )
+    }
+
+    pub(super) fn effective_userns_options(
+        &self,
+        requested: Option<&NamespaceOption>,
+    ) -> Option<NamespaceOption> {
+        let (Some(uid_mappings), Some(gid_mappings)) = (
+            self.config.uid_mappings.as_ref(),
+            self.config.gid_mappings.as_ref(),
+        ) else {
+            return requested.cloned();
+        };
+
+        if let Some(options) = requested {
+            if let Some(userns) = options.userns_options.as_ref() {
+                if userns.mode == NamespaceMode::Node as i32 {
+                    return Some(options.clone());
+                }
+                if !userns.uids.is_empty() || !userns.gids.is_empty() {
+                    return Some(options.clone());
+                }
+            }
+
+            let mut effective = options.clone();
+            effective.userns_options = Some(crate::proto::runtime::v1::UserNamespace {
+                mode: NamespaceMode::Pod as i32,
+                uids: uid_mappings.clone(),
+                gids: gid_mappings.clone(),
+            });
+            return Some(effective);
+        }
+
+        Some(NamespaceOption {
+            network: NamespaceMode::Pod as i32,
+            pid: NamespaceMode::Pod as i32,
+            ipc: NamespaceMode::Pod as i32,
+            target_id: String::new(),
+            userns_options: Some(crate::proto::runtime::v1::UserNamespace {
+                mode: NamespaceMode::Pod as i32,
+                uids: uid_mappings.clone(),
+                gids: gid_mappings.clone(),
+            }),
+        })
+    }
+
+    pub(super) fn effective_container_namespace_options(
+        &self,
+        requested: Option<&NamespaceOption>,
+        sandbox: Option<&StoredNamespaceOptions>,
+    ) -> Option<NamespaceOption> {
+        let mut effective = self.effective_userns_options(requested);
+        let Some(sandbox) = sandbox else {
+            return effective;
+        };
+
+        let sandbox = sandbox.to_proto();
+        let requested_missing = requested.is_none();
+        let effective = effective.get_or_insert_with(|| sandbox.clone());
+
+        // Match CRI-O's behavior: the sandbox decides whether workload
+        // containers must run in host namespaces, even if the container
+        // request omitted namespace options or left them at proto defaults.
+        if sandbox.network == NamespaceMode::Node as i32 || requested_missing {
+            effective.network = sandbox.network;
+        }
+
+        if sandbox.pid == NamespaceMode::Node as i32 {
+            effective.pid = sandbox.pid;
+            effective.target_id.clear();
+        } else if requested_missing {
+            effective.pid = sandbox.pid;
+            effective.target_id = sandbox.target_id.clone();
+        }
+
+        if sandbox.ipc == NamespaceMode::Node as i32 || requested_missing {
+            effective.ipc = sandbox.ipc;
+        }
+
+        if effective.userns_options.is_none() {
+            effective.userns_options = sandbox.userns_options;
+        }
+
+        Some(effective.clone())
+    }
+
+    fn run_as_user_is_non_root(run_as_user: Option<&str>) -> bool {
+        let Some(run_as_user) = run_as_user.map(str::trim).filter(|value| !value.is_empty()) else {
+            return false;
+        };
+
+        run_as_user
+            .parse::<u64>()
+            .map(|value| value != 0)
+            .unwrap_or(true)
+    }
+
+    fn run_as_group_or_supplemental_is_non_root(
+        run_as_group: Option<u32>,
+        supplemental_groups: &[u32],
+    ) -> bool {
+        run_as_group.is_some_and(|group| group != 0)
+            || supplemental_groups.iter().any(|group| *group != 0)
+    }
+
+    pub(super) fn validate_minimum_mappable_ids(
+        &self,
+        namespace_options: Option<&NamespaceOption>,
+        run_as_user: Option<&str>,
+        run_as_group: Option<u32>,
+        supplemental_groups: &[u32],
+    ) -> Result<(), Status> {
+        let Some(userns) = namespace_options.and_then(|options| options.userns_options.as_ref())
+        else {
+            return Ok(());
+        };
+        if userns.mode == NamespaceMode::Node as i32 {
+            return Ok(());
+        }
+
+        let non_root_user = Self::run_as_user_is_non_root(run_as_user);
+        let non_root_group =
+            Self::run_as_group_or_supplemental_is_non_root(run_as_group, supplemental_groups);
+
+        if self.config.minimum_mappable_uid >= 0 && non_root_user {
+            for mapping in &userns.uids {
+                if i64::from(mapping.host_id) < self.config.minimum_mappable_uid {
+                    return Err(Status::invalid_argument(format!(
+                        "uid mapping {}:{}:{} is below minimum mappable uid {} for non-root user namespace",
+                        mapping.container_id,
+                        mapping.host_id,
+                        mapping.length,
+                        self.config.minimum_mappable_uid
+                    )));
+                }
+            }
+        }
+
+        if self.config.minimum_mappable_gid >= 0 && (non_root_user || non_root_group) {
+            for mapping in &userns.gids {
+                if i64::from(mapping.host_id) < self.config.minimum_mappable_gid {
+                    return Err(Status::invalid_argument(format!(
+                        "gid mapping {}:{}:{} is below minimum mappable gid {} for non-root user namespace",
+                        mapping.container_id,
+                        mapping.host_id,
+                        mapping.length,
+                        self.config.minimum_mappable_gid
+                    )));
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
