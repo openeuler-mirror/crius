@@ -31,6 +31,7 @@ pub const DEFAULT_RUNTIME_VERSION_FILE: &str = "/run/crius/version";
 pub const DEFAULT_RUNTIME_VERSION_FILE_PERSIST: &str = "/var/lib/crius/version";
 
 pub const MIN_CONTAINER_STOP_TIMEOUT_SECS: u32 = 30;
+pub const MIN_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 30;
 
 pub const LOCAL_LOG_TIME_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%.6f%:z";
 
@@ -155,3 +156,10 @@ pub const CONTAINERD_IMAGE_NAME_ANNOTATION: &str = "io.kubernetes.cri.image-name
 pub const CONTAINERD_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.cri.container-name";
 
 pub const KUBERNETES_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.container.name";
+
+pub const DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 240;
+
+pub const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
+
+pub const SHIM_METADATA_FILE: &str = "shim.json";
+pub const SHIM_PIDFILE_NAME: &str = "shim.pid";

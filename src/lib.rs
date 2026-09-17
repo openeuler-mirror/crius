@@ -20,8 +20,6 @@ limitations under the License.
 //!
 //! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
 
-#[cfg(feature = "shim")]
-pub mod shim;
 
 pub mod error;
 pub mod config;
@@ -32,13 +30,11 @@ pub mod storage;
 pub mod service;
 pub mod crs;
 pub mod proto;
-
-#[cfg(feature = "shim")]
-pub mod shim_rpc;
-#[cfg(feature = "shim")]
-pub mod attach;
-#[cfg(feature = "shim")]
 pub mod runtime;
-#[cfg(feature = "shim")]
-pub mod cgroups;
+pub mod shim;
+pub mod shim_rpc;
+pub mod oci;
+pub mod security;
+pub mod cgroup;
+pub mod attach;
 
