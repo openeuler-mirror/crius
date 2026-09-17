@@ -16,6 +16,7 @@ limitations under the License.
 
 
 use std::sync::Arc;
+use std::unimplemented;
 use tokio::sync::Mutex;
 use std::path::PathBuf;
 use std::collections::{HashMap, HashSet};
@@ -30,6 +31,14 @@ use crate::image::{ImageServiceOptions, ImageServiceImpl};
 use crate::service::InternalServices;
 use crate::storage::persistence::{PersistenceManager, PersistenceConfig};
 use crate::server::state_model::StoredNamespaceOptions;
+use crate::runtime::backend::RuntimeBackend;
+use crate::runtime::shim_manager::ShimConfig;
+use crate::runtime::RuncRuntime;
+use crate::runtime::runc_backend::RuncBackend;
+use crate::defaults::{
+    CRIO_RUNTIME_HANDLER_ANNOTATION,
+    CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
+};
 
 /// 运行时配置
 #[derive(Debug, Clone)]
@@ -37,7 +46,7 @@ pub struct RuntimeServiceConfig {
     pub root_dir: PathBuf,
     pub runtime: String,
     pub runtime_handlers: Vec<String>,
-    // pub runtime_configs: HashMap<String, crate::config::ResolvedRuntimeHandlerConfig>,
+    pub runtime_configs: HashMap<String, crate::config::ResolvedRuntimeHandlerConfig>,
     pub runtime_root: PathBuf,
     pub log_dir: PathBuf,
     pub runtime_path: PathBuf,
@@ -154,7 +163,7 @@ pub struct RuntimeServiceConfig {
     pub enable_unprivileged_ports: bool,
     pub enable_unprivileged_icmp: bool,
     // pub rootless: crate::rootless::EffectiveRootlessConfig,
-    // pub shim: ShimConfig,
+    pub shim: ShimConfig,
     // pub streaming: crate::streaming::StreamingConfig,
     // pub config_path: Option<PathBuf>,
 }
@@ -195,6 +204,7 @@ pub struct RuntimeServiceImpl {
     pub(super) removed_container_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) removed_pod_sandbox_ids: StdArc<StdMutex<HashSet<String>>>,
     pub(super) config: RuntimeServiceConfig,
+    pub(super) runtime: RuntimeRegistry,
     pub(super) image_service: ImageServiceImpl,
     pub(super) internal_services: crate::service::InternalServices,
     pub(super) shim_work_dir: PathBuf,
@@ -205,11 +215,75 @@ pub struct RuntimeServiceImpl {
 }
 
 impl RuntimeServiceImpl {
-    pub fn new(config: RuntimeServiceConfig) -> Self {
+    pub fn new(config: RuntimeServiceConfig, ) -> Self {
         let containers = Arc::new(Mutex::new(HashMap::new()));
         let pod_sandboxes = Arc::new(Mutex::new(HashMap::new()));
         let container_names = StdArc::new(StdMutex::new(NameRegistry::default()));
         let pod_names = StdArc::new(StdMutex::new(NameRegistry::default()));
+        let container_create_timeouts = config.runtime_configs
+            .iter()
+            .map(|(handler, config)| (handler.clone(), config.container_create_timeout))
+            .collect();
+        let shim_work_dir = config.runtime_root.join("shims");
+        let resolved_shim_work_dir = shim_work_dir;
+
+        let runtimes: HashMap<String, Arc<dyn RuntimeBackend>> = if let Some(
+            runtimes,
+        ) =
+            None
+        {
+            runtimes
+        } else {
+            config
+                    .runtime_configs
+                    .iter()
+                    .map(|(handler, runtime_config)| {
+                        let mut shim_config = config.shim.clone();
+                        shim_config.work_dir = resolved_shim_work_dir.clone();
+                        shim_config.attach_socket_dir = config.attach_socket_dir.clone();
+                        shim_config.container_exits_dir = config.container_exits_dir.clone();
+                        shim_config.shim_path = PathBuf::from(&runtime_config.monitor_path);
+                        shim_config.runtime_config_path =
+                            PathBuf::from(runtime_config.runtime_config_path.as_str());
+                        shim_config.monitor_cgroup = runtime_config.monitor_cgroup.clone();
+                        shim_config.io_uid = config.io_uid;
+                        shim_config.io_gid = config.io_gid;
+                        shim_config.runtime_path = PathBuf::from(&runtime_config.runtime_path);
+                        shim_config.monitor_env = runtime_config.monitor_env.clone();
+                        shim_config.no_sync_log = config.no_sync_log;
+                        shim_config.no_new_keyring = config.no_new_keyring;
+                        shim_config.systemd_cgroup =
+                            config.cgroup_driver == Some(CgroupDriver::Systemd);
+                        let backend: Arc<dyn RuntimeBackend> = match runtime_config
+                            .backend
+                            .as_str()
+                        {
+                            "wasm-direct" => {
+                                unimplemented!()
+                            }
+                            "" | "runc" => {
+                                let mut runtime = RuncRuntime::with_shim_and_image_storage(
+                                    PathBuf::from(&runtime_config.runtime_path),
+                                    PathBuf::from(&runtime_config.runtime_root),
+                                    config.image_root.clone(),
+                                    shim_config,
+                                );
+                                Arc::new(RuncBackend::new(runtime))
+                            }
+                            other => {
+                                log::warn!(
+                                    "runtime handler {} requested backend {}; falling back to runc-compatible backend construction",
+                                    handler,
+                                    other
+                                );
+                                unimplemented!()
+                            }
+                        };
+                        (handler.clone(), backend)
+                    })
+                    .collect()
+        };
+        let runtime = RuntimeRegistry::new(config.runtime.clone(), runtimes, container_create_timeouts);
         let image_service = ImageServiceImpl::new_with_options(ImageServiceOptions {
             storage_path: config.image_root.clone(),
             ledger_db_path: Some(config.root_dir.join("crius.db")),
@@ -271,6 +345,7 @@ impl RuntimeServiceImpl {
             removed_container_ids: Arc::new(StdMutex::new(HashSet::new())), 
             removed_pod_sandbox_ids: Arc::new(StdMutex::new(HashSet::new())), 
             config, 
+            runtime,
             image_service: image_service, 
             internal_services,
             shim_work_dir: PathBuf::new(), 
@@ -772,5 +847,87 @@ impl NameReservationGuard {
             registry,
             active: true,
         }
+    }
+}
+
+#[derive(Clone)]
+pub struct RuntimeRegistry {
+    default_handler: String,
+    runtimes: Arc<HashMap<String, Arc<dyn RuntimeBackend>>>,
+    container_create_timeouts: Arc<HashMap<String, u32>>,
+    container_handlers: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+impl RuntimeRegistry {
+    pub(super) fn new(
+        default_handler: String,
+        runtimes: HashMap<String, Arc<dyn RuntimeBackend>>,
+        container_create_timeouts: HashMap<String, u32>,
+    ) -> Self {
+        Self {
+            default_handler,
+            runtimes: Arc::new(runtimes),
+            container_create_timeouts: Arc::new(container_create_timeouts),
+            container_handlers: Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    pub(super) fn runtime_for_handler(
+        &self,
+        handler: &str,
+    ) -> anyhow::Result<Arc<dyn RuntimeBackend>> {
+        let resolved = if handler.trim().is_empty() {
+            self.default_handler.as_str()
+        } else {
+            handler.trim()
+        };
+        self.runtimes
+            .get(resolved)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("unsupported runtime handler: {}", resolved))
+    }
+
+    pub(super) fn runtime_for_annotations_map(
+        &self,
+        annotations: &HashMap<String, String>,
+    ) -> anyhow::Result<Arc<dyn RuntimeBackend>> {
+        let handler = annotations
+            .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+            .or_else(|| annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.default_handler.as_str());
+        self.runtime_for_handler(handler)
+    }
+
+    fn remember_container_handler(&self, container_id: &str, handler: &str) {
+        if let Ok(mut handlers) = self.container_handlers.lock() {
+            handlers.insert(container_id.to_string(), handler.to_string());
+        }
+    }
+
+
+    pub(super) fn runtime_for_container(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<Arc<dyn RuntimeBackend>> {
+        if let Ok(handlers) = self.container_handlers.lock() {
+            if let Some(handler) = handlers.get(container_id) {
+                return self.runtime_for_handler(handler);
+            }
+        }
+
+        for (handler, runtime) in self.runtimes.iter() {
+            if runtime
+                .runtime_context()
+                .bundle_path_for(container_id)
+                .exists()
+            {
+                self.remember_container_handler(container_id, handler);
+                return Ok(runtime.clone());
+            }
+        }
+
+        self.runtime_for_handler(&self.default_handler)
     }
 }

@@ -18,7 +18,6 @@ pub mod content_store;
 pub mod metadata_store;
 pub mod pull_cgroup;
 
-#[cfg(feature = "shim")]
 pub mod snapshotter;
 
 use std::path::PathBuf;

@@ -24,6 +24,7 @@ use anyhow::Result;
 use log::{debug, error, info, warn};
 use nix::sys::wait::{waitpid, WaitPidFlag, WaitStatus};
 use nix::unistd::Pid;
+use nix::libc;
 
 /// 子进程收割器
 pub struct SubReaper;

@@ -47,6 +47,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use nix::libc;
+
 use super::io::{IoConfig, IoManager, JournalConfig, DEFAULT_JOURNALD_SOCKET_PATH};
 use crate::image::snapshotter::{RootfsHandle, RootfsHandleKind, RootfsMountSpec};
 use crate::runtime::RuncRuntime;
@@ -61,6 +63,7 @@ use crate::shim_rpc::{
     WaitProcessRequest, WaitProcessResponse,
 };
 use crate::storage::StorageManager;
+use crate::cgroup::CgroupManager;
 
 const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 
@@ -1835,7 +1838,7 @@ impl Daemon {
         let resources: crate::proto::runtime::v1::LinuxContainerResources =
             request.resources.clone().into();
         let limits = RuncRuntime::cri_to_limits(&resources);
-        let cgroup_manager = crate::cgroups::CgroupManager::new(request.container_id.clone())
+        let cgroup_manager = CgroupManager::new(request.container_id.clone())
             .context("Failed to create cgroup manager")?;
         cgroup_manager
             .set_resources(&limits)

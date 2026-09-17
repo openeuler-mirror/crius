@@ -27,18 +27,25 @@ pub mod state_model;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::vec;
+use std::sync::Arc;
 
-use crate::config::Config;
-use crate::server::service::RuntimeServiceConfig;
+use tonic::Status;
+
+use crate::config::{Config, CgroupDriverConfig};
+use crate::server::service::{RuntimeServiceConfig, RuntimeServiceImpl};
+use crate::runtime::backend::RuntimeBackend;
+use crate::runtime::shim_manager::ShimConfig;
 
 
 impl RuntimeServiceConfig {
     pub fn new(config: Config) -> Self {
         let runtime_name = config.runtime.runtime_type.clone();
+        let runtime_config = config.runtime.resolved_runtimes().expect("runtime handler failed");
         Self {
             root_dir: PathBuf::from(&config.root),
             runtime: runtime_name,
             runtime_handlers: vec![],
+            runtime_configs: runtime_config,
             runtime_root: PathBuf::from(&config.runtime.root),
             log_dir: PathBuf::from(&config.logging.dir),
             runtime_path: PathBuf::from(&config.runtime.runtime_path),
@@ -154,6 +161,130 @@ impl RuntimeServiceConfig {
             restrict_oom_score_adj: config.runtime.restrict_oom_score_adj,
             enable_unprivileged_ports: config.runtime.enable_unprivileged_ports,
             enable_unprivileged_icmp: config.runtime.enable_unprivileged_icmp,
+            shim: ShimConfig {
+            shim_path: PathBuf::from(&config.runtime.shim_path),
+            runtime_config_path: PathBuf::from(&config.runtime.runtime_config_path),
+            monitor_cgroup: config.runtime.monitor_cgroup.clone(),
+            work_dir: PathBuf::from(&config.runtime.shim_dir),
+            attach_socket_dir: PathBuf::from(&config.runtime.attach_socket_dir),
+            container_exits_dir: PathBuf::from(&config.runtime.container_exits_dir),
+            io_uid: config.runtime.io_uid,
+            io_gid: config.runtime.io_gid,
+            monitor_env: config.runtime.monitor_env.clone(),
+            debug: config.runtime.shim_debug,
+            log_to_journald: config.runtime.log_to_journald,
+            no_sync_log: config.runtime.no_sync_log,
+            no_pivot: config.runtime.no_pivot,
+            no_new_keyring: config.runtime.no_new_keyring,
+            systemd_cgroup: matches!(
+                config.runtime.cgroup_driver,
+                Some(CgroupDriverConfig::Systemd)
+            ),
+            runtime_path: PathBuf::from(&config.runtime.runtime_path),
+            max_container_log_line_size: config.logging.max_container_log_line_size,
+            state_db_path: PathBuf::from(&config.root).join("crius.db"),
+        },
         }
     }
+}
+
+
+impl RuntimeServiceImpl {
+    async fn runtime_for_container_request(
+        &self,
+        container_id: &str,
+    ) -> Result<Arc<dyn RuntimeBackend>, Status> {
+        let annotations = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(container_id)
+                .map(|container| container.annotations.clone())
+        };
+
+        if let Some(annotations) = annotations {
+            if let Ok(runtime) = self.runtime.runtime_for_annotations_map(&annotations) {
+                return Ok(runtime);
+            }
+        }
+
+        self.runtime
+            .runtime_for_container(container_id)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve runtime for container {}: {}",
+                    container_id, e
+                ))
+            })
+    }
+    
+    async fn runtime_namespace_path_for_container(
+        &self,
+        runtime_container_id: &str,
+        namespace: &str,
+    ) -> Result<Option<PathBuf>, Status> {
+        if runtime_container_id.is_empty() {
+            return Ok(None);
+        }
+
+        let runtime = self
+            .runtime_for_container_request(runtime_container_id)
+            .await?;
+        let container_id = runtime_container_id.to_string();
+        let pid = tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_pid(&container_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| {
+            Status::internal(format!(
+                "Failed to query container PID for {}: {}",
+                runtime_container_id, e
+            ))
+        })?;
+
+        Ok(pid.map(|pid| PathBuf::from(format!("/proc/{}/ns/{}", pid, namespace))))
+    }
+
+    async fn resolve_container_id(&self, requested_id: &str) -> Result<String, Status> {
+        if let Ok(removed) = self.removed_container_ids.lock() {
+            if removed.contains(requested_id) {
+                return Err(Status::not_found("Container not found"));
+            }
+        }
+        let containers = self.containers.lock().await;
+        if containers.contains_key(requested_id) {
+            return Ok(requested_id.to_string());
+        }
+
+        let matches: Vec<String> = containers
+            .keys()
+            .filter(|id| id.starts_with(requested_id))
+            .cloned()
+            .collect();
+
+        match matches.len() {
+            0 => Err(Status::not_found("Container not found")),
+            1 => Ok(matches[0].clone()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous container id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
+
+    async fn runtime_namespace_path_for_target(
+        &self,
+        requested_container_id: &str,
+        namespace: &str,
+    ) -> Result<Option<PathBuf>, Status> {
+        if requested_container_id.is_empty() {
+            return Ok(None);
+        }
+
+        let resolved_id = self.resolve_container_id(requested_container_id).await?;
+        self.runtime_namespace_path_for_container(&resolved_id, namespace)
+            .await
+    }
+
+
 }
