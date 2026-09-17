@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+
+pub mod validation;
+
 use std::{fs, path::Path};
 use std::str::FromStr;
 use std::collections::HashMap;
@@ -23,6 +26,11 @@ use serde::{Deserialize, Serialize};
 use crate::error::Result;
 use crate::defaults::*;
 use crate::error::Error;
+use crate::config::validation::{
+    resolve_platform_runtime_path,
+    resolve_monitor_cgroup,
+    detect_system_cgroup_driver,
+};
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -224,6 +232,195 @@ pub struct RuntimeConfig {
     pub enable_unprivileged_icmp: bool,
 }
 
+impl RuntimeConfig {
+    pub fn effective_cgroup_driver(&self) -> CgroupDriverConfig {
+        self.cgroup_driver
+            .unwrap_or_else(detect_system_cgroup_driver)
+    }
+
+    pub fn normalized_handlers(&self) -> Vec<String> {
+        let mut handlers = Vec::new();
+        for handler in &self.handlers {
+            let trimmed = handler.trim();
+            if !trimmed.is_empty() && !handlers.iter().any(|existing: &String| existing == trimmed)
+            {
+                handlers.push(trimmed.to_string());
+            }
+        }
+        for handler in self.runtimes.keys() {
+            let trimmed = handler.trim();
+            if !trimmed.is_empty() && !handlers.iter().any(|existing: &String| existing == trimmed)
+            {
+                handlers.push(trimmed.to_string());
+            }
+        }
+        if !handlers.iter().any(|handler| handler == &self.runtime_type) {
+            handlers.push(self.runtime_type.clone());
+        }
+        handlers
+    }
+
+    pub fn resolved_runtimes(&self) -> Result<HashMap<String, ResolvedRuntimeHandlerConfig>> {
+        let default_handler = self.runtime_type.trim();
+        let default_runtime = ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: resolve_platform_runtime_path(
+                self.runtime_path.trim(),
+                &self.platform_runtime_paths,
+            )?,
+            runtime_config_path: self.runtime_config_path.trim().to_string(),
+            runtime_root: self.root.trim().to_string(),
+            platform_runtime_paths: self.platform_runtime_paths.clone(),
+            monitor_path: self.shim_path.trim().to_string(),
+            monitor_cgroup: resolve_monitor_cgroup(
+                self.monitor_cgroup.as_str(),
+                self.effective_cgroup_driver(),
+            )?,
+            monitor_env: self.monitor_env.clone(),
+            stream_websockets: true,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
+        };
+        let mut resolved = HashMap::from([(default_handler.to_string(), default_runtime.clone())]);
+
+        for handler in self.normalized_handlers() {
+            if handler == default_handler {
+                continue;
+            }
+
+            let Some(config) = self.runtimes.get(&handler) else {
+                return Err(Error::Config(format!(
+                    "runtime handler {handler} requires [runtime.runtimes.{handler}]"
+                )));
+            };
+
+            if config.inherit_default_runtime {
+                if !config.runtime_path.trim().is_empty() || !config.runtime_root.trim().is_empty()
+                {
+                    return Err(Error::Config(format!(
+                        "runtime.runtimes.{handler} must not set runtime_path/runtime_root when inherit_default_runtime = true"
+                    )));
+                }
+                let mut inherited = default_runtime.clone();
+                if !config.runtime_config_path.trim().is_empty() {
+                    inherited.runtime_config_path = config.runtime_config_path.trim().to_string();
+                }
+                if !config.backend.trim().is_empty() {
+                    inherited.backend = config.backend.trim().to_string();
+                }
+                inherited.backend_options = config.backend_options.clone();
+                if !config.platform_runtime_paths.is_empty() {
+                    inherited.platform_runtime_paths = config.platform_runtime_paths.clone();
+                    inherited.runtime_path = resolve_platform_runtime_path(
+                        self.runtime_path.trim(),
+                        &inherited.platform_runtime_paths,
+                    )?;
+                }
+                if !config.monitor_path.trim().is_empty() {
+                    inherited.monitor_path = config.monitor_path.trim().to_string();
+                }
+                if let Some(monitor_cgroup) = config.monitor_cgroup.as_deref() {
+                    inherited.monitor_cgroup =
+                        resolve_monitor_cgroup(monitor_cgroup, self.effective_cgroup_driver())?;
+                }
+                if let Some(monitor_env) = config.monitor_env.as_ref() {
+                    inherited.monitor_env = monitor_env.clone();
+                }
+                if let Some(stream_websockets) = config.stream_websockets {
+                    inherited.stream_websockets = stream_websockets;
+                }
+                inherited.allowed_annotations = config.allowed_annotations.clone();
+                inherited.default_annotations = config.default_annotations.clone();
+                inherited.privileged_without_host_devices = config.privileged_without_host_devices;
+                inherited.privileged_without_host_devices_all_devices_allowed =
+                    config.privileged_without_host_devices_all_devices_allowed;
+                if let Some(timeout) = config.container_create_timeout {
+                    inherited.container_create_timeout =
+                        timeout.max(MIN_CONTAINER_CREATE_TIMEOUT_SECS);
+                }
+                if !config.snapshotter.trim().is_empty() {
+                    inherited.snapshotter = config.snapshotter.trim().to_string();
+                }
+                resolved.insert(handler, inherited);
+                continue;
+            }
+
+            if config.runtime_path.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "runtime.runtimes.{handler}.runtime_path must not be empty"
+                )));
+            }
+
+            resolved.insert(
+                handler,
+                ResolvedRuntimeHandlerConfig {
+                    backend: if config.backend.trim().is_empty() {
+                        default_runtime.backend.clone()
+                    } else {
+                        config.backend.trim().to_string()
+                    },
+                    backend_options: config.backend_options.clone(),
+                    runtime_path: resolve_platform_runtime_path(
+                        config.runtime_path.trim(),
+                        &config.platform_runtime_paths,
+                    )?,
+                    runtime_config_path: if config.runtime_config_path.trim().is_empty() {
+                        default_runtime.runtime_config_path.clone()
+                    } else {
+                        config.runtime_config_path.trim().to_string()
+                    },
+                    runtime_root: if config.runtime_root.trim().is_empty() {
+                        default_runtime.runtime_root.clone()
+                    } else {
+                        config.runtime_root.trim().to_string()
+                    },
+                    platform_runtime_paths: config.platform_runtime_paths.clone(),
+                    monitor_path: if config.monitor_path.trim().is_empty() {
+                        default_runtime.monitor_path.clone()
+                    } else {
+                        config.monitor_path.trim().to_string()
+                    },
+                    monitor_cgroup: resolve_monitor_cgroup(
+                        config
+                            .monitor_cgroup
+                            .as_deref()
+                            .unwrap_or(default_runtime.monitor_cgroup.as_str()),
+                        self.effective_cgroup_driver(),
+                    )?,
+                    monitor_env: config
+                        .monitor_env
+                        .clone()
+                        .unwrap_or_else(|| self.monitor_env.clone()),
+                    stream_websockets: config
+                        .stream_websockets
+                        .unwrap_or(default_runtime.stream_websockets),
+                    allowed_annotations: config.allowed_annotations.clone(),
+                    default_annotations: config.default_annotations.clone(),
+                    privileged_without_host_devices: config.privileged_without_host_devices,
+                    privileged_without_host_devices_all_devices_allowed: config
+                        .privileged_without_host_devices_all_devices_allowed,
+                    container_create_timeout: config
+                        .container_create_timeout
+                        .unwrap_or(DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS)
+                        .max(MIN_CONTAINER_CREATE_TIMEOUT_SECS),
+                    snapshotter: if config.snapshotter.trim().is_empty() {
+                        "internal-overlay-untar".to_string()
+                    } else {
+                        config.snapshotter.trim().to_string()
+                    },
+                },
+            );
+        }
+
+        Ok(resolved)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageConfig{
     /// 镜像存储后端。
@@ -359,7 +556,7 @@ pub struct RuntimeWorkloadResources {
 }
 
 /// 守护进程 cgroup driver 配置。
-#[derive(Debug, Clone, Deserialize, Copy, Serialize)]
+#[derive(Debug, Clone, Deserialize, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CgroupDriverConfig {
     Systemd,
@@ -631,6 +828,49 @@ impl CgroupDriverConfig {
         match self {
             Self::Systemd => crate::proto::runtime::v1::CgroupDriver::Systemd,
             Self::Cgroupfs => crate::proto::runtime::v1::CgroupDriver::Cgroupfs,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimeHandlerConfig {
+    pub backend: String,
+    pub backend_options: HashMap<String, String>,
+    pub runtime_path: String,
+    pub runtime_config_path: String,
+    pub runtime_root: String,
+    pub platform_runtime_paths: HashMap<String, String>,
+    pub monitor_path: String,
+    pub monitor_cgroup: String,
+    pub monitor_env: Vec<String>,
+    pub stream_websockets: bool,
+    pub allowed_annotations: Vec<String>,
+    pub default_annotations: HashMap<String, String>,
+    pub privileged_without_host_devices: bool,
+    pub privileged_without_host_devices_all_devices_allowed: bool,
+    pub container_create_timeout: u32,
+    pub snapshotter: String,
+}
+
+impl Default for ResolvedRuntimeHandlerConfig {
+    fn default() -> Self {
+        Self {
+            backend: "runc".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: String::new(),
+            runtime_config_path: String::new(),
+            runtime_root: String::new(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: String::new(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: true,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
         }
     }
 }
