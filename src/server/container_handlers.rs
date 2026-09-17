@@ -17,6 +17,7 @@ limitations under the License.
 
 use std::unimplemented;
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use tonic::{Request, Response, Status};
 use serde_json::json;
@@ -267,6 +268,81 @@ impl RuntimeServiceImpl {
             &supplemental_groups,
         )?;
 
+        // 日志路径解析与目录创建
+        let pod_log_directory = sandbox_config
+            .as_ref()
+            .and_then(|config| {
+                (!config.log_directory.is_empty()).then(|| config.log_directory.clone())
+            })
+            .or_else(|| {
+                pod_state
+                    .as_ref()
+                    .and_then(|state| state.log_directory.clone())
+            });
+        let log_path =
+            Self::resolve_container_log_path(pod_log_directory.as_deref(), &config.log_path)?;
+
+        if let Some(path) = &log_path {
+            if let Some(parent) = path.parent() {
+                tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                    Status::internal(format!("Failed to prepare log directory: {}", e))
+                })?;
+            }
+        }
+
+        // 网络命名空间与本地网络
+        let network_namespace_path = match &owner {
+            ContainerOwner::Local { .. } => None,
+            ContainerOwner::Pod { pod_sandbox_id } => unimplemented!(),
+        }
+        .or_else(|| {
+            pod_state
+                .as_ref()
+                .and_then(|state| state.netns_path.as_ref().map(PathBuf::from))
+        });
+        let pause_container_id = match &owner {
+            ContainerOwner::Local { .. } => None,
+            ContainerOwner::Pod { pod_sandbox_id } => unimplemented!(),
+        }
+        .or_else(|| {
+            pod_state
+                .as_ref()
+                .and_then(|state| state.pause_container_id.clone())
+        });
+        let pid_namespace_path = if let Some(options) = namespace_options.as_ref() {
+            if options.pid == NamespaceMode::Pod as i32 {
+                if let Some(pause_id) = pause_container_id.as_deref() {
+                    self.runtime_namespace_path_for_container(pause_id, "pid")
+                        .await?
+                } else {
+                    None
+                }
+            } else if options.pid == NamespaceMode::Target as i32 {
+                self.runtime_namespace_path_for_target(&options.target_id, "pid")
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let ipc_namespace_path = if let Some(options) = namespace_options.as_ref() {
+            if options.ipc == NamespaceMode::Pod as i32 {
+                if let Some(pause_id) = pause_container_id.as_deref() {
+                    self.runtime_namespace_path_for_container(pause_id, "ipc")
+                        .await?
+                } else {
+                    None
+                }
+            } else if options.ipc == NamespaceMode::Target as i32 {
+                self.runtime_namespace_path_for_target(&options.target_id, "ipc")
+                    .await?
+            } else {
+                None
+            }
+        } else {
+            None
+        };
 
         unimplemented!()
     }
@@ -418,6 +494,50 @@ impl RuntimeServiceImpl {
             Err(status)if status.code() == tonic::Code::AlreadyExists => unimplemented!(),
             Err(status) => Err(status),
         }
+    }
+
+    pub(super) fn resolve_container_log_path(
+        sandbox_log_directory: Option<&str>,
+        container_log_path: &str,
+    ) -> Result<Option<PathBuf>, Status> {
+        let log_path = container_log_path.trim();
+        if log_path.is_empty() {
+            return Ok(None);
+        }
+
+        let path = Path::new(log_path);
+        let sandbox_log_directory = sandbox_log_directory
+            .map(str::trim)
+            .filter(|dir| !dir.is_empty());
+
+        if let Some(log_directory) = sandbox_log_directory {
+            if path.is_absolute() {
+                return Err(Status::invalid_argument(
+                    "container log_path must be relative when sandbox log_directory is set",
+                ));
+            }
+            if path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::RootDir
+                        | std::path::Component::Prefix(_)
+                )
+            }) {
+                return Err(Status::invalid_argument(
+                    "container log_path must not escape the sandbox log_directory",
+                ));
+            }
+            return Ok(Some(PathBuf::from(log_directory).join(path)));
+        }
+
+        if !path.is_absolute() {
+            return Err(Status::invalid_argument(
+                "container log_path must be absolute when sandbox log_directory is not set",
+            ));
+        }
+
+        Ok(Some(path.to_path_buf()))
     }
 
 
