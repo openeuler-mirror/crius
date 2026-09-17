@@ -30,6 +30,20 @@ pub struct StorageManager {
     db_path: std::path::PathBuf,
 }
 
+/// shim进程记录
+#[derive(Debug, Clone)]
+pub struct ShimProcessRecord {
+    pub container_id: String,
+    pub shim_pid: u32,
+    pub work_dir: String,
+    pub socket_path: String,
+    pub exit_code_file: String,
+    pub log_file: String,
+    pub bundle_path: String,
+    pub state: String,
+    pub last_seen_at: i64,
+}
+
 impl StorageManager {
     /// 创建新的存储管理器
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
@@ -517,6 +531,49 @@ impl StorageManager {
         Ok(())
     }
 
+    pub fn list_shim_processes(&self) -> Result<Vec<ShimProcessRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at
+             FROM shim_processes",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(ShimProcessRecord {
+                    container_id: row.get(0)?,
+                    shim_pid: row.get(1)?,
+                    work_dir: row.get(2)?,
+                    socket_path: row.get(3)?,
+                    exit_code_file: row.get(4)?,
+                    log_file: row.get(5)?,
+                    bundle_path: row.get(6)?,
+                    state: row.get(7)?,
+                    last_seen_at: row.get(8)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list shim processes")?;
+        Ok(records)
+    }
+
+    pub fn save_shim_process(&mut self, record: &ShimProcessRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO shim_processes
+             (container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                &record.container_id,
+                record.shim_pid,
+                &record.work_dir,
+                &record.socket_path,
+                &record.exit_code_file,
+                &record.log_file,
+                &record.bundle_path,
+                &record.state,
+                record.last_seen_at,
+            ],
+        ).context("Failed to save shim process")?;
+        Ok(())
+    }
 }
 
 /// 镜像记录
