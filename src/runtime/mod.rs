@@ -607,3 +607,33 @@ pub enum SeccompProfile {
     Unconfined,
     Localhost(PathBuf),
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingMountSourcePolicy {
+    Ignore,
+    Reject,
+    CreateDirectory,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountPropagationMode {
+    Private,
+    HostToContainer,
+    Bidirectional,
+}
+
+/// 挂载点配置
+#[derive(Debug, Clone)]
+pub struct MountConfig {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub read_only: bool,
+    pub missing_source_policy: MissingMountSourcePolicy,
+    pub selinux_relabel: bool,
+    pub propagation: MountPropagationMode,
+    pub recursive_read_only: bool,
+    pub uid_mappings: Vec<crate::oci::spec::IdMapping>,
+    pub gid_mappings: Vec<crate::oci::spec::IdMapping>,
+    pub requested_image: Option<String>,
+    pub image_sub_path: Option<String>,
+}

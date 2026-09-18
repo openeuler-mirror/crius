@@ -16,10 +16,12 @@ limitations under the License.
 
 
 use std::collections::HashMap;
+use std::path::Path;
 
 use serde::Deserialize;
 
 use crate::server::service::RuntimeServiceImpl;
+use crate::server::state_model::StoredPodState;
 use crate::defaults::{
     INTERNAL_ANNOTATION_PREFIX, CRIO_SANDBOX_ID_ANNOTATION,
     CRIO_SANDBOX_NAME_ANNOTATION, CRIO_POD_NAME_ANNOTATION,
@@ -32,12 +34,25 @@ use crate::defaults::{
     CRIO_IMAGE_NAME_ANNOTATION, CRIO_LOG_PATH_ANNOTATION,
     CONTAINERD_CONTAINER_TYPE_ANNOTATION, CONTAINERD_IMAGE_NAME_ANNOTATION,
     CONTAINERD_CONTAINER_NAME_ANNOTATION, KUBERNETES_CONTAINER_NAME_ANNOTATION,
+    CONTAINER_TYPE_CONTAINER,
 };
 
 #[derive(Clone, Copy)]
 pub(super) enum AnnotationScope {
     Pod,
     Container,
+}
+
+pub(super) struct ContainerAnnotationContext<'a> {
+    pub(super) annotations: &'a mut HashMap<String, String>,
+    pub(super) container_id: &'a str,
+    pub(super) pod_sandbox_id: &'a str,
+    pub(super) metadata_name: Option<&'a str>,
+    pub(super) requested_image: Option<&'a str>,
+    pub(super) resolved_image_name: Option<&'a str>,
+    pub(super) log_path: Option<&'a Path>,
+    pub(super) pod_state: Option<&'a StoredPodState>,
+    pub(super) default_runtime: &'a str,
 }
 
 impl RuntimeServiceImpl {
@@ -114,10 +129,118 @@ impl RuntimeServiceImpl {
             .collect()
     }
 
-
     pub(super) fn external_pod_annotations(
         annotations: &HashMap<String, String>,
     ) -> HashMap<String, String> {
         Self::external_annotations_for_scope(annotations, AnnotationScope::Pod)
     }
+
+    fn resolved_runtime_handler_name<'a>(&'a self, runtime_handler: &'a str) -> &'a str {
+        let runtime_handler = runtime_handler.trim();
+        if runtime_handler.is_empty() {
+            self.config.runtime.as_str()
+        } else {
+            runtime_handler
+        }
+    }
+
+    pub(super) fn apply_runtime_handler_default_annotations(
+        &self,
+        annotations: &mut HashMap<String, String>,
+        runtime_handler: &str,
+    ) {
+        let Some(config) = self
+            .config
+            .runtime_configs
+            .get(self.resolved_runtime_handler_name(runtime_handler))
+        else {
+            return;
+        };
+
+        for (key, value) in &config.default_annotations {
+            annotations
+                .entry(key.clone())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    pub(super) fn enrich_container_annotations(context: ContainerAnnotationContext<'_>) {
+        context.annotations.insert(
+            CRIO_CONTAINER_ID_ANNOTATION.to_string(),
+            context.container_id.to_string(),
+        );
+        context.annotations.insert(
+            CRIO_SANDBOX_ID_ANNOTATION.to_string(),
+            context.pod_sandbox_id.to_string(),
+        );
+        context.annotations.insert(
+            CRIO_CONTAINER_NAME_ANNOTATION.to_string(),
+            context
+                .metadata_name
+                .unwrap_or(context.container_id)
+                .to_string(),
+        );
+        context.annotations.insert(
+            CRIO_CONTAINER_TYPE_ANNOTATION.to_string(),
+            CONTAINER_TYPE_CONTAINER.to_string(),
+        );
+        context.annotations.insert(
+            CONTAINERD_SANDBOX_ID_ANNOTATION.to_string(),
+            context.pod_sandbox_id.to_string(),
+        );
+        context.annotations.insert(
+            CONTAINERD_CONTAINER_TYPE_ANNOTATION.to_string(),
+            CONTAINER_TYPE_CONTAINER.to_string(),
+        );
+        if let Some(name) = context.metadata_name {
+            context.annotations.insert(
+                CONTAINERD_CONTAINER_NAME_ANNOTATION.to_string(),
+                name.to_string(),
+            );
+            context.annotations.insert(
+                KUBERNETES_CONTAINER_NAME_ANNOTATION.to_string(),
+                name.to_string(),
+            );
+        }
+        if let Some(image) = context.requested_image.filter(|image| !image.is_empty()) {
+            context.annotations.insert(
+                CRIO_USER_REQUESTED_IMAGE_ANNOTATION.to_string(),
+                image.to_string(),
+            );
+        }
+        if let Some(image_name) = context
+            .resolved_image_name
+            .filter(|image| !image.is_empty())
+        {
+            context.annotations.insert(
+                CRIO_IMAGE_NAME_ANNOTATION.to_string(),
+                image_name.to_string(),
+            );
+            context.annotations.insert(
+                CONTAINERD_IMAGE_NAME_ANNOTATION.to_string(),
+                image_name.to_string(),
+            );
+        }
+        let runtime_handler = context
+            .pod_state
+            .map(|state| state.runtime_handler.clone())
+            .filter(|handler| !handler.is_empty())
+            .unwrap_or_else(|| context.default_runtime.to_string());
+        context.annotations.insert(
+            CRIO_RUNTIME_HANDLER_ANNOTATION.to_string(),
+            runtime_handler.clone(),
+        );
+        context.annotations.insert(
+            CONTAINERD_RUNTIME_HANDLER_ANNOTATION.to_string(),
+            runtime_handler,
+        );
+        if let Some(path) = context.log_path {
+            context.annotations.insert(
+                CRIO_LOG_PATH_ANNOTATION.to_string(),
+                path.to_string_lossy().to_string(),
+            );
+        }
+    }
+
+    
 }

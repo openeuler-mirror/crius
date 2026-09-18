@@ -166,3 +166,4 @@ pub const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
 pub const SHIM_METADATA_FILE: &str = "shim.json";
 pub const SHIM_PIDFILE_NAME: &str = "shim.pid";
 pub const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
+pub const CONTAINER_TYPE_CONTAINER: &str = "container";

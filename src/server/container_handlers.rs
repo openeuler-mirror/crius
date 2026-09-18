@@ -41,6 +41,8 @@ use crate::server::state_model::{
     StoredLinuxResources,
 };
 use crate::network::{NetworkManager, DefaultNetworkManager};
+use crate::server::annotations;
+use crate::runtime::MountConfig;
 
 use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
@@ -488,6 +490,56 @@ impl RuntimeServiceImpl {
             resources.rdt_class = crate::security::resource_classes::resolve_rdt_class(rdt_class)
                 .and_then(|rdt| rdt.clos_id);
         }
+        self.apply_runtime_handler_default_annotations(&mut stored_annotations, runtime_handler);
+        Self::enrich_container_annotations(annotations::ContainerAnnotationContext {
+            annotations: &mut stored_annotations,
+            container_id: &container_id,
+            pod_sandbox_id: &pod_sandbox_id,
+            metadata_name: config
+                .metadata
+                .as_ref()
+                .map(|metadata| metadata.name.as_str()),
+            requested_image: config
+                .image
+                .as_ref()
+                .map(|image| image.user_specified_image.as_str())
+                .or_else(|| config.image.as_ref().map(|image| image.image.as_str())),
+            resolved_image_name: Some(container_image_ref.as_str()),
+            log_path: log_path.as_deref(),
+            pod_state: pod_state.as_ref(),
+            default_runtime: &self.config.runtime,
+        });
+
+        // 挂载信息转换
+        let mut runtime_mounts =
+            self.runtime_mounts_from_proto(&config.mounts)?;
+        if let ContainerOwner::Pod { pod_sandbox_id } = &owner {
+            let pod_resolv_path = self
+                .config
+                .root_dir
+                .join("pods")
+                .join(pod_sandbox_id)
+                .join("resolv.conf");
+            if pod_resolv_path.exists()
+                && !runtime_mounts
+                    .iter()
+                    .any(|mount| mount.destination == Path::new("/etc/resolv.conf"))
+            {
+                runtime_mounts.push(MountConfig {
+                    source: pod_resolv_path.clone(),
+                    destination: PathBuf::from("/etc/resolv.conf"),
+                    read_only: true,
+                    missing_source_policy: crate::runtime::MissingMountSourcePolicy::Ignore,
+                    selinux_relabel: false,
+                    propagation: crate::runtime::MountPropagationMode::Private,
+                    recursive_read_only: false,
+                    uid_mappings: Vec::new(),
+                    gid_mappings: Vec::new(),
+                    requested_image: None,
+                    image_sub_path: None,
+                });
+            }
+        }
 
         unimplemented!()
     }
@@ -765,6 +817,163 @@ impl RuntimeServiceImpl {
             pod_uid,
             runtime_handler,
         })
+    }
+
+    pub(super) fn runtime_mounts_from_proto(
+        &self,
+        mounts: &[crate::proto::runtime::v1::Mount],
+    ) -> Result<Vec<MountConfig>, Status> {
+        let mut runtime_mounts = Vec::new();
+        for mount in mounts {
+            if mount.recursive_read_only && !mount.readonly {
+                return Err(Status::invalid_argument(format!(
+                    "mount {} sets recursive_read_only=true but readonly=false",
+                    mount.container_path
+                )));
+            }
+            if mount.recursive_read_only
+                && mount.propagation
+                    != crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32
+            {
+                return Err(Status::invalid_argument(format!(
+                    "mount {} sets recursive_read_only=true but propagation is not private",
+                    mount.container_path
+                )));
+            }
+
+            let propagation = match mount.propagation {
+                x if x
+                    == crate::proto::runtime::v1::MountPropagation::PropagationPrivate as i32 =>
+                {
+                    crate::runtime::MountPropagationMode::Private
+                }
+                x if x
+                    == crate::proto::runtime::v1::MountPropagation::PropagationHostToContainer
+                        as i32 =>
+                {
+                    crate::runtime::MountPropagationMode::HostToContainer
+                }
+                x if x
+                    == crate::proto::runtime::v1::MountPropagation::PropagationBidirectional
+                        as i32 =>
+                {
+                    crate::runtime::MountPropagationMode::Bidirectional
+                }
+                _ => {
+                    return Err(Status::invalid_argument(format!(
+                        "mount {} sets unsupported propagation value {}",
+                        mount.container_path, mount.propagation
+                    )));
+                }
+            };
+
+            if let Some(image) = mount.image.as_ref() {
+                if !mount.host_path.trim().is_empty() {
+                    return Err(Status::invalid_argument(format!(
+                        "mount {} must not set both host_path and image",
+                        mount.container_path
+                    )));
+                }
+                if !self.config.image_oci_artifact_mount_support {
+                    return Err(Status::failed_precondition(
+                        "OCI artifact image volume mounts are disabled by image.oci_artifact_mount_support",
+                    ));
+                }
+                let container_root = PathBuf::from(mount.container_path.trim());
+                if !container_root.is_absolute() {
+                    return Err(Status::invalid_argument(format!(
+                        "OCI artifact mount container_path must be absolute: {}",
+                        mount.container_path
+                    )));
+                }
+                if container_root.extension().is_some() {
+                    return Err(Status::failed_precondition(format!(
+                        "OCI artifact mount container_path must reference a directory, got {}",
+                        mount.container_path
+                    )));
+                }
+
+                let resolved = crate::image::ImageServiceImpl::resolve_artifact_mounts(
+                    &self.config.image_root,
+                    &self.config.image_additional_artifact_stores,
+                    image.image.as_str(),
+                    (!mount.image_sub_path.trim().is_empty())
+                        .then_some(mount.image_sub_path.as_str()),
+                )?;
+                for entry in resolved {
+                    runtime_mounts.push(MountConfig {
+                        source: entry.source,
+                        destination: container_root.join(entry.relative_path),
+                        read_only: true,
+                        missing_source_policy: crate::runtime::MissingMountSourcePolicy::Reject,
+                        selinux_relabel: mount.selinux_relabel,
+                        propagation,
+                        recursive_read_only: false,
+                        uid_mappings: mount
+                            .uid_mappings
+                            .iter()
+                            .map(|mapping| crate::oci::spec::IdMapping {
+                                container_id: mapping.container_id,
+                                host_id: mapping.host_id,
+                                size: mapping.length,
+                            })
+                            .collect(),
+                        gid_mappings: mount
+                            .gid_mappings
+                            .iter()
+                            .map(|mapping| crate::oci::spec::IdMapping {
+                                container_id: mapping.container_id,
+                                host_id: mapping.host_id,
+                                size: mapping.length,
+                            })
+                            .collect(),
+                        requested_image: Some(image.image.clone()),
+                        image_sub_path: (!mount.image_sub_path.trim().is_empty())
+                            .then(|| mount.image_sub_path.clone()),
+                    });
+                }
+                continue;
+            }
+
+            if mount.host_path.trim().is_empty() {
+                return Err(Status::invalid_argument(format!(
+                    "mount {} must set host_path when image is not specified",
+                    mount.container_path
+                )));
+            }
+
+            runtime_mounts.push(MountConfig {
+                source: PathBuf::from(&mount.host_path),
+                destination: PathBuf::from(&mount.container_path),
+                read_only: mount.readonly,
+                missing_source_policy: crate::runtime::MissingMountSourcePolicy::CreateDirectory,
+                selinux_relabel: mount.selinux_relabel,
+                propagation,
+                recursive_read_only: mount.recursive_read_only,
+                uid_mappings: mount
+                    .uid_mappings
+                    .iter()
+                    .map(|mapping| crate::oci::spec::IdMapping {
+                        container_id: mapping.container_id,
+                        host_id: mapping.host_id,
+                        size: mapping.length,
+                    })
+                    .collect(),
+                gid_mappings: mount
+                    .gid_mappings
+                    .iter()
+                    .map(|mapping| crate::oci::spec::IdMapping {
+                        container_id: mapping.container_id,
+                        host_id: mapping.host_id,
+                        size: mapping.length,
+                    })
+                    .collect(),
+                requested_image: None,
+                image_sub_path: None,
+            });
+        }
+
+        Ok(runtime_mounts)
     }
 
 }
