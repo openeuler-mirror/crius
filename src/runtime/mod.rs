@@ -529,6 +529,10 @@ impl RuncRuntime {
     pub fn validate_mount_requests(&self, config: &ContainerConfig,) -> std::result::Result<(), MountSemanticsError> {
         unimplemented!()
     }
+
+    pub fn restrict_oom_score_adj_floor(oom_score_adj: i64) -> Result<i64> {
+        unimplemented!()
+    }
 }
 
 impl ContainerRuntime for RuncRuntime {

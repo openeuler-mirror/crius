@@ -37,7 +37,8 @@ use crate::server::service::{
 };
 use crate::service::event::InternalEventSeverity;
 use crate::server::state_model::{
-    StoredPodState, StoredNamespaceOptions
+    StoredPodState, StoredNamespaceOptions,
+    StoredLinuxResources,
 };
 use crate::network::{NetworkManager, DefaultNetworkManager};
 
@@ -45,6 +46,7 @@ use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
     INTERNAL_POD_STATE_KEY,
+    CHECKPOINT_LOCATION_ANNOTATION_KEY,
 };
 
 enum ContainerOwner {
@@ -412,7 +414,80 @@ impl RuntimeServiceImpl {
             container_privileged,
         );
 
-        
+        // 处理镜像解析
+        let container_image_ref = config.image
+            .as_ref()
+            .map(|image| image.image.clone())
+            .filter(|image| !image.trim().is_empty())
+            .unwrap_or_default();
+
+        let readonly_rootfs = self.effective_readonly_rootfs(
+            security
+                .map(|security| security.readonly_rootfs)
+                .unwrap_or(false),
+        );
+
+        // 处理资源配置
+        let mut linux_resources = config
+            .linux
+            .as_ref()
+            .and_then(|linux| linux.resources.as_ref())
+            .map(StoredLinuxResources::from);
+        match self.effective_pids_limit(
+            linux_resources
+                .as_ref()
+                .and_then(|resources| resources.pids_limit),
+        )? {
+            Some(limit) => {
+                linux_resources
+                    .get_or_insert_with(Default::default)
+                    .pids_limit = Some(limit);
+            }
+            None => {
+                if let Some(resources) = linux_resources.as_mut() {
+                    resources.pids_limit = None;
+                }
+            }
+        }
+        if let Some(resources) = linux_resources.as_mut() {
+            self.clamp_stored_oom_score_adj(resources)?;
+        }
+        let cgroup_support = Self::cgroup_support_flags();
+        Self::validate_stored_hugetlb_limits_with_flags(
+            linux_resources.as_ref(),
+            cgroup_support,
+            self.config.tolerate_missing_hugetlb_controller,
+            "container create",
+        )?;
+        if let Some(resources) = linux_resources.as_mut() {
+            Self::sanitize_stored_runtime_resources_with_policy(
+                resources,
+                cgroup_support,
+                self.config.tolerate_missing_hugetlb_controller,
+            );
+        }
+        let mut stored_annotations = config.annotations.clone();
+        let mut effective_pod_resource_class_annotations = pod_external_annotations.clone();
+        if let Some(sandbox_config) = sandbox_config.as_ref() {
+            for (key, value) in &sandbox_config.annotations {
+                effective_pod_resource_class_annotations.insert(key.clone(), value.clone());
+            }
+        }
+        let resource_class_request =
+            crate::security::resource_classes::requested_classes_from_annotations(
+                &container_metadata.name,
+                &config.annotations,
+                &effective_pod_resource_class_annotations,
+            );
+        if let Some(blockio_class) = resource_class_request.blockio_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.blockio_class = Some(blockio_class.clone());
+        }
+        if let Some(rdt_class) = resource_class_request.rdt_class.as_ref() {
+            let resources = linux_resources.get_or_insert_with(Default::default);
+            resources.rdt_class = crate::security::resource_classes::resolve_rdt_class(rdt_class)
+                .and_then(|rdt| rdt.clos_id);
+        }
 
         unimplemented!()
     }
@@ -691,4 +766,5 @@ impl RuntimeServiceImpl {
             runtime_handler,
         })
     }
+
 }

@@ -189,6 +189,42 @@ pub(super) struct StoredLinuxResources {
     pub(super) rdt_class: Option<String>,
 }
 
+impl From<&crate::proto::runtime::v1::LinuxContainerResources> for StoredLinuxResources {
+    fn from(value: &crate::proto::runtime::v1::LinuxContainerResources) -> Self {
+        Self {
+            cpu_period: value.cpu_period,
+            cpu_quota: value.cpu_quota,
+            cpu_shares: value.cpu_shares,
+            memory_limit_in_bytes: value.memory_limit_in_bytes,
+            oom_score_adj: value.oom_score_adj,
+            cpuset_cpus: value.cpuset_cpus.clone(),
+            cpuset_mems: value.cpuset_mems.clone(),
+            hugepage_limits: value
+                .hugepage_limits
+                .iter()
+                .map(|limit| StoredHugepageLimit {
+                    page_size: limit.page_size.clone(),
+                    limit: limit.limit,
+                })
+                .collect(),
+            unified: value.unified.clone(),
+            memory_swap_limit_in_bytes: value.memory_swap_limit_in_bytes,
+            memory_reservation_in_bytes: None,
+            memory_kernel_limit_in_bytes: None,
+            memory_kernel_tcp_limit_in_bytes: None,
+            memory_swappiness: None,
+            memory_disable_oom_killer: None,
+            memory_use_hierarchy: None,
+            cpu_realtime_runtime: None,
+            cpu_realtime_period: None,
+            pids_limit: None,
+            devices: Vec::new(),
+            blockio_class: None,
+            rdt_class: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 
 #[serde(default)]
 pub(super) struct StoredHugepageLimit {
@@ -217,4 +253,26 @@ pub(super) struct StoredBrokenState {
 #[serde(default)]
 pub(super) struct StoredRuntimeNetworkConfig {
     pub(super) pod_cidr: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct StoredCheckpointRestore {
+    pub(super) checkpoint_location: String,
+    pub(super) checkpoint_image_path: String,
+    pub(super) oci_config: serde_json::Value,
+    pub(super) image_ref: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct CgroupResourceSupport {
+    pub(super) swap: bool,
+    pub(super) hugetlb: bool,
+    pub(super) memory_kernel: bool,
+    pub(super) memory_kernel_tcp: bool,
+    pub(super) memory_swappiness: bool,
+    pub(super) memory_disable_oom_killer: bool,
+    pub(super) memory_use_hierarchy: bool,
+    pub(super) cpu_realtime: bool,
+    pub(super) blockio: bool,
+    pub(super) rdt: bool,
 }

@@ -37,7 +37,9 @@ use crate::runtime::shim_manager::ShimConfig;
 use crate::runtime::RuncRuntime;
 use crate::runtime::runc_backend::RuncBackend;
 use crate::network::CniConfig;
-use crate::server::state_model::StoredRuntimeNetworkConfig;
+use crate::server::state_model::{
+    StoredRuntimeNetworkConfig, StoredLinuxResources,
+};
 use crate::defaults::{
     CRIO_RUNTIME_HANDLER_ANNOTATION,
     CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
@@ -838,6 +840,40 @@ impl RuntimeServiceImpl {
                 pod_cidr: stored.pod_cidr,
             }))
         }
+    }
+
+    pub(super) fn effective_readonly_rootfs(&self, requested: bool) -> bool {
+        self.config.read_only || requested
+    }
+
+    pub(super) fn effective_pids_limit(
+        &self,
+        requested: Option<i64>,
+    ) -> Result<Option<i64>, Status> {
+        match requested {
+            Some(limit) if limit > 0 => Ok(Some(limit)),
+            Some(0) | None => Ok((self.config.pids_limit > 0).then_some(self.config.pids_limit)),
+            Some(-1) => Ok(None),
+            Some(limit) => Err(Status::invalid_argument(format!(
+                "pids_limit must be -1, 0, or greater than zero, got {}",
+                limit
+            ))),
+        }
+    }
+
+    pub(super) fn clamp_stored_oom_score_adj(
+        &self,
+        resources: &mut StoredLinuxResources,
+    ) -> Result<(), Status> {
+        if !self.config.restrict_oom_score_adj || resources.oom_score_adj == 0 {
+            return Ok(());
+        }
+        resources.oom_score_adj =
+            crate::runtime::RuncRuntime::restrict_oom_score_adj_floor(resources.oom_score_adj)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
+                })?;
+        Ok(())
     }
 }
 

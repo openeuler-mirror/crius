@@ -36,7 +36,10 @@ use crate::server::service::{RuntimeServiceConfig, RuntimeServiceImpl};
 use crate::runtime::backend::RuntimeBackend;
 use crate::runtime::shim_manager::ShimConfig;
 use crate::runtime::SeccompProfile;
-use crate::server::state_model::StoredSecurityProfile;
+use crate::server::state_model::{
+    StoredSecurityProfile, CgroupResourceSupport,
+    StoredLinuxResources,
+};
 
 impl RuntimeServiceConfig {
     pub fn new(config: Config, config_path: PathBuf) -> Self {
@@ -202,6 +205,83 @@ impl RuntimeServiceConfig {
 
 
 impl RuntimeServiceImpl {
+    fn cgroup_support_flags() -> CgroupResourceSupport {
+        Self::cgroup_support_flags_for_root(Path::new("/sys/fs/cgroup"))
+    }
+
+    fn cgroup_support_flags_for_root(root: &Path) -> CgroupResourceSupport {
+        let is_v2 = root.join("cgroup.controllers").exists();
+
+        let swap = if is_v2 {
+            root.join("memory.swap.max").exists()
+        } else {
+            root.join("memory")
+                .join("memory.memsw.limit_in_bytes")
+                .exists()
+        };
+
+        let hugetlb = if is_v2 {
+            std::fs::read_dir(root)
+                .ok()
+                .into_iter()
+                .flat_map(|entries| entries.filter_map(Result::ok))
+                .map(|entry| entry.file_name())
+                .filter_map(|name| name.into_string().ok())
+                .any(|name| name.starts_with("hugetlb.") && name.ends_with(".max"))
+        } else {
+            root.join("hugetlb").exists()
+        };
+
+        let memory_kernel = if is_v2 {
+            false
+        } else {
+            root.join("memory")
+                .join("memory.kmem.limit_in_bytes")
+                .exists()
+        };
+        let memory_kernel_tcp = if is_v2 {
+            false
+        } else {
+            root.join("memory")
+                .join("memory.kmem.tcp.limit_in_bytes")
+                .exists()
+        };
+        let memory_swappiness = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.swappiness").exists()
+        };
+        let memory_disable_oom_killer = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.oom_control").exists()
+        };
+        let memory_use_hierarchy = if is_v2 {
+            false
+        } else {
+            root.join("memory").join("memory.use_hierarchy").exists()
+        };
+        let cpu_realtime = if is_v2 {
+            false
+        } else {
+            root.join("cpu").join("cpu.rt_runtime_us").exists()
+                && root.join("cpu").join("cpu.rt_period_us").exists()
+        };
+
+        CgroupResourceSupport {
+            swap,
+            hugetlb,
+            memory_kernel,
+            memory_kernel_tcp,
+            memory_swappiness,
+            memory_disable_oom_killer,
+            memory_use_hierarchy,
+            cpu_realtime,
+            blockio: true,
+            rdt: true,
+        }
+    }
+
     async fn runtime_for_container_request(
         &self,
         container_id: &str,
@@ -356,5 +436,74 @@ impl RuntimeServiceImpl {
         security
             .map(|ctx| ctx.seccomp_profile_path.as_str())
             .unwrap_or("")
+    }
+
+    fn validate_hugetlb_limits_with_flags(
+        hugepage_limits_present: bool,
+        support: CgroupResourceSupport,
+        tolerate_missing_hugetlb_controller: bool,
+        operation: &str,
+    ) -> Result<(), Status> {
+        if hugepage_limits_present && !support.hugetlb && !tolerate_missing_hugetlb_controller {
+            return Err(Status::failed_precondition(format!(
+                "hugetlb controller is missing; {} includes hugepage limits. Set runtime.tolerate_missing_hugetlb_controller = true to ignore this error",
+                operation
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_stored_hugetlb_limits_with_flags(
+        resources: Option<&StoredLinuxResources>,
+        support: CgroupResourceSupport,
+        tolerate_missing_hugetlb_controller: bool,
+        operation: &str,
+    ) -> Result<(), Status> {
+        Self::validate_hugetlb_limits_with_flags(
+            resources
+                .map(|resources| !resources.hugepage_limits.is_empty())
+                .unwrap_or(false),
+            support,
+            tolerate_missing_hugetlb_controller,
+            operation,
+        )
+    }
+
+    fn sanitize_stored_runtime_resources_with_policy(
+        resources: &mut StoredLinuxResources,
+        support: CgroupResourceSupport,
+        tolerate_missing_hugetlb_controller: bool,
+    ) {
+        if !support.swap {
+            resources.memory_swap_limit_in_bytes = 0;
+        }
+        if !support.memory_kernel {
+            resources.memory_kernel_limit_in_bytes = None;
+        }
+        if !support.memory_kernel_tcp {
+            resources.memory_kernel_tcp_limit_in_bytes = None;
+        }
+        if !support.memory_swappiness {
+            resources.memory_swappiness = None;
+        }
+        if !support.memory_disable_oom_killer {
+            resources.memory_disable_oom_killer = None;
+        }
+        if !support.memory_use_hierarchy {
+            resources.memory_use_hierarchy = None;
+        }
+        if !support.cpu_realtime {
+            resources.cpu_realtime_runtime = None;
+            resources.cpu_realtime_period = None;
+        }
+        if !support.hugetlb && tolerate_missing_hugetlb_controller {
+            resources.hugepage_limits.clear();
+        }
+        if !support.blockio {
+            resources.blockio_class = None;
+        }
+        if !support.rdt {
+            resources.rdt_class = None;
+        }
     }
 }
