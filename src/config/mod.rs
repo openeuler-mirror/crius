@@ -17,11 +17,11 @@ limitations under the License.
 
 pub mod validation;
 
-use std::{fs, path::Path};
+use std::{fs, path::{Path, PathBuf},};
 use std::str::FromStr;
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 
 use crate::error::Result;
 use crate::defaults::*;
@@ -31,6 +31,8 @@ use crate::config::validation::{
     resolve_monitor_cgroup,
     detect_system_cgroup_driver,
 };
+use crate::network::CniConfig;
+use crate::network::types::MainIpPreference;
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -49,7 +51,7 @@ pub struct Config {
     pub image: ImageConfig,
 
     // 网络配置。
-    // pub network: NetworkConfig,
+    pub network: NetworkConfig,
 
     // 日志配置。
     pub logging: LoggingConfig,
@@ -875,6 +877,189 @@ impl Default for ResolvedRuntimeHandlerConfig {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDomainConfig {
+    /// CNI 配置目录。
+    #[serde(
+        default,
+        alias = "config_dir",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub config_dirs: Vec<String>,
+    /// CNI 插件目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub plugin_dirs: Vec<String>,
+    /// CNI 缓存目录。
+    pub cache_dir: String,
+    /// CNI 配置模板文件路径。
+    pub conf_template: String,
+    /// 最大允许加载的 CNI 配置文件数量；0 表示不限制。
+    #[serde(alias = "cni_max_conf_num")]
+    pub max_conf_num: usize,
+    /// Pod 主 IP 选择策略。
+    pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时。
+    pub teardown_timeout: std::time::Duration,
+    /// 显式指定默认使用的 CNI 网络名。
+    #[serde(alias = "cni_default_network")]
+    pub default_network_name: Option<String>,
+    /// 是否全局禁用 hostPort 映射。
+    pub disable_hostport_mapping: bool,
+    /// 是否将 netns 挂载统一放到 runtime state dir 下。
+    #[serde(alias = "netns_mounts_under_state_dir")]
+    pub netns_mounts_under_state_dir: bool,
+}
+
+impl Default for NetworkDomainConfig {
+    fn default() -> Self {
+        Self::cri_default()
+    }
+}
+
+impl NetworkDomainConfig {
+    fn local_default() -> Self {
+        Self {
+            config_dirs: vec!["/etc/crius/cni/net.d".to_string()],
+            ..Self::common_default()
+        }
+    }
+
+    fn cri_default() -> Self {
+        Self {
+            config_dirs: vec![
+                "/etc/cni/net.d".to_string(),
+                "/etc/kubernetes/cni/net.d".to_string(),
+            ],
+            ..Self::common_default()
+        }
+    }
+
+    fn common_default() -> Self {
+        Self {
+            config_dirs: Vec::new(),
+            plugin_dirs: vec![
+                "/opt/cni/bin".to_string(),
+                "/usr/lib/cni".to_string(),
+                "/usr/libexec/cni".to_string(),
+            ],
+            cache_dir: "/var/lib/cni/cache".to_string(),
+            conf_template: String::new(),
+            max_conf_num: 0,
+            ip_pref: MainIpPreference::Cni,
+            teardown_timeout: std::time::Duration::from_secs(60),
+            default_network_name: None,
+            disable_hostport_mapping: false,
+            netns_mounts_under_state_dir:false,
+        }
+    }
+
+    pub fn cni_config(&self) -> CniConfig {
+        let mut cni = CniConfig::new(
+            self.config_dirs.iter().map(PathBuf::from).collect(),
+            self.plugin_dirs.iter().map(PathBuf::from).collect(),
+            PathBuf::from(&self.cache_dir),
+            self.max_conf_num,
+            self.ip_pref,
+            self.default_network_name.clone(),
+            self.disable_hostport_mapping,
+        );
+        cni.set_teardown_timeout(self.teardown_timeout);
+        if !self.conf_template.trim().is_empty() {
+            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        }
+        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
+        cni
+    }
+}
+
+/// 网络配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    /// 网络插件类型。
+    pub plugin: String,
+    /// CNI 配置目录，兼容旧单目录配置。
+    #[serde(
+        default,
+        alias = "config_dir",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub config_dirs: Vec<String>,
+    /// CNI 插件目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub plugin_dirs: Vec<String>,
+    /// CNI 缓存目录。
+    pub cache_dir: String,
+    /// CNI 配置模板文件路径；开启后 UpdateRuntimeConfig 可基于 PodCIDR 渲染配置文件。
+    pub conf_template: String,
+    /// 最大允许加载的 CNI 配置文件数量；0 表示不限制。
+    #[serde(alias = "cni_max_conf_num")]
+    pub max_conf_num: usize,
+    /// Pod 主 IP 选择策略。
+    pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时；默认 1 分钟，对齐 CRI-O 的 networkStop 语义。
+    pub teardown_timeout: std::time::Duration,
+    /// 显式指定默认使用的 CNI 网络名；为空时按文件名字典序选择第一个。
+    #[serde(alias = "cni_default_network")]
+    pub default_network_name: Option<String>,
+    /// 是否全局禁用 hostPort 映射。
+    pub disable_hostport_mapping: bool,
+    /// 是否将 netns 挂载统一放到 runtime state dir 下。
+    #[serde(alias = "netns_mounts_under_state_dir")]
+    pub netns_mounts_under_state_dir: bool,
+    /// `crs` 本地 Pod 使用的网络域。
+    pub local: NetworkDomainConfig,
+    /// kubelet / CRI 调用使用的网络域。
+    pub cri: NetworkDomainConfig,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        let local = NetworkDomainConfig::local_default();
+        let cri = NetworkDomainConfig::cri_default();
+        Self {
+            plugin: "cni".to_string(),
+            config_dirs: cri.config_dirs.clone(),
+            plugin_dirs: cri.plugin_dirs.clone(),
+            cache_dir: cri.cache_dir.clone(),
+            conf_template: cri.conf_template.clone(),
+            max_conf_num: cri.max_conf_num,
+            ip_pref: cri.ip_pref,
+            teardown_timeout: cri.teardown_timeout,
+            default_network_name: cri.default_network_name.clone(),
+            disable_hostport_mapping: cri.disable_hostport_mapping,
+            netns_mounts_under_state_dir: cri.netns_mounts_under_state_dir,
+            local,
+            cri,
+        }
+    }
+}
+
+impl NetworkConfig {
+    pub fn cni_config(&self) -> CniConfig {
+        let mut cni = CniConfig::new(
+            self.config_dirs.iter().map(PathBuf::from).collect(),
+            self.plugin_dirs.iter().map(PathBuf::from).collect(),
+            PathBuf::from(&self.cache_dir),
+            self.max_conf_num,
+            self.ip_pref,
+            self.default_network_name.clone(),
+            self.disable_hostport_mapping,
+        );
+        cni.set_teardown_timeout(self.teardown_timeout);
+        if !self.conf_template.trim().is_empty() {
+            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        }
+        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
+        cni
+    }
+
+    pub fn local_cni_config(&self) -> CniConfig {
+        self.local.cni_config()
+    }
+}
+
 fn apply_string_override(env_name: &str, target: &mut String) {
     if let Some(value) = std::env::var_os(env_name) {
         *target = value.to_string_lossy().trim().to_string();
@@ -935,4 +1120,23 @@ fn parse_bool(raw: &str) -> std::result::Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!("invalid boolean value {other}")),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringOrVec {
+    String(String),
+    Vec(Vec<String>),
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(StringOrVec::String(value)) => vec![value],
+        Some(StringOrVec::Vec(values)) => values,
+        None => Vec::new(),
+    })
 }

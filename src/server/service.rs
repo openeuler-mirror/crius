@@ -18,11 +18,12 @@ limitations under the License.
 use std::sync::Arc;
 use std::unimplemented;
 use tokio::sync::Mutex;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
 
 use tonic::{Response, Status};
+use anyhow::Context;
 
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
@@ -35,6 +36,8 @@ use crate::runtime::backend::RuntimeBackend;
 use crate::runtime::shim_manager::ShimConfig;
 use crate::runtime::RuncRuntime;
 use crate::runtime::runc_backend::RuncBackend;
+use crate::network::CniConfig;
+use crate::server::state_model::StoredRuntimeNetworkConfig;
 use crate::defaults::{
     CRIO_RUNTIME_HANDLER_ANNOTATION,
     CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
@@ -126,14 +129,14 @@ pub struct RuntimeServiceConfig {
     pub disable_cgroup: bool,
     pub tolerate_missing_hugetlb_controller: bool,
     pub separate_pull_cgroup: String,
-    // pub seccomp_profile: PathBuf,
-    // pub privileged_seccomp_profile: String,
-    // pub unset_seccomp_profile: String,
-    // pub apparmor_default_profile: String,
-    // pub disable_apparmor: bool,
-    // pub enable_selinux: bool,
-    // pub selinux_category_range: u32,
-    // pub hostnetwork_disable_selinux: bool,
+    pub seccomp_profile: PathBuf,
+    pub privileged_seccomp_profile: String,
+    pub unset_seccomp_profile: String,
+    pub apparmor_default_profile: String,
+    pub disable_apparmor: bool,
+    pub enable_selinux: bool,
+    pub selinux_category_range: u32,
+    pub hostnetwork_disable_selinux: bool,
     pub uid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
     pub gid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
     pub minimum_mappable_uid: i64,
@@ -152,8 +155,8 @@ pub struct RuntimeServiceConfig {
     pub pause_image: String,
     pub pause_command: String,
     pub drop_infra_ctr: bool,
-    // pub cni_config: CniConfig,
-    // pub local_cni_config: CniConfig,
+    pub cni_config: CniConfig,
+    pub local_cni_config: CniConfig,
     pub cgroup_driver: Option<CgroupDriver>,
     pub exec_sync_io_drain_timeout: std::time::Duration,
     pub max_container_log_line_size: usize,
@@ -165,7 +168,192 @@ pub struct RuntimeServiceConfig {
     // pub rootless: crate::rootless::EffectiveRootlessConfig,
     pub shim: ShimConfig,
     // pub streaming: crate::streaming::StreamingConfig,
-    // pub config_path: Option<PathBuf>,
+    pub config_path: Option<PathBuf>,
+}
+
+/// 运行时配置
+#[derive(Debug, Clone)]
+pub struct RuntimeConfig {
+    pub root_dir: PathBuf,
+    pub runtime: String,
+    pub runtime_handlers: Vec<String>,
+    pub runtime_configs: HashMap<String, crate::config::ResolvedRuntimeHandlerConfig>,
+    pub runtime_root: PathBuf,
+    pub log_dir: PathBuf,
+    pub runtime_path: PathBuf,
+    pub runtime_config_path: PathBuf,
+    pub image_root: PathBuf,
+    pub image_driver: String,
+    pub image_global_auth_file: PathBuf,
+    pub image_namespaced_auth_dir: PathBuf,
+    pub image_default_transport: String,
+    pub image_short_name_mode: String,
+    pub image_pull_progress_timeout: std::time::Duration,
+    pub image_max_concurrent_downloads: usize,
+    pub image_pull_retry_count: u32,
+    pub image_registry_config_dir: PathBuf,
+    pub image_decryption_keys_path: PathBuf,
+    pub image_decryption_decoder_path: String,
+    pub image_decryption_keyprovider_config: PathBuf,
+    pub image_additional_artifact_stores: Vec<PathBuf>,
+    pub image_signature_policy: PathBuf,
+    pub image_signature_policy_dir: PathBuf,
+    pub image_storage_options: Vec<String>,
+    // pub image_external_snapshotters: HashMap<String, crate::config::ExternalSnapshotterConfig>,
+    pub image_volumes: String,
+    pub image_pinned_images: Vec<String>,
+    pub image_big_files_temporary_dir: PathBuf,
+    pub image_oci_artifact_mount_support: bool,
+    pub workloads: HashMap<String, crate::config::RuntimeWorkloadConfig>,
+    pub enable_pod_events: bool,
+    pub included_pod_metrics: Vec<String>,
+    pub stats_collection_period: u64,
+    pub pod_sandbox_metrics_collection_period: u64,
+    pub grpc_max_send_msg_size: u32,
+    pub grpc_max_recv_msg_size: u32,
+    pub metrics_enable: bool,
+    pub metrics_host: String,
+    pub metrics_port: u16,
+    pub metrics_socket_path: PathBuf,
+    pub metrics_enable_tls: bool,
+    pub metrics_tls_cert_file: PathBuf,
+    pub metrics_tls_key_file: PathBuf,
+    pub metrics_tls_ca_file: PathBuf,
+    pub metrics_tls_min_version: String,
+    pub metrics_tls_cipher_suites: Vec<String>,
+    pub metrics_collectors: Vec<String>,
+    pub tracing_enable: bool,
+    pub tracing_endpoint: String,
+    pub tracing_sampling_rate_per_million: u32,
+    pub monitor_env: Vec<String>,
+    pub monitor_cgroup: String,
+    pub default_env: Vec<(String, String)>,
+    pub default_capabilities: Vec<String>,
+    pub default_sysctls: HashMap<String, String>,
+    pub default_ulimits: Vec<crate::oci::spec::Rlimit>,
+    pub allowed_devices: Vec<PathBuf>,
+    // pub additional_devices: Vec<crate::runtime::DeviceMapping>,
+    pub device_ownership_from_security_context: bool,
+    pub add_inheritable_capabilities: bool,
+    pub base_runtime_spec: Option<crate::oci::spec::Spec>,
+    pub default_mounts_file: PathBuf,
+    pub hooks_dir: Vec<PathBuf>,
+    pub absent_mount_sources_to_reject: Vec<PathBuf>,
+    pub disable_proc_mount: bool,
+    pub timezone: String,
+    pub attach_socket_dir: PathBuf,
+    pub container_exits_dir: PathBuf,
+    pub clean_shutdown_file: PathBuf,
+    pub container_stop_timeout: u32,
+    pub version_file: PathBuf,
+    pub version_file_persist: PathBuf,
+    pub criu_path: PathBuf,
+    pub criu_image_path: PathBuf,
+    pub criu_work_path: PathBuf,
+    pub enable_criu_support: bool,
+    pub internal_wipe: bool,
+    pub internal_repair: bool,
+    pub bind_mount_prefix: PathBuf,
+    pub disable_cgroup: bool,
+    pub tolerate_missing_hugetlb_controller: bool,
+    pub separate_pull_cgroup: String,
+    pub seccomp_profile: PathBuf,
+    pub privileged_seccomp_profile: String,
+    pub unset_seccomp_profile: String,
+    pub apparmor_default_profile: String,
+    pub disable_apparmor: bool,
+    pub enable_selinux: bool,
+    pub selinux_category_range: u32,
+    pub hostnetwork_disable_selinux: bool,
+    pub uid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
+    pub gid_mappings: Option<Vec<crate::proto::runtime::v1::IdMapping>>,
+    pub minimum_mappable_uid: i64,
+    pub minimum_mappable_gid: i64,
+    pub io_uid: u32,
+    pub io_gid: u32,
+    pub pids_limit: i64,
+    pub infra_ctr_cpuset: String,
+    pub shared_cpuset: String,
+    pub exec_cpu_affinity: String,
+    pub irqbalance_config_file: PathBuf,
+    pub irqbalance_config_restore_file: String,
+    pub read_only: bool,
+    pub no_pivot: bool,
+    pub no_new_keyring: bool,
+    pub pause_image: String,
+    pub pause_command: String,
+    pub drop_infra_ctr: bool,
+    pub cni_config: CniConfig,
+    pub local_cni_config: CniConfig,
+    pub cgroup_driver: Option<CgroupDriver>,
+    pub exec_sync_io_drain_timeout: std::time::Duration,
+    pub max_container_log_line_size: usize,
+    pub log_to_journald: bool,
+    pub no_sync_log: bool,
+    pub restrict_oom_score_adj: bool,
+    pub enable_unprivileged_ports: bool,
+    pub enable_unprivileged_icmp: bool,
+    pub shim: ShimConfig,
+    // pub streaming: crate::streaming::StreamingConfig,
+    pub config_path: Option<PathBuf>,
+}
+
+
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RuntimeReloadableConfig {
+    pub pause_image: String,
+    pub pinned_images: Vec<String>,
+    pub registry_config_dir: PathBuf,
+    pub global_auth_file: PathBuf,
+    pub namespaced_auth_dir: PathBuf,
+    pub signature_policy: PathBuf,
+    pub signature_policy_dir: PathBuf,
+    pub decryption_keys_path: PathBuf,
+    pub decryption_decoder_path: String,
+    pub decryption_keyprovider_config: PathBuf,
+    pub seccomp_profile: PathBuf,
+    pub apparmor_default_profile: String,
+    pub cni_config_dirs: Vec<PathBuf>,
+    pub cni_conf_template: Option<PathBuf>,
+    pub cni_max_conf_num: usize,
+    pub cni_default_network_name: Option<String>,
+}
+
+impl RuntimeReloadableConfig {
+    pub fn with_cni_config(&self, base: &crate::network::CniConfig) -> crate::network::CniConfig {
+        let mut config = base.clone();
+        config.set_config_dirs(self.cni_config_dirs.clone());
+        config.set_plugin_dirs(base.plugin_dirs().to_vec());
+        config.set_max_conf_num(self.cni_max_conf_num);
+        config.set_default_network_name(self.cni_default_network_name.clone());
+        config.set_conf_template(self.cni_conf_template.clone());
+        config
+    }
+
+    pub fn from_runtime_config(config: &RuntimeServiceConfig) -> Self {
+        Self {
+            pause_image: config.pause_image.clone(),
+            pinned_images: config.image_pinned_images.clone(),
+            registry_config_dir: config.image_registry_config_dir.clone(),
+            global_auth_file: config.image_global_auth_file.clone(),
+            namespaced_auth_dir: config.image_namespaced_auth_dir.clone(),
+            signature_policy: config.image_signature_policy.clone(),
+            signature_policy_dir: config.image_signature_policy_dir.clone(),
+            decryption_keys_path: config.image_decryption_keys_path.clone(),
+            decryption_decoder_path: config.image_decryption_decoder_path.clone(),
+            decryption_keyprovider_config: config.image_decryption_keyprovider_config.clone(),
+            seccomp_profile: config.seccomp_profile.clone(),
+            apparmor_default_profile: config.apparmor_default_profile.clone(),
+            cni_config_dirs: config.cni_config.config_dirs().to_vec(),
+            cni_conf_template: config.cni_config.conf_template().map(Path::to_path_buf),
+            cni_max_conf_num: config.cni_config.max_conf_num(),
+            cni_default_network_name: config
+                .cni_config
+                .default_network_name()
+                .map(ToOwned::to_owned),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -195,6 +383,33 @@ impl NameRegistry {
     }
 }
 
+#[derive(Debug, Clone, Default, serde::Serialize)]
+pub struct RuntimeReloadState {
+    pub last_reload_at_unix_millis: Option<i64>,
+    pub last_reload_source: Option<String>,
+    pub last_reload_fields: Vec<String>,
+    pub last_reload_error: Option<String>,
+    pub watcher_active: bool,
+    pub watcher_status: RuntimeReloadWatcherStatus,
+    pub watcher_backoff_count: u32,
+    pub watcher_next_retry_unix_millis: Option<i64>,
+    pub watcher_last_error: Option<String>,
+    pub config_file_watch: bool,
+    pub cni_watch_dirs: Vec<String>,
+    pub last_cni_watch_at_unix_millis: Option<i64>,
+    pub last_cni_watch_error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeReloadWatcherStatus {
+    #[default]
+    Stopped,
+    Running,
+    Backoff,
+    Error,
+}
+
 #[derive(Clone)]
 pub struct RuntimeServiceImpl {
     pub(super) containers: Arc<Mutex<HashMap<String, Container>>>,
@@ -212,6 +427,9 @@ pub struct RuntimeServiceImpl {
     pub(super) container_exits_dir: PathBuf,
     pub(super) clean_shutdown_file: PathBuf,
     pub(super) last_startup_clean_shutdown: StdArc<StdMutex<Option<bool>>>,
+    pub(super) runtime_network_config: Arc<Mutex<Option<crate::proto::runtime::v1::NetworkConfig>>>,
+    pub(super) reloadable_config: StdArc<StdMutex<RuntimeReloadableConfig>>,
+    pub(super) reload_state: StdArc<StdMutex<RuntimeReloadState>>,
 }
 
 impl RuntimeServiceImpl {
@@ -337,6 +555,28 @@ impl RuntimeServiceImpl {
             crate::service::event::EventService::from_sender(events.clone())
                .with_ledger(persistence.clone()),
         );
+        let runtime_network_config = Self::load_runtime_network_config(&config.root_dir)
+            .unwrap_or_else(|e| {
+                log::warn!(
+                    "Failed to load runtime network config from {}: {}",
+                    config.root_dir.display(),
+                    e
+                );
+                None
+            });
+        let reloadable_config = StdArc::new(StdMutex::new(
+            RuntimeReloadableConfig::from_runtime_config(&config),
+        ));
+        let reload_state = StdArc::new(StdMutex::new(RuntimeReloadState {
+            config_file_watch: config.config_path.is_some(),
+            cni_watch_dirs: config
+                .cni_config
+                .config_dirs()
+                .iter()
+                .map(|dir| dir.display().to_string())
+                .collect(),
+            ..Default::default()
+        }));
         let service = Self { 
             containers, 
             pod_sandboxes, 
@@ -353,6 +593,9 @@ impl RuntimeServiceImpl {
             container_exits_dir: PathBuf::new(), 
             clean_shutdown_file: PathBuf::new(), 
             last_startup_clean_shutdown: Arc::new(StdMutex::new(None)), 
+            runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
+            reloadable_config,
+            reload_state,
         };
         service
     }
@@ -539,6 +782,62 @@ impl RuntimeServiceImpl {
         }
 
         Ok(())
+    }
+
+    pub(super) fn pod_network_domain_cni_config(&self, local: bool) -> crate::network::CniConfig {
+        let mut config = if local {
+            self.config.local_cni_config.clone()
+        } else {
+            self.current_cni_config()
+        };
+        config.set_event_sink(Some(crate::service::event::LedgerInternalEventSink::new(
+            self.config.root_dir.join("crius.db"),
+        )));
+        config
+    }
+
+    pub fn current_reloadable_config(&self) -> RuntimeReloadableConfig {
+        self.reloadable_config
+            .lock()
+            .expect("reloadable config lock poisoned")
+            .clone()
+    }
+
+    pub(super) fn current_cni_config(&self) -> crate::network::CniConfig {
+        let mut config = self
+            .current_reloadable_config()
+            .with_cni_config(&self.config.cni_config);
+        config.set_event_sink(Some(crate::service::event::LedgerInternalEventSink::new(
+            self.config.root_dir.join("crius.db"),
+        )));
+        config
+    }
+
+    fn runtime_network_config_path(root_dir: &Path) -> PathBuf {
+        root_dir.join("runtime_network_config.json")
+    }
+
+    fn load_runtime_network_config(
+        root_dir: &Path,
+    ) -> anyhow::Result<Option<crate::proto::runtime::v1::NetworkConfig>> {
+        let path = Self::runtime_network_config_path(root_dir);
+        if !path.exists() {
+            return Ok(None);
+        }
+
+        let raw = std::fs::read(&path)
+            .with_context(|| format!("Failed to read runtime network config {}", path.display()))?;
+        let stored: StoredRuntimeNetworkConfig =
+            serde_json::from_slice(&raw).with_context(|| {
+                format!("Failed to parse runtime network config {}", path.display())
+            })?;
+        if stored.pod_cidr.trim().is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(crate::proto::runtime::v1::NetworkConfig {
+                pod_cidr: stored.pod_cidr,
+            }))
+        }
     }
 }
 

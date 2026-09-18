@@ -142,7 +142,7 @@ async fn main() -> Result<(), Error> {
 
     info!("Loaded configuration from {}", args.config.display());
     
-    let runtime_config = RuntimeServiceConfig::new(config.clone());
+    let runtime_config = RuntimeServiceConfig::new(config.clone(), args.config);
     let listen = config.api.listen.clone();
     // 创建服务实例
     let runtime_service =

@@ -39,6 +39,8 @@ use crate::service::event::InternalEventSeverity;
 use crate::server::state_model::{
     StoredPodState, StoredNamespaceOptions
 };
+use crate::network::{NetworkManager, DefaultNetworkManager};
+
 use crate::defaults::{
     CRS_RUN_ANNOTATION, CRS_RUN_ANNOTATION_VALUE,
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
@@ -57,6 +59,23 @@ impl ContainerOwner {
             Self::Pod { pod_sandbox_id } => pod_sandbox_id,
         }
     }
+
+    fn runtime_handler_override(&self) -> Option<&str> {
+        match self {
+            Self::Local { runtime_handler } => runtime_handler.as_deref(),
+            Self::Pod { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct LocalContainerNetwork {
+    netns_name: String,
+    netns_path: PathBuf,
+    pod_name: String,
+    pod_namespace: String,
+    pod_uid: String,
+    runtime_handler: String,
 }
 
 struct ContainerCreateInput {
@@ -343,6 +362,57 @@ impl RuntimeServiceImpl {
         } else {
             None
         };
+        let runtime_handler = owner
+            .runtime_handler_override()
+            .or_else(|| {
+                pod_state
+                    .as_ref()
+                    .map(|state| state.runtime_handler.as_str())
+                    .filter(|handler| !handler.is_empty())
+            })
+            .unwrap_or(self.config.runtime.as_str());
+        let host_network = matches!(
+            namespace_options.as_ref().map(|options| options.network),
+            Some(mode) if mode == NamespaceMode::Node as i32
+        );
+        let local_network = if matches!(owner, ContainerOwner::Local { .. }) && !host_network {
+            Some(
+                self.setup_local_container_network(
+                    &container_id,
+                    &container_metadata,
+                    runtime_handler,
+                )
+                .await?,
+            )
+        } else {
+            None
+        };
+
+        let container_privileged = security
+            .map(|security| security.privileged)
+            .unwrap_or(false);
+        let apparmor_profile = self.effective_apparmor_profile_from_proto(
+            security.and_then(|security| security.apparmor.as_ref()),
+            Self::legacy_linux_container_apparmor_profile(security),
+            container_privileged,
+        )?;
+        let selinux_label = self.effective_selinux_label_from_proto(
+            security.and_then(|ctx| ctx.selinux_options.as_ref()),
+            host_network,
+            Some(&pod_sandbox_id),
+        );
+        let seccomp_profile = self.effective_seccomp_profile_from_proto(
+            security.and_then(|ctx| ctx.seccomp.as_ref()),
+            Self::legacy_linux_container_seccomp_profile_path(security),
+            container_privileged,
+        );
+        let stored_seccomp_profile = self.effective_stored_seccomp_profile_from_proto(
+            security.and_then(|ctx| ctx.seccomp.as_ref()),
+            Self::legacy_linux_container_seccomp_profile_path(security),
+            container_privileged,
+        );
+
+        
 
         unimplemented!()
     }
@@ -540,5 +610,85 @@ impl RuntimeServiceImpl {
         Ok(Some(path.to_path_buf()))
     }
 
+    pub(super) fn cni_config_has_config_file(config: &crate::network::CniConfig) -> bool {
+        config.config_dirs().iter().any(|dir| {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                let path = entry.path();
+                path.extension()
+                    .and_then(|extension| extension.to_str())
+                    .map(|extension| matches!(extension, "conf" | "json" | "conflist"))
+                    .unwrap_or(false)
+            })
+        })
+    }
 
+    async fn setup_local_container_network(
+        &self,
+        container_id: &str,
+        container_metadata: &ContainerMetadata,
+        runtime_handler: &str,
+    ) -> Result<LocalContainerNetwork, Status> {
+        let config = self.pod_network_domain_cni_config(true);
+        if !Self::cni_config_has_config_file(&config) {
+            return Err(Status::failed_precondition(format!(
+                "local network is not configured: no CNI config file found in {}; install a local CNI conflist such as examples/cni/crius-bridge.conflist under /etc/crius/cni/net.d",
+                config
+                    .config_dirs()
+                    .iter()
+                    .map(|path| path.display().to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        let network_manager = DefaultNetworkManager::from_cni_config(config.clone());
+        let netns_name = format!("crius-local-{container_id}");
+        let netns_path = config.netns_path(&netns_name);
+        let pod_name = if container_metadata.name.trim().is_empty() {
+            container_id.to_string()
+        } else {
+            container_metadata.name.clone()
+        };
+        let pod_namespace = "local".to_string();
+        let pod_uid = container_id.to_string();
+        let runtime_handler = runtime_handler.to_string();
+        network_manager.init().await.map_err(|err| {
+            Status::internal(format!("failed to initialize local network: {err}"))
+        })?;
+        if let Err(err) = network_manager.create_network_namespace(&netns_name).await {
+            return Err(Status::internal(format!(
+                "failed to create local network namespace {netns_name}: {err}"
+            )));
+        }
+
+        let setup_result = network_manager
+            .setup_pod_network(crate::network::NetworkSetupRequest {
+                pod_id: container_id,
+                netns: &netns_path.to_string_lossy(),
+                pod_name: &pod_name,
+                pod_namespace: &pod_namespace,
+                pod_uid: &pod_uid,
+                runtime_handler: &runtime_handler,
+                pod_cidr: None,
+            })
+            .await;
+        if let Err(err) = setup_result {
+            let _ = network_manager.remove_network_namespace(&netns_name).await;
+            return Err(Status::internal(format!(
+                "failed to setup local container network for {container_id}: {err}"
+            )));
+        }
+
+        Ok(LocalContainerNetwork {
+            netns_name,
+            netns_path,
+            pod_name,
+            pod_namespace,
+            pod_uid,
+            runtime_handler,
+        })
+    }
 }

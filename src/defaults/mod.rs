@@ -159,6 +159,8 @@ pub const KUBERNETES_CONTAINER_NAME_ANNOTATION: &str = "io.kubernetes.container.
 
 pub const DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS: u32 = 240;
 
+pub const DEFAULT_CNI_TEARDOWN_TIMEOUT: Duration = Duration::from_secs(60);
+
 pub const DEFAULT_SHIM_WORK_DIR: &str = "/var/run/crius/shims";
 
 pub const SHIM_METADATA_FILE: &str = "shim.json";

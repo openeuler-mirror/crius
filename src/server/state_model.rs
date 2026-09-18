@@ -212,3 +212,9 @@ pub(super) struct StoredBrokenState {
     pub(super) details: String,
     pub(super) detected_at: i64,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredRuntimeNetworkConfig {
+    pub(super) pod_cidr: String,
+}

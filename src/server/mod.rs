@@ -25,8 +25,8 @@ pub mod annotations;
 pub mod state_model;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::vec;
+use std::path::{Path, PathBuf};
+use std::{unimplemented, vec};
 use std::sync::Arc;
 
 use tonic::Status;
@@ -35,10 +35,11 @@ use crate::config::{Config, CgroupDriverConfig};
 use crate::server::service::{RuntimeServiceConfig, RuntimeServiceImpl};
 use crate::runtime::backend::RuntimeBackend;
 use crate::runtime::shim_manager::ShimConfig;
-
+use crate::runtime::SeccompProfile;
+use crate::server::state_model::StoredSecurityProfile;
 
 impl RuntimeServiceConfig {
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config, config_path: PathBuf) -> Self {
         let runtime_name = config.runtime.runtime_type.clone();
         let runtime_config = config.runtime.resolved_runtimes().expect("runtime handler failed");
         Self {
@@ -135,6 +136,14 @@ impl RuntimeServiceConfig {
             disable_cgroup: config.runtime.disable_cgroup,
             tolerate_missing_hugetlb_controller: false,
             separate_pull_cgroup: config.runtime.separate_pull_cgroup.clone(),
+            seccomp_profile: PathBuf::new(),
+            privileged_seccomp_profile: String::new(),
+            unset_seccomp_profile: String::new(),
+            apparmor_default_profile: String::new(),
+            disable_apparmor: false,
+            enable_selinux: false,
+            selinux_category_range: 0,
+            hostnetwork_disable_selinux: false,
             uid_mappings: None,
             gid_mappings: None,
             minimum_mappable_uid: config.runtime.minimum_mappable_uid,
@@ -153,6 +162,8 @@ impl RuntimeServiceConfig {
             pause_image: config.runtime.pause_image.clone(),
             pause_command: config.runtime.pause_command.clone(),
             drop_infra_ctr: config.runtime.drop_infra_ctr,
+            cni_config: config.network.cni_config(),
+            local_cni_config: config.network.local_cni_config(),
             cgroup_driver: config.runtime.cgroup_driver.map(|driver| driver.as_proto()),
             exec_sync_io_drain_timeout: config.api.exec_sync_io_drain_timeout,
             max_container_log_line_size: config.logging.max_container_log_line_size,
@@ -184,6 +195,7 @@ impl RuntimeServiceConfig {
             max_container_log_line_size: config.logging.max_container_log_line_size,
             state_db_path: PathBuf::from(&config.root).join("crius.db"),
         },
+        config_path: Some(config_path),
         }
     }
 }
@@ -286,5 +298,63 @@ impl RuntimeServiceImpl {
             .await
     }
 
+    fn security_availability() -> crate::security::SecurityManager {
+        crate::security::SecurityManager::new()
+    }
 
+    fn effective_apparmor_profile_from_proto(
+        &self,
+        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        deprecated_profile: &str,
+        privileged: bool,
+    ) -> Result<Option<String>, Status> {
+        let security = Self::security_availability();
+        unimplemented!()
+    }
+
+    #[allow(deprecated)]
+    fn legacy_linux_container_apparmor_profile(
+        security: Option<&crate::proto::runtime::v1::LinuxContainerSecurityContext>,
+    ) -> &str {
+        security
+            .map(|security| security.apparmor_profile.as_str())
+            .unwrap_or("")
+    }
+
+    fn effective_selinux_label_from_proto(
+        &self,
+        options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
+        host_network: bool,
+        auto_level_seed: Option<&str>,
+    ) -> Option<String> {
+        let security = Self::security_availability();
+        unimplemented!()
+    }
+
+    fn effective_seccomp_profile_from_proto(
+        &self,
+        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        deprecated_profile: &str,
+        privileged: bool,
+    ) -> Option<SeccompProfile> {
+        unimplemented!()
+    }
+
+    fn effective_stored_seccomp_profile_from_proto(
+        &self,
+        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        deprecated_profile: &str,
+        privileged: bool,
+    ) -> Option<StoredSecurityProfile> {
+        unimplemented!()
+    }
+
+    #[allow(deprecated)]
+    fn legacy_linux_container_seccomp_profile_path(
+        security: Option<&crate::proto::runtime::v1::LinuxContainerSecurityContext>,
+    ) -> &str {
+        security
+            .map(|ctx| ctx.seccomp_profile_path.as_str())
+            .unwrap_or("")
+    }
 }

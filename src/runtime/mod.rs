@@ -595,3 +595,11 @@ struct OciRuntimeMountExtensions {
 struct OciRuntimeFeatureToggle {
     enabled: Option<bool>,
 }
+
+/// Seccomp 配置来源
+#[derive(Debug, Clone)]
+pub enum SeccompProfile {
+    RuntimeDefault,
+    Unconfined,
+    Localhost(PathBuf),
+}
