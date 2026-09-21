@@ -225,6 +225,30 @@ impl From<&crate::proto::runtime::v1::LinuxContainerResources> for StoredLinuxRe
     }
 }
 
+impl StoredLinuxResources {
+    pub(super) fn to_proto(&self) -> crate::proto::runtime::v1::LinuxContainerResources {
+        crate::proto::runtime::v1::LinuxContainerResources {
+            cpu_period: self.cpu_period,
+            cpu_quota: self.cpu_quota,
+            cpu_shares: self.cpu_shares,
+            memory_limit_in_bytes: self.memory_limit_in_bytes,
+            oom_score_adj: self.oom_score_adj,
+            cpuset_cpus: self.cpuset_cpus.clone(),
+            cpuset_mems: self.cpuset_mems.clone(),
+            hugepage_limits: self
+                .hugepage_limits
+                .iter()
+                .map(|limit| crate::proto::runtime::v1::HugepageLimit {
+                    page_size: limit.page_size.clone(),
+                    limit: limit.limit,
+                })
+                .collect(),
+            unified: self.unified.clone(),
+            memory_swap_limit_in_bytes: self.memory_swap_limit_in_bytes,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)] 
 #[serde(default)]
 pub(super) struct StoredHugepageLimit {
@@ -276,3 +300,57 @@ pub(super) struct CgroupResourceSupport {
     pub(super) blockio: bool,
     pub(super) rdt: bool,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredLocalContainerNetwork {
+    pub(super) netns_name: String,
+    pub(super) pod_name: String,
+    pub(super) pod_namespace: String,
+    pub(super) pod_uid: String,
+    pub(super) runtime_handler: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredMount {
+    pub(super) container_path: String,
+    pub(super) host_path: String,
+    pub(super) image: String,
+    pub(super) image_sub_path: String,
+    pub(super) readonly: bool,
+    pub(super) selinux_relabel: bool,
+    pub(super) propagation: i32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub(super) struct StoredContainerState {
+    pub(super) log_path: Option<String>,
+    pub(super) tty: bool,
+    pub(super) stdin: bool,
+    pub(super) stdin_once: bool,
+    pub(super) privileged: bool,
+    pub(super) readonly_rootfs: bool,
+    pub(super) cgroup_parent: Option<String>,
+    pub(super) network_namespace_path: Option<String>,
+    pub(super) local_network: Option<StoredLocalContainerNetwork>,
+    pub(super) linux_resources: Option<StoredLinuxResources>,
+    pub(super) mounts: Vec<StoredMount>,
+    pub(super) run_as_user: Option<String>,
+    pub(super) run_as_group: Option<u32>,
+    pub(super) supplemental_groups: Vec<u32>,
+    pub(super) no_new_privileges: Option<bool>,
+    pub(super) apparmor_profile: Option<String>,
+    pub(super) seccomp_profile: Option<StoredSecurityProfile>,
+    // pub(super) seccomp_notifier_action: Option<String>,
+    pub(super) metadata_name: Option<String>,
+    pub(super) metadata_attempt: Option<u32>,
+    pub(super) started_at: Option<i64>,
+    pub(super) finished_at: Option<i64>,
+    pub(super) exit_code: Option<i32>,
+    // pub(super) nri_stop_notified: bool,
+    // pub(super) nri_remove_notified: bool,
+    pub(super) broken: Option<StoredBrokenState>,
+}
+

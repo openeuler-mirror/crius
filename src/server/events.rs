@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 
+use crate::proto::runtime::v1::{
+    ContainerEventType, Container,
+    PodSandboxStatus, ContainerEventResponse,
+};
 use crate::server::service::RuntimeServiceImpl;
 use crate::service::event::{InternalEvent, InternalEventSeverity};
 
@@ -48,5 +52,45 @@ impl RuntimeServiceImpl {
         if let Err(err) = self.internal_services.events.publish_internal(event).await {
             log::debug!("Failed to publish {subject_kind} lifecycle event for {subject_id}: {err}");
         }
+    }
+
+    pub(super) fn publish_event(&self, event: ContainerEventResponse) {
+        self.internal_services.events.publish(event);
+    }
+
+    pub(super) async fn current_pod_status_snapshot(
+        &self,
+        pod_id: &str,
+    ) -> Option<PodSandboxStatus> {
+        let pod = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes.get(pod_id).cloned()
+        }?;
+        Some(self.build_pod_sandbox_status_snapshot(&pod))
+    }
+
+    pub(super) async fn emit_container_event(
+        &self,
+        event_type: ContainerEventType,
+        container: &Container,
+        runtime_state: Option<i32>,
+    ) {
+        if self.events.receiver_count() == 0 {
+            return;
+        }
+        let pod_status = self
+            .current_pod_status_snapshot(&container.pod_sandbox_id)
+            .await;
+        let snapshot = Self::build_container_status_snapshot(
+            container,
+            runtime_state.unwrap_or(container.state),
+        );
+        self.publish_event(ContainerEventResponse {
+            container_id: container.id.clone(),
+            container_event_type: event_type as i32,
+            created_at: Self::now_nanos(),
+            pod_sandbox_status: pod_status,
+            containers_statuses: vec![snapshot],
+        });
     }
 }

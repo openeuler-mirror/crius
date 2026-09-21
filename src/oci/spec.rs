@@ -41,6 +41,22 @@ pub struct Spec {
     pub annotations: Option<HashMap<String, String>>,
 }
 
+impl Spec {
+    /// 创建新的OCI配置
+    pub fn new(oci_version: impl Into<String>) -> Self {
+        Self {
+            oci_version: oci_version.into(),
+            process: None,
+            root: None,
+            hostname: None,
+            mounts: None,
+            hooks: None,
+            linux: None,
+            annotations: None,
+        }
+    }
+}
+
 /// 进程配置
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

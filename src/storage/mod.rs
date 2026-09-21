@@ -44,6 +44,20 @@ pub struct ShimProcessRecord {
     pub last_seen_at: i64,
 }
 
+/// 状态变更事件
+#[derive(Debug, Clone)]
+pub struct StateEvent {
+    pub id: i64,
+    pub event_type: String,
+    pub entity_type: String,
+    pub entity_id: String,
+    pub old_state: String,
+    pub new_state: String,
+    pub timestamp: i64,
+    pub details: Option<String>,
+}
+
+
 impl StorageManager {
     /// 创建新的存储管理器
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
@@ -574,6 +588,282 @@ impl StorageManager {
         ).context("Failed to save shim process")?;
         Ok(())
     }
+
+    /// 保存容器记录
+    pub fn save_container(&mut self, record: &ContainerRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO containers 
+             (id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            rusqlite::params![
+                &record.id,
+                &record.pod_id,
+                &record.state,
+                &record.image,
+                &record.command,
+                record.created_at,
+                &record.labels,
+                &record.annotations,
+                record.exit_code,
+                record.exit_time,
+                record.runtime_handler.as_deref(),
+                record.runtime_backend.as_deref(),
+                record.snapshot_key.as_deref(),
+            ],
+        ).context("Failed to save container")?;
+
+        // 记录状态变更事件
+        self.record_state_event("container", &record.id, None, Some(&record.state))?;
+
+        debug!("Container {} saved to database", record.id);
+        Ok(())
+    }
+
+    /// 获取容器记录
+    pub fn get_container(&self, container_id: &str) -> Result<Option<ContainerRecord>> {
+        let record = self.conn.query_row(
+            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
+             FROM containers WHERE id = ?1",
+            [container_id],
+            |row| {
+                Ok(ContainerRecord {
+                    id: row.get(0)?,
+                    pod_id: row.get(1)?,
+                    state: row.get(2)?,
+                    image: row.get(3)?,
+                    command: row.get(4)?,
+                    created_at: row.get(5)?,
+                    labels: row.get(6)?,
+                    annotations: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    exit_time: row.get(9)?,
+                    runtime_handler: row.get(10)?,
+                    runtime_backend: row.get(11)?,
+                    snapshot_key: row.get(12)?,
+                })
+            },
+        ).optional().context("Failed to get container")?;
+
+        Ok(record)
+    }
+
+    /// 删除容器记录
+    pub fn delete_container(&mut self, container_id: &str) -> Result<()> {
+        self.conn
+            .execute("DELETE FROM containers WHERE id = ?1", [container_id])
+            .context("Failed to delete container")?;
+
+        debug!("Container {} deleted from database", container_id);
+        Ok(())
+    }
+
+    /// 更新容器状态
+    pub fn update_container_state(
+        &mut self,
+        container_id: &str,
+        new_state: &str,
+        exit_code: Option<i32>,
+    ) -> Result<()> {
+        // 获取旧状态
+        let old_state: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT state FROM containers WHERE id = ?1",
+                [container_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+
+        let exit_time = if exit_code.is_some() {
+            Some(chrono::Utc::now().timestamp())
+        } else {
+            None
+        };
+
+        self.conn
+            .execute(
+                "UPDATE containers SET state = ?1, exit_code = ?2, exit_time = ?3 WHERE id = ?4",
+                rusqlite::params![new_state, exit_code, exit_time, container_id,],
+            )
+            .context("Failed to update container state")?;
+
+        // 记录状态变更事件
+        if old_state.as_deref() != Some(new_state) {
+            self.record_state_event(
+                "container",
+                container_id,
+                old_state.as_deref(),
+                Some(new_state),
+            )?;
+        }
+
+        debug!("Container {} state updated to {}", container_id, new_state);
+        Ok(())
+    }
+
+    /// 记录状态变更事件
+    fn record_state_event(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+    ) -> Result<()> {
+        let event_type = Self::ledger_event_type(entity_type);
+        self.append_typed_event(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            None,
+        )
+    }
+
+    fn ledger_event_type(entity_type: &str) -> &'static str {
+        match entity_type {
+            "pod" => "pod",
+            "shim_task" => "task",
+            "shim_exec" => "shim",
+            value if value.starts_with("reconcile") => "reconcile",
+            _ => "container",
+        }
+    }
+
+    pub fn append_event(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let event_type = Self::ledger_event_type(entity_type);
+        self.append_typed_event(
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            details,
+        )
+    }
+
+    pub fn append_typed_event(
+        &mut self,
+        event_type: &str,
+        entity_type: &str,
+        entity_id: &str,
+        old_state: Option<&str>,
+        new_state: Option<&str>,
+        details: Option<&str>,
+    ) -> Result<()> {
+        let timestamp = chrono::Utc::now().timestamp();
+        self.append_typed_event_at(TypedEventInput {
+            event_type,
+            entity_type,
+            entity_id,
+            old_state,
+            new_state,
+            details,
+            timestamp,
+        })
+    }
+
+    /// 获取最近的实体状态事件
+    pub fn get_recent_events(&self, entity_type: &str, since: i64) -> Result<Vec<StateEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_type, entity_type, entity_id, old_state, new_state, timestamp, details
+             FROM events
+             WHERE entity_type = ?1 AND timestamp >= ?2
+             ORDER BY timestamp DESC",
+        )?;
+
+        let events = stmt
+            .query_map([entity_type, &since.to_string()], |row| {
+                Ok(StateEvent {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    entity_id: row.get(3)?,
+                    old_state: row.get(4)?,
+                    new_state: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    details: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to get recent events")?;
+
+        Ok(events)
+    }
+
+    pub fn get_recent_events_for_subject(
+        &self,
+        entity_type: &str,
+        entity_id: &str,
+        limit: usize,
+    ) -> Result<Vec<StateEvent>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, event_type, entity_type, entity_id, old_state, new_state, timestamp, details
+             FROM events
+             WHERE entity_type = ?1 AND entity_id = ?2
+             ORDER BY timestamp DESC, id DESC
+             LIMIT ?3",
+        )?;
+
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let events = stmt
+            .query_map(rusqlite::params![entity_type, entity_id, limit], |row| {
+                Ok(StateEvent {
+                    id: row.get(0)?,
+                    event_type: row.get(1)?,
+                    entity_type: row.get(2)?,
+                    entity_id: row.get(3)?,
+                    old_state: row.get(4)?,
+                    new_state: row.get(5)?,
+                    timestamp: row.get(6)?,
+                    details: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to get recent events for subject")?;
+
+        Ok(events)
+    }
+
+    pub fn prune_events_for_subject(
+        &mut self,
+        entity_type: &str,
+        entity_id: &str,
+        keep: usize,
+    ) -> Result<usize> {
+        let keep = i64::try_from(keep).unwrap_or(i64::MAX);
+        let deleted = self
+            .conn
+            .execute(
+                "DELETE FROM events
+                 WHERE entity_type = ?1
+                   AND entity_id = ?2
+                   AND id NOT IN (
+                     SELECT id FROM events
+                     WHERE entity_type = ?1 AND entity_id = ?2
+                     ORDER BY timestamp DESC, id DESC
+                     LIMIT ?3
+                   )",
+                rusqlite::params![entity_type, entity_id, keep],
+            )
+            .context("Failed to prune events for subject")?;
+        Ok(deleted)
+    }
+
+    /// 关闭数据库连接
+    pub fn close(self) -> Result<()> {
+        self.conn
+            .close()
+            .map_err(|e| anyhow::anyhow!("Failed to close database: {:?}", e))?;
+        Ok(())
+    }
 }
 
 /// 镜像记录
@@ -653,4 +943,22 @@ pub struct ContentTransferRecord {
     pub started_at: i64,
     pub finished_at: Option<i64>,
     pub error: Option<String>,
+}
+
+/// 容器记录
+#[derive(Debug, Clone)]
+pub struct ContainerRecord {
+    pub id: String,
+    pub pod_id: Option<String>,
+    pub state: String,
+    pub image: String,
+    pub command: String,
+    pub created_at: i64,
+    pub labels: String,      // JSON
+    pub annotations: String, // JSON
+    pub exit_code: Option<i32>,
+    pub exit_time: Option<i64>,
+    pub runtime_handler: Option<String>,
+    pub runtime_backend: Option<String>,
+    pub snapshot_key: Option<String>,
 }

@@ -19,14 +19,12 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
-use crate::proto::runtime::v1::{
-    ContainerConfig, ContainerStatus
-};
 use crate::runtime::{
     RuncRuntime, RuntimeFeatureProbe,
     CgroupDriverConfig, LinuxContainerResources,
     ContainerRuntime, PreparedRootfsMount,
-    MountSemanticsError, 
+    MountSemanticsError, ContainerStatus,
+    ContainerConfig,
 };
 use crate::runtime::backend::{
     RuntimeBackend, TaskController,

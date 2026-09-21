@@ -23,16 +23,22 @@ pub mod stats;
 pub mod events;
 pub mod annotations;
 pub mod state_model;
+pub mod responses;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::{unimplemented, vec};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tonic::Status;
 
+use crate::proto::runtime::v1::ContainerState;
 use crate::config::{Config, CgroupDriverConfig};
-use crate::server::service::{RuntimeServiceConfig, RuntimeServiceImpl};
+use crate::server::service::{
+    RuntimeServiceConfig, RuntimeServiceImpl,
+    ContainerCreateDeadline,
+};
 use crate::runtime::backend::RuntimeBackend;
 use crate::runtime::shim_manager::ShimConfig;
 use crate::runtime::SeccompProfile;
@@ -504,6 +510,150 @@ impl RuntimeServiceImpl {
         }
         if !support.rdt {
             resources.rdt_class = None;
+        }
+    }
+
+    pub(super) fn container_create_deadline_for_handler(
+        &self,
+        runtime_handler: &str,
+    ) -> ContainerCreateDeadline {
+        let timeout_secs = self
+            .runtime
+            .container_create_timeout_for_handler(runtime_handler);
+        ContainerCreateDeadline {
+            timeout_secs,
+            deadline: Instant::now() + std::time::Duration::from_secs(timeout_secs as u64),
+        }
+    }
+
+    fn sanitize_spec_runtime_resources_with_policy(
+        spec: &mut crate::oci::spec::Spec,
+        support: CgroupResourceSupport,
+        tolerate_missing_hugetlb_controller: bool,
+    ) {
+        let Some(linux) = spec.linux.as_mut() else {
+            return;
+        };
+        if !support.rdt {
+            linux.intel_rdt = None;
+        }
+        let Some(resources) = linux.resources.as_mut() else {
+            return;
+        };
+
+        if let Some(memory) = resources.memory.as_mut() {
+            if !support.swap {
+                memory.swap = None;
+            }
+            if !support.memory_kernel {
+                memory.kernel = None;
+            }
+            if !support.memory_kernel_tcp {
+                memory.kernel_tcp = None;
+            }
+            if !support.memory_swappiness {
+                memory.swappiness = None;
+            }
+            if !support.memory_disable_oom_killer {
+                memory.disable_oom_killer = None;
+            }
+            if !support.memory_use_hierarchy {
+                memory.use_hierarchy = None;
+            }
+        }
+
+        if let Some(cpu) = resources.cpu.as_mut() {
+            if !support.cpu_realtime {
+                cpu.realtime_runtime = None;
+                cpu.realtime_period = None;
+            }
+        }
+
+        if !support.hugetlb && tolerate_missing_hugetlb_controller {
+            resources.hugepage_limits = None;
+        }
+
+        if !support.blockio {
+            resources.block_io = None;
+        }
+
+        if !support.rdt {
+            resources.intel_rdt = None;
+        }
+    }
+
+    fn now_nanos() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i64
+    }
+
+    fn container_reason_message(runtime_state: i32, exit_code: i32) -> (String, String) {
+        match runtime_state {
+            x if x == ContainerState::ContainerCreated as i32 => (
+                "Created".to_string(),
+                "container has been created but not started".to_string(),
+            ),
+            x if x == ContainerState::ContainerRunning as i32 => {
+                ("Running".to_string(), "container is running".to_string())
+            }
+            x if x == ContainerState::ContainerExited as i32 => {
+                let reason = if exit_code == 0 {
+                    "Completed"
+                } else if exit_code == -1 {
+                    "Error"
+                } else if exit_code == 137 {
+                    "OOMKilled"
+                } else {
+                    "Error"
+                };
+                (
+                    reason.to_string(),
+                    if exit_code == -1 {
+                        "container exited with unknown exit code".to_string()
+                    } else {
+                        format!("container exited with code {}", exit_code)
+                    },
+                )
+            }
+            _ => (
+                "Unknown".to_string(),
+                "runtime state could not be determined".to_string(),
+            ),
+        }
+    }
+
+    fn checkpoint_bundle_path(&self, container_id: &str) -> PathBuf {
+        self.runtime
+            .bundle_path_for_container(container_id)
+            .unwrap_or_else(|_| self.config.runtime_root.join(container_id))
+    }
+
+    fn checkpoint_config_path(&self, container_id: &str) -> PathBuf {
+        self.checkpoint_bundle_path(container_id)
+            .join("config.json")
+    }
+
+    async fn runtime_container_pid_checked(&self, container_id: &str) -> Option<i32> {
+        let runtime = self
+            .runtime_for_container_request(container_id)
+            .await
+            .ok()?;
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.task_controller().container_pid(&container_id))
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
+    }
+
+    fn normalize_timestamp_nanos(ts: i64) -> i64 {
+        // Backward-compatible normalization: old records may still be seconds.
+        if ts > 0 && ts < 1_000_000_000_000 {
+            ts.saturating_mul(1_000_000_000)
+        } else {
+            ts
         }
     }
 }

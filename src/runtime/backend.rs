@@ -20,13 +20,13 @@ use std::path::{Path, PathBuf};
 use anyhow::Result;
 
 use crate::proto::runtime::v1::{
-    ContainerConfig, ContainerStatus,
     LinuxContainerResources,
 };
 use crate::config::CgroupDriverConfig;
 use crate::runtime::{
     RuntimeFeatureProbe, PreparedRootfsMount, 
-    MountSemanticsError,
+    MountSemanticsError, ContainerConfig,
+    ContainerStatus,
 };
 use crate::shim_rpc::OpenAttachStreamResponse;
 use crate::oci::spec::Spec;

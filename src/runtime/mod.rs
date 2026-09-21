@@ -32,8 +32,8 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::proto::runtime::v1::{
-    LinuxContainerResources, ContainerConfig,
-    ContainerStatus,
+    LinuxContainerResources,
+    Capability, NamespaceOption, 
 };
 use crate::image::snapshotter::RootfsHandle;
 use crate::runtime::shim_manager::ShimManager;
@@ -145,6 +145,81 @@ pub enum MountSemanticsError {
         source_path: PathBuf,
         message: String,
     },
+}
+
+impl MountSemanticsError {
+    pub(crate) fn to_status(&self) -> tonic::Status {
+        match self {
+            Self::MissingSource {
+                source_path,
+                destination,
+            } => tonic::Status::failed_precondition(
+                format!(
+                    "mount {} source {} does not exist",
+                    destination.display(),
+                    source_path.display()
+                ),
+            ),
+            Self::SelinuxRelabelRequiresMountLabel { destination } => {
+                tonic::Status::failed_precondition(format!(
+                    "mount {} requests SELinux relabel but SELinux mount labeling is unavailable",
+                    destination.display()
+                ))
+            }
+            Self::RecursiveReadOnlyUnsupported { destination } => {
+                tonic::Status::failed_precondition(format!(
+                    "mount {} requests recursive_read_only but the selected runtime does not support it",
+                    destination.display()
+                ))
+            }
+            Self::IdmapMountUnsupported { destination } => tonic::Status::failed_precondition(
+                format!(
+                    "mount {} requests uidMappings/gidMappings but the selected runtime does not support idmapped mounts",
+                    destination.display()
+                ),
+            ),
+            Self::RecursiveReadOnlyRequiresDirectory {
+                source_path,
+                destination,
+            } => {
+                tonic::Status::invalid_argument(format!(
+                    "mount {} source {} must be a directory when recursive_read_only=true",
+                    destination.display(),
+                    source_path.display()
+                ))
+            }
+            Self::BidirectionalPropagationRequiresShared {
+                source_path,
+                destination,
+            } => {
+                tonic::Status::failed_precondition(format!(
+                    "mount {} source {} must be a shared mount for bidirectional propagation",
+                    destination.display(),
+                    source_path.display()
+                ))
+            }
+            Self::HostToContainerPropagationRequiresSharedOrSlave {
+                source_path,
+                destination,
+            } => {
+                tonic::Status::failed_precondition(format!(
+                    "mount {} source {} must be a shared or slave mount for host-to-container propagation",
+                    destination.display(),
+                    source_path.display()
+                ))
+            }
+            Self::MountPropagationInspectionFailed {
+                source_path,
+                message,
+            } => {
+                tonic::Status::failed_precondition(format!(
+                    "failed to inspect mount propagation for {}: {}",
+                    source_path.display(),
+                    message
+                ))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -636,4 +711,63 @@ pub struct MountConfig {
     pub gid_mappings: Vec<crate::oci::spec::IdMapping>,
     pub requested_image: Option<String>,
     pub image_sub_path: Option<String>,
+}
+
+/// 容器配置
+#[derive(Debug, Clone)]
+pub struct ContainerConfig {
+    pub name: String,
+    pub image: String,
+    pub command: Vec<String>,
+    pub args: Vec<String>,
+    pub env: Vec<(String, String)>,
+    pub working_dir: Option<PathBuf>,
+    pub mounts: Vec<MountConfig>,
+    pub labels: Vec<(String, String)>,
+    pub annotations: Vec<(String, String)>,
+    pub cdi_devices: Vec<String>,
+    pub privileged: bool,
+    pub user: Option<String>,
+    pub run_as_group: Option<u32>,
+    pub supplemental_groups: Vec<u32>,
+    pub hostname: Option<String>,
+    pub tty: bool,
+    pub stdin: bool,
+    pub stdin_once: bool,
+    pub log_path: Option<PathBuf>,
+    pub readonly_rootfs: bool,
+    // pub seccomp_notifier: Option<SeccompNotifierConfig>,
+    pub pids_limit: Option<i64>,
+    pub no_new_privileges: Option<bool>,
+    pub apparmor_profile: Option<String>,
+    pub selinux_label: Option<String>,
+    pub seccomp_profile: Option<SeccompProfile>,
+    pub capabilities: Option<Capability>,
+    pub cgroup_parent: Option<String>,
+    pub sysctls: HashMap<String, String>,
+    pub namespace_options: Option<NamespaceOption>,
+    pub namespace_paths: NamespacePaths,
+    pub linux_resources: Option<LinuxContainerResources>,
+    pub devices: Vec<DeviceMapping>,
+    pub masked_paths: Vec<String>,
+    pub readonly_paths: Vec<String>,
+    pub rootfs: PathBuf,
+}
+
+/// 命名空间路径覆盖
+#[derive(Debug, Clone, Default)]
+pub struct NamespacePaths {
+    pub network: Option<PathBuf>,
+    pub pid: Option<PathBuf>,
+    pub ipc: Option<PathBuf>,
+    pub uts: Option<PathBuf>,
+}
+
+/// 容器状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum ContainerStatus {
+    Created,
+    Running,
+    Stopped(i32), // 退出码
+    Unknown,
 }

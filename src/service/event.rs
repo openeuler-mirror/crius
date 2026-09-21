@@ -54,6 +54,11 @@ impl EventService {
         unimplemented!()
     }
 
+    pub fn publish(&self, event: ContainerEventResponse) {
+        if let Err(err) = self.sender.send(event) {
+            log::debug!("Dropping CRI event without subscribers: {}", err);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

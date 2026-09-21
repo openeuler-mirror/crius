@@ -18,7 +18,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::path::Path;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use tonic::Status;
 
 use crate::server::service::RuntimeServiceImpl;
 use crate::server::state_model::StoredPodState;
@@ -242,5 +243,20 @@ impl RuntimeServiceImpl {
         }
     }
 
-    
+    pub(super) fn insert_internal_state<T: Serialize>(
+        annotations: &mut HashMap<String, String>,
+        key: &str,
+        state: &T,
+    ) -> Result<(), Status> {
+        let encoded = serde_json::to_string(state)
+            .map_err(|e| Status::internal(format!("Failed to encode internal state: {}", e)))?;
+        annotations.insert(key.to_string(), encoded);
+        Ok(())
+    }
+
+    pub(super) fn external_container_annotations(
+        annotations: &HashMap<String, String>,
+    ) -> HashMap<String, String> {
+        Self::external_annotations_for_scope(annotations, AnnotationScope::Container)
+    }
 }

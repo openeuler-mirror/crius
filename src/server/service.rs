@@ -21,6 +21,7 @@ use tokio::sync::Mutex;
 use std::path::{Path, PathBuf};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc as StdArc, Mutex as StdMutex};
+use std::time::Instant;
 
 use tonic::{Response, Status};
 use anyhow::Context;
@@ -35,6 +36,8 @@ use crate::server::state_model::StoredNamespaceOptions;
 use crate::runtime::backend::RuntimeBackend;
 use crate::runtime::shim_manager::ShimConfig;
 use crate::runtime::RuncRuntime;
+use crate::runtime::ContainerRuntime;
+use crate::runtime::ContainerStatus;
 use crate::runtime::runc_backend::RuncBackend;
 use crate::network::CniConfig;
 use crate::server::state_model::{
@@ -423,6 +426,8 @@ pub struct RuntimeServiceImpl {
     pub(super) config: RuntimeServiceConfig,
     pub(super) runtime: RuntimeRegistry,
     pub(super) image_service: ImageServiceImpl,
+    pub(super) persistence: Arc<Mutex<PersistenceManager>>,
+    pub(super) events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
     pub(super) internal_services: crate::service::InternalServices,
     pub(super) shim_work_dir: PathBuf,
     pub(super) attach_socket_dir: PathBuf,
@@ -589,6 +594,8 @@ impl RuntimeServiceImpl {
             config, 
             runtime,
             image_service: image_service, 
+            persistence,
+            events,
             internal_services,
             shim_work_dir: PathBuf::new(), 
             attach_socket_dir: PathBuf::new(), 
@@ -874,6 +881,42 @@ impl RuntimeServiceImpl {
                     Status::internal(format!("Failed to enforce oom_score_adj policy: {}", e))
                 })?;
         Ok(())
+    }
+
+    pub(super) async fn run_container_create_phase_until<T, F>(
+        &self,
+        deadline: ContainerCreateDeadline,
+        phase: &str,
+        future: F,
+    ) -> Result<T, Status>
+    where
+        F: std::future::Future<Output = Result<T, Status>>,
+    {
+        let remaining = deadline
+            .deadline
+            .checked_duration_since(Instant::now())
+            .unwrap_or_default();
+        if remaining.is_zero() {
+            return Err(Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            )));
+        }
+        let output = tokio::time::timeout(remaining, future).await.map_err(|_| {
+            Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            ))
+        })?;
+
+        if Instant::now() >= deadline.deadline {
+            return Err(Status::deadline_exceeded(format!(
+                "container create phase {phase} exceeded runtime handler create timeout of {}s",
+                deadline.timeout_secs
+            )));
+        }
+
+        output
     }
 }
 
@@ -1183,6 +1226,10 @@ impl NameReservationGuard {
             active: true,
         }
     }
+
+    pub(super) fn disarm(&mut self) {
+        self.active = false;
+    }
 }
 
 #[derive(Clone)]
@@ -1241,6 +1288,94 @@ impl RuntimeRegistry {
         }
     }
 
+    pub(crate) fn container_create_timeout_for_handler(&self, handler: &str) -> u32 {
+        let resolved = if handler.trim().is_empty() {
+            self.default_handler.as_str()
+        } else {
+            handler.trim()
+        };
+        self.container_create_timeouts
+            .get(resolved)
+            .copied()
+            .unwrap_or(240)
+    }
+
+    fn handler_from_annotations(&self, annotations: &[(String, String)]) -> Option<String> {
+        annotations.iter().find_map(|(key, value)| {
+            matches!(
+                key.as_str(),
+                CRIO_RUNTIME_HANDLER_ANNOTATION | CONTAINERD_RUNTIME_HANDLER_ANNOTATION
+            )
+            .then(|| value.trim())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+        })
+    }
+
+    pub(super) fn prepare_rootfs(
+        &self,
+        container_id: &str,
+        config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<crate::runtime::PreparedRootfsMount> {
+        let handler = self
+            .handler_from_annotations(&config.annotations)
+            .unwrap_or_else(|| self.default_handler.clone());
+        self.remember_container_handler(container_id, &handler);
+        self.runtime_for_handler(&handler)?
+            .runtime_context()
+            .prepare_rootfs(container_id, config)
+    }
+
+    pub(super) fn build_spec(
+        &self,
+        container_id: &str,
+        config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<crate::oci::spec::Spec> {
+        let handler = self
+            .handler_from_annotations(&config.annotations)
+            .unwrap_or_else(|| self.default_handler.clone());
+        self.remember_container_handler(container_id, &handler);
+        self.runtime_for_handler(&handler)?
+            .runtime_context()
+            .build_spec(container_id, config)
+    }
+
+    pub(super) fn enforce_oom_score_adj_policy(
+        &self,
+        container_id: &str,
+        spec: &mut crate::oci::spec::Spec,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .runtime_context()
+            .enforce_oom_score_adj_policy(spec)
+    }
+
+    pub(super) fn write_bundle(
+        &self,
+        container_id: &str,
+        rootfs: &Path,
+        spec: &crate::oci::spec::Spec,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .runtime_context()
+            .write_bundle(container_id, rootfs, spec)
+    }
+
+    pub(super) fn create_task_from_prepared_bundle(
+        &self,
+        container_id: &str,
+        rootfs: crate::runtime::PreparedRootfsMount,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .runtime_context()
+            .create_task_from_prepared_bundle(container_id, rootfs)
+    }
+
+    fn forget_container_handler(&self, container_id: &str) {
+        if let Ok(mut handlers) = self.container_handlers.lock() {
+            handlers.remove(container_id);
+        }
+    }
 
     pub(super) fn runtime_for_container(
         &self,
@@ -1264,5 +1399,93 @@ impl RuntimeRegistry {
         }
 
         self.runtime_for_handler(&self.default_handler)
+    }
+
+    pub(super) fn bundle_path_for_container(&self, container_id: &str) -> anyhow::Result<PathBuf> {
+        Ok(self
+            .runtime_for_container(container_id)?
+            .runtime_context()
+            .bundle_path_for(container_id))
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct ContainerCreateDeadline {
+    pub(super) timeout_secs: u32,
+    pub(super) deadline: Instant,
+}
+
+impl ContainerRuntime for RuntimeRegistry {
+    fn create_container(
+        &self,
+        container_id: &str,
+        config: &crate::runtime::ContainerConfig,
+    ) -> anyhow::Result<String> {
+        let handler = self
+            .handler_from_annotations(&config.annotations)
+            .unwrap_or_else(|| self.default_handler.clone());
+        let runtime = self.runtime_for_handler(&handler)?;
+        let created = runtime
+            .task_controller()
+            .create_container(container_id, config)?;
+        self.remember_container_handler(container_id, &handler);
+        Ok(created)
+    }
+
+    fn start_container(&self, container_id: &str) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .start_container(container_id)
+    }
+
+    fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .stop_container(container_id, timeout)
+    }
+
+    fn remove_container(&self, container_id: &str) -> anyhow::Result<()> {
+        let result = self
+            .runtime_for_container(container_id)?
+            .task_controller()
+            .remove_container(container_id);
+        self.forget_container_handler(container_id);
+        result
+    }
+
+    fn container_status(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<ContainerStatus> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .container_status(container_id)
+    }
+
+    fn reopen_container_log(&self, container_id: &str) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .reopen_container_log(container_id)
+    }
+
+    fn exec_in_container(
+        &self,
+        container_id: &str,
+        command: &[String],
+        tty: bool,
+    ) -> anyhow::Result<i32> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .exec_in_container(container_id, command, tty)
+    }
+
+    fn update_container_resources(
+        &self,
+        container_id: &str,
+        resources: &crate::proto::runtime::v1::LinuxContainerResources,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .update_container_resources(container_id, resources)
     }
 }
