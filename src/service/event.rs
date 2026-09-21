@@ -48,6 +48,17 @@ impl EventService {
         self.ledger = Some(ledger);
         self
     }
+
+    pub async fn publish_internal(&self, event: InternalEvent) -> anyhow::Result<()> {
+        event.validate_schema()?;
+        unimplemented!()
+    }
+
+    pub fn publish(&self, event: ContainerEventResponse) {
+        if let Err(err) = self.sender.send(event) {
+            log::debug!("Dropping CRI event without subscribers: {}", err);
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

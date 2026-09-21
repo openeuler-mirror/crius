@@ -14,28 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
+use std::path::PathBuf;
 
-
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod storage;
-pub mod service;
-pub mod crs;
-pub mod proto;
-pub mod runtime;
-pub mod shim;
-pub mod shim_rpc;
-pub mod oci;
-pub mod security;
-pub mod cgroup;
-pub mod attach;
-pub mod network;
-pub mod state;
+#[derive(Debug, Clone)]
+pub struct DeviceMapping {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub permissions: String,
+}

@@ -14,15 +14,25 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{fs, path::Path};
+
+pub mod validation;
+
+use std::{fs, path::{Path, PathBuf},};
 use std::str::FromStr;
 use std::collections::HashMap;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, Deserializer};
 
 use crate::error::Result;
 use crate::defaults::*;
 use crate::error::Error;
+use crate::config::validation::{
+    resolve_platform_runtime_path,
+    resolve_monitor_cgroup,
+    detect_system_cgroup_driver,
+};
+use crate::network::CniConfig;
+use crate::network::types::MainIpPreference;
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -41,7 +51,7 @@ pub struct Config {
     pub image: ImageConfig,
 
     // 网络配置。
-    // pub network: NetworkConfig,
+    pub network: NetworkConfig,
 
     // 日志配置。
     pub logging: LoggingConfig,
@@ -224,6 +234,195 @@ pub struct RuntimeConfig {
     pub enable_unprivileged_icmp: bool,
 }
 
+impl RuntimeConfig {
+    pub fn effective_cgroup_driver(&self) -> CgroupDriverConfig {
+        self.cgroup_driver
+            .unwrap_or_else(detect_system_cgroup_driver)
+    }
+
+    pub fn normalized_handlers(&self) -> Vec<String> {
+        let mut handlers = Vec::new();
+        for handler in &self.handlers {
+            let trimmed = handler.trim();
+            if !trimmed.is_empty() && !handlers.iter().any(|existing: &String| existing == trimmed)
+            {
+                handlers.push(trimmed.to_string());
+            }
+        }
+        for handler in self.runtimes.keys() {
+            let trimmed = handler.trim();
+            if !trimmed.is_empty() && !handlers.iter().any(|existing: &String| existing == trimmed)
+            {
+                handlers.push(trimmed.to_string());
+            }
+        }
+        if !handlers.iter().any(|handler| handler == &self.runtime_type) {
+            handlers.push(self.runtime_type.clone());
+        }
+        handlers
+    }
+
+    pub fn resolved_runtimes(&self) -> Result<HashMap<String, ResolvedRuntimeHandlerConfig>> {
+        let default_handler = self.runtime_type.trim();
+        let default_runtime = ResolvedRuntimeHandlerConfig {
+            backend: "runc".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: resolve_platform_runtime_path(
+                self.runtime_path.trim(),
+                &self.platform_runtime_paths,
+            )?,
+            runtime_config_path: self.runtime_config_path.trim().to_string(),
+            runtime_root: self.root.trim().to_string(),
+            platform_runtime_paths: self.platform_runtime_paths.clone(),
+            monitor_path: self.shim_path.trim().to_string(),
+            monitor_cgroup: resolve_monitor_cgroup(
+                self.monitor_cgroup.as_str(),
+                self.effective_cgroup_driver(),
+            )?,
+            monitor_env: self.monitor_env.clone(),
+            stream_websockets: true,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
+        };
+        let mut resolved = HashMap::from([(default_handler.to_string(), default_runtime.clone())]);
+
+        for handler in self.normalized_handlers() {
+            if handler == default_handler {
+                continue;
+            }
+
+            let Some(config) = self.runtimes.get(&handler) else {
+                return Err(Error::Config(format!(
+                    "runtime handler {handler} requires [runtime.runtimes.{handler}]"
+                )));
+            };
+
+            if config.inherit_default_runtime {
+                if !config.runtime_path.trim().is_empty() || !config.runtime_root.trim().is_empty()
+                {
+                    return Err(Error::Config(format!(
+                        "runtime.runtimes.{handler} must not set runtime_path/runtime_root when inherit_default_runtime = true"
+                    )));
+                }
+                let mut inherited = default_runtime.clone();
+                if !config.runtime_config_path.trim().is_empty() {
+                    inherited.runtime_config_path = config.runtime_config_path.trim().to_string();
+                }
+                if !config.backend.trim().is_empty() {
+                    inherited.backend = config.backend.trim().to_string();
+                }
+                inherited.backend_options = config.backend_options.clone();
+                if !config.platform_runtime_paths.is_empty() {
+                    inherited.platform_runtime_paths = config.platform_runtime_paths.clone();
+                    inherited.runtime_path = resolve_platform_runtime_path(
+                        self.runtime_path.trim(),
+                        &inherited.platform_runtime_paths,
+                    )?;
+                }
+                if !config.monitor_path.trim().is_empty() {
+                    inherited.monitor_path = config.monitor_path.trim().to_string();
+                }
+                if let Some(monitor_cgroup) = config.monitor_cgroup.as_deref() {
+                    inherited.monitor_cgroup =
+                        resolve_monitor_cgroup(monitor_cgroup, self.effective_cgroup_driver())?;
+                }
+                if let Some(monitor_env) = config.monitor_env.as_ref() {
+                    inherited.monitor_env = monitor_env.clone();
+                }
+                if let Some(stream_websockets) = config.stream_websockets {
+                    inherited.stream_websockets = stream_websockets;
+                }
+                inherited.allowed_annotations = config.allowed_annotations.clone();
+                inherited.default_annotations = config.default_annotations.clone();
+                inherited.privileged_without_host_devices = config.privileged_without_host_devices;
+                inherited.privileged_without_host_devices_all_devices_allowed =
+                    config.privileged_without_host_devices_all_devices_allowed;
+                if let Some(timeout) = config.container_create_timeout {
+                    inherited.container_create_timeout =
+                        timeout.max(MIN_CONTAINER_CREATE_TIMEOUT_SECS);
+                }
+                if !config.snapshotter.trim().is_empty() {
+                    inherited.snapshotter = config.snapshotter.trim().to_string();
+                }
+                resolved.insert(handler, inherited);
+                continue;
+            }
+
+            if config.runtime_path.trim().is_empty() {
+                return Err(Error::Config(format!(
+                    "runtime.runtimes.{handler}.runtime_path must not be empty"
+                )));
+            }
+
+            resolved.insert(
+                handler,
+                ResolvedRuntimeHandlerConfig {
+                    backend: if config.backend.trim().is_empty() {
+                        default_runtime.backend.clone()
+                    } else {
+                        config.backend.trim().to_string()
+                    },
+                    backend_options: config.backend_options.clone(),
+                    runtime_path: resolve_platform_runtime_path(
+                        config.runtime_path.trim(),
+                        &config.platform_runtime_paths,
+                    )?,
+                    runtime_config_path: if config.runtime_config_path.trim().is_empty() {
+                        default_runtime.runtime_config_path.clone()
+                    } else {
+                        config.runtime_config_path.trim().to_string()
+                    },
+                    runtime_root: if config.runtime_root.trim().is_empty() {
+                        default_runtime.runtime_root.clone()
+                    } else {
+                        config.runtime_root.trim().to_string()
+                    },
+                    platform_runtime_paths: config.platform_runtime_paths.clone(),
+                    monitor_path: if config.monitor_path.trim().is_empty() {
+                        default_runtime.monitor_path.clone()
+                    } else {
+                        config.monitor_path.trim().to_string()
+                    },
+                    monitor_cgroup: resolve_monitor_cgroup(
+                        config
+                            .monitor_cgroup
+                            .as_deref()
+                            .unwrap_or(default_runtime.monitor_cgroup.as_str()),
+                        self.effective_cgroup_driver(),
+                    )?,
+                    monitor_env: config
+                        .monitor_env
+                        .clone()
+                        .unwrap_or_else(|| self.monitor_env.clone()),
+                    stream_websockets: config
+                        .stream_websockets
+                        .unwrap_or(default_runtime.stream_websockets),
+                    allowed_annotations: config.allowed_annotations.clone(),
+                    default_annotations: config.default_annotations.clone(),
+                    privileged_without_host_devices: config.privileged_without_host_devices,
+                    privileged_without_host_devices_all_devices_allowed: config
+                        .privileged_without_host_devices_all_devices_allowed,
+                    container_create_timeout: config
+                        .container_create_timeout
+                        .unwrap_or(DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS)
+                        .max(MIN_CONTAINER_CREATE_TIMEOUT_SECS),
+                    snapshotter: if config.snapshotter.trim().is_empty() {
+                        "internal-overlay-untar".to_string()
+                    } else {
+                        config.snapshotter.trim().to_string()
+                    },
+                },
+            );
+        }
+
+        Ok(resolved)
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ImageConfig{
     /// 镜像存储后端。
@@ -359,7 +558,7 @@ pub struct RuntimeWorkloadResources {
 }
 
 /// 守护进程 cgroup driver 配置。
-#[derive(Debug, Clone, Deserialize, Copy, Serialize)]
+#[derive(Debug, Clone, Deserialize, Copy, Serialize, PartialEq)]
 #[serde(rename_all = "lowercase")]
 pub enum CgroupDriverConfig {
     Systemd,
@@ -635,6 +834,232 @@ impl CgroupDriverConfig {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedRuntimeHandlerConfig {
+    pub backend: String,
+    pub backend_options: HashMap<String, String>,
+    pub runtime_path: String,
+    pub runtime_config_path: String,
+    pub runtime_root: String,
+    pub platform_runtime_paths: HashMap<String, String>,
+    pub monitor_path: String,
+    pub monitor_cgroup: String,
+    pub monitor_env: Vec<String>,
+    pub stream_websockets: bool,
+    pub allowed_annotations: Vec<String>,
+    pub default_annotations: HashMap<String, String>,
+    pub privileged_without_host_devices: bool,
+    pub privileged_without_host_devices_all_devices_allowed: bool,
+    pub container_create_timeout: u32,
+    pub snapshotter: String,
+}
+
+impl Default for ResolvedRuntimeHandlerConfig {
+    fn default() -> Self {
+        Self {
+            backend: "runc".to_string(),
+            backend_options: HashMap::new(),
+            runtime_path: String::new(),
+            runtime_config_path: String::new(),
+            runtime_root: String::new(),
+            platform_runtime_paths: HashMap::new(),
+            monitor_path: String::new(),
+            monitor_cgroup: String::new(),
+            monitor_env: Vec::new(),
+            stream_websockets: true,
+            allowed_annotations: Vec::new(),
+            default_annotations: HashMap::new(),
+            privileged_without_host_devices: false,
+            privileged_without_host_devices_all_devices_allowed: false,
+            container_create_timeout: DEFAULT_CONTAINER_CREATE_TIMEOUT_SECS,
+            snapshotter: "internal-overlay-untar".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkDomainConfig {
+    /// CNI 配置目录。
+    #[serde(
+        default,
+        alias = "config_dir",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub config_dirs: Vec<String>,
+    /// CNI 插件目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub plugin_dirs: Vec<String>,
+    /// CNI 缓存目录。
+    pub cache_dir: String,
+    /// CNI 配置模板文件路径。
+    pub conf_template: String,
+    /// 最大允许加载的 CNI 配置文件数量；0 表示不限制。
+    #[serde(alias = "cni_max_conf_num")]
+    pub max_conf_num: usize,
+    /// Pod 主 IP 选择策略。
+    pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时。
+    pub teardown_timeout: std::time::Duration,
+    /// 显式指定默认使用的 CNI 网络名。
+    #[serde(alias = "cni_default_network")]
+    pub default_network_name: Option<String>,
+    /// 是否全局禁用 hostPort 映射。
+    pub disable_hostport_mapping: bool,
+    /// 是否将 netns 挂载统一放到 runtime state dir 下。
+    #[serde(alias = "netns_mounts_under_state_dir")]
+    pub netns_mounts_under_state_dir: bool,
+}
+
+impl Default for NetworkDomainConfig {
+    fn default() -> Self {
+        Self::cri_default()
+    }
+}
+
+impl NetworkDomainConfig {
+    fn local_default() -> Self {
+        Self {
+            config_dirs: vec!["/etc/crius/cni/net.d".to_string()],
+            ..Self::common_default()
+        }
+    }
+
+    fn cri_default() -> Self {
+        Self {
+            config_dirs: vec![
+                "/etc/cni/net.d".to_string(),
+                "/etc/kubernetes/cni/net.d".to_string(),
+            ],
+            ..Self::common_default()
+        }
+    }
+
+    fn common_default() -> Self {
+        Self {
+            config_dirs: Vec::new(),
+            plugin_dirs: vec![
+                "/opt/cni/bin".to_string(),
+                "/usr/lib/cni".to_string(),
+                "/usr/libexec/cni".to_string(),
+            ],
+            cache_dir: "/var/lib/cni/cache".to_string(),
+            conf_template: String::new(),
+            max_conf_num: 0,
+            ip_pref: MainIpPreference::Cni,
+            teardown_timeout: std::time::Duration::from_secs(60),
+            default_network_name: None,
+            disable_hostport_mapping: false,
+            netns_mounts_under_state_dir:false,
+        }
+    }
+
+    pub fn cni_config(&self) -> CniConfig {
+        let mut cni = CniConfig::new(
+            self.config_dirs.iter().map(PathBuf::from).collect(),
+            self.plugin_dirs.iter().map(PathBuf::from).collect(),
+            PathBuf::from(&self.cache_dir),
+            self.max_conf_num,
+            self.ip_pref,
+            self.default_network_name.clone(),
+            self.disable_hostport_mapping,
+        );
+        cni.set_teardown_timeout(self.teardown_timeout);
+        if !self.conf_template.trim().is_empty() {
+            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        }
+        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
+        cni
+    }
+}
+
+/// 网络配置。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NetworkConfig {
+    /// 网络插件类型。
+    pub plugin: String,
+    /// CNI 配置目录，兼容旧单目录配置。
+    #[serde(
+        default,
+        alias = "config_dir",
+        deserialize_with = "deserialize_string_or_vec"
+    )]
+    pub config_dirs: Vec<String>,
+    /// CNI 插件目录。
+    #[serde(default, deserialize_with = "deserialize_string_or_vec")]
+    pub plugin_dirs: Vec<String>,
+    /// CNI 缓存目录。
+    pub cache_dir: String,
+    /// CNI 配置模板文件路径；开启后 UpdateRuntimeConfig 可基于 PodCIDR 渲染配置文件。
+    pub conf_template: String,
+    /// 最大允许加载的 CNI 配置文件数量；0 表示不限制。
+    #[serde(alias = "cni_max_conf_num")]
+    pub max_conf_num: usize,
+    /// Pod 主 IP 选择策略。
+    pub ip_pref: MainIpPreference,
+    /// CNI teardown/DEL 的固定超时；默认 1 分钟，对齐 CRI-O 的 networkStop 语义。
+    pub teardown_timeout: std::time::Duration,
+    /// 显式指定默认使用的 CNI 网络名；为空时按文件名字典序选择第一个。
+    #[serde(alias = "cni_default_network")]
+    pub default_network_name: Option<String>,
+    /// 是否全局禁用 hostPort 映射。
+    pub disable_hostport_mapping: bool,
+    /// 是否将 netns 挂载统一放到 runtime state dir 下。
+    #[serde(alias = "netns_mounts_under_state_dir")]
+    pub netns_mounts_under_state_dir: bool,
+    /// `crs` 本地 Pod 使用的网络域。
+    pub local: NetworkDomainConfig,
+    /// kubelet / CRI 调用使用的网络域。
+    pub cri: NetworkDomainConfig,
+}
+
+impl Default for NetworkConfig {
+    fn default() -> Self {
+        let local = NetworkDomainConfig::local_default();
+        let cri = NetworkDomainConfig::cri_default();
+        Self {
+            plugin: "cni".to_string(),
+            config_dirs: cri.config_dirs.clone(),
+            plugin_dirs: cri.plugin_dirs.clone(),
+            cache_dir: cri.cache_dir.clone(),
+            conf_template: cri.conf_template.clone(),
+            max_conf_num: cri.max_conf_num,
+            ip_pref: cri.ip_pref,
+            teardown_timeout: cri.teardown_timeout,
+            default_network_name: cri.default_network_name.clone(),
+            disable_hostport_mapping: cri.disable_hostport_mapping,
+            netns_mounts_under_state_dir: cri.netns_mounts_under_state_dir,
+            local,
+            cri,
+        }
+    }
+}
+
+impl NetworkConfig {
+    pub fn cni_config(&self) -> CniConfig {
+        let mut cni = CniConfig::new(
+            self.config_dirs.iter().map(PathBuf::from).collect(),
+            self.plugin_dirs.iter().map(PathBuf::from).collect(),
+            PathBuf::from(&self.cache_dir),
+            self.max_conf_num,
+            self.ip_pref,
+            self.default_network_name.clone(),
+            self.disable_hostport_mapping,
+        );
+        cni.set_teardown_timeout(self.teardown_timeout);
+        if !self.conf_template.trim().is_empty() {
+            cni.set_conf_template(Some(PathBuf::from(self.conf_template.trim())));
+        }
+        cni.set_netns_mounts_under_state_dir(self.netns_mounts_under_state_dir);
+        cni
+    }
+
+    pub fn local_cni_config(&self) -> CniConfig {
+        self.local.cni_config()
+    }
+}
+
 fn apply_string_override(env_name: &str, target: &mut String) {
     if let Some(value) = std::env::var_os(env_name) {
         *target = value.to_string_lossy().trim().to_string();
@@ -695,4 +1120,23 @@ fn parse_bool(raw: &str) -> std::result::Result<bool, String> {
         "0" | "false" | "no" | "off" => Ok(false),
         other => Err(format!("invalid boolean value {other}")),
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum StringOrVec {
+    String(String),
+    Vec(Vec<String>),
+}
+
+fn deserialize_string_or_vec<'de, D>(deserializer: D) -> std::result::Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<StringOrVec>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(StringOrVec::String(value)) => vec![value],
+        Some(StringOrVec::Vec(values)) => values,
+        None => Vec::new(),
+    })
 }

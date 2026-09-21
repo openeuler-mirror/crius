@@ -18,7 +18,6 @@ pub mod content_store;
 pub mod metadata_store;
 pub mod pull_cgroup;
 
-#[cfg(feature = "shim")]
 pub mod snapshotter;
 
 use std::path::PathBuf;
@@ -2049,6 +2048,164 @@ impl ImageServiceImpl {
         })
         .await
     }
+
+    fn normalize_artifact_sub_path(raw: Option<&str>) -> Result<Option<PathBuf>, Status> {
+        let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let path = Path::new(raw);
+        if path.is_absolute()
+            || path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::ParentDir
+                        | std::path::Component::CurDir
+                        | std::path::Component::Prefix(_)
+                )
+            })
+        {
+            return Err(Status::invalid_argument(format!(
+                "invalid OCI artifact image_sub_path {}",
+                raw
+            )));
+        }
+        Ok(Some(path.to_path_buf()))
+    }
+
+    fn matching_non_artifact_image(root: &Path, requested_ref: &str) -> Result<bool, Status> {
+        let images_dir = FilesystemImageMetadataStore::image_records_dir(root);
+        if !images_dir.exists() {
+            return Ok(false);
+        }
+
+        for entry in std::fs::read_dir(&images_dir).map_err(|err| {
+            Status::internal(format!(
+                "failed to read image records directory {}: {}",
+                images_dir.display(),
+                err
+            ))
+        })? {
+            let entry = entry.map_err(|err| {
+                Status::internal(format!(
+                    "failed to read image record entry in {}: {}",
+                    images_dir.display(),
+                    err
+                ))
+            })?;
+            let Some(meta) = Self::load_meta_from_record_dir(&entry.path()) else {
+                continue;
+            };
+            if Self::is_artifact_meta(&meta) {
+                continue;
+            }
+            let image = Self::image_from_meta(&meta);
+            if Self::image_matches_ref(&image, requested_ref) {
+                return Ok(true);
+            }
+        }
+
+        Ok(false)
+    }
+
+    pub(crate) fn resolve_artifact_mounts(
+        storage_root: &Path,
+        additional_artifact_stores: &[PathBuf],
+        requested_ref: &str,
+        sub_path: Option<&str>,
+    ) -> Result<Vec<ResolvedArtifactMount>, Status> {
+        let mut search_roots: Vec<&Path> = additional_artifact_stores
+            .iter()
+            .map(PathBuf::as_path)
+            .collect();
+        search_roots.push(storage_root);
+
+        let normalized_sub_path = Self::normalize_artifact_sub_path(sub_path)?;
+        for root in search_roots {
+            let Some((meta, record_dir)) = Self::artifact_mount_candidates(root, requested_ref)?
+            else {
+                if Self::matching_non_artifact_image(root, requested_ref)? {
+                    return Err(Status::failed_precondition(format!(
+                        "image mount {} refers to a regular container image, not an OCI artifact; type=image mounts require an OCI artifact with mountable blobs",
+                        requested_ref
+                    )));
+                }
+                continue;
+            };
+            let mut mounts = Vec::new();
+            let mut matched = false;
+            for (index, blob) in meta.artifact_blobs.iter().enumerate() {
+                let blob_path = Path::new(blob.path.trim());
+                if blob.path.trim().is_empty()
+                    || blob_path.is_absolute()
+                    || blob_path.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::CurDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    continue;
+                }
+
+                let relative_path = if let Some(sub_path) = normalized_sub_path.as_ref() {
+                    if blob_path == sub_path {
+                        matched = true;
+                        PathBuf::from(
+                            blob_path
+                                .file_name()
+                                .and_then(|value| value.to_str())
+                                .unwrap_or("artifact"),
+                        )
+                    } else if let Ok(stripped) = blob_path.strip_prefix(sub_path) {
+                        matched = true;
+                        stripped.to_path_buf()
+                    } else {
+                        continue;
+                    }
+                } else {
+                    matched = true;
+                    blob_path.to_path_buf()
+                };
+
+                if relative_path.as_os_str().is_empty() {
+                    continue;
+                }
+
+                mounts.push(ResolvedArtifactMount {
+                    source: record_dir.join(format!("{index}.tar.gz")),
+                    relative_path,
+                });
+            }
+
+            if normalized_sub_path.is_some() && !matched {
+                return Err(Status::failed_precondition(format!(
+                    "OCI artifact sub path {} does not exist in {}",
+                    normalized_sub_path
+                        .as_ref()
+                        .map(|path| path.display().to_string())
+                        .unwrap_or_default(),
+                    requested_ref
+                )));
+            }
+
+            if mounts.is_empty() {
+                return Err(Status::failed_precondition(format!(
+                    "OCI artifact {} has no mountable blobs",
+                    requested_ref
+                )));
+            }
+
+            return Ok(mounts);
+        }
+
+        Err(Status::not_found(format!(
+            "OCI artifact {} is not present locally",
+            requested_ref
+        )))
+    }
+
 }
 
 #[tonic::async_trait]
@@ -2747,6 +2904,12 @@ struct PersistedPullImage {
     image_size: u64,
     layers_to_persist: Vec<PulledLayerData>,
     pulled_metadata: PulledImageMetadata,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedArtifactMount {
+    pub source: PathBuf,
+    pub relative_path: PathBuf,
 }
 
 fn json_string(json: &serde_json::Value, key: &str) -> Option<String> {

@@ -21,11 +21,6 @@ path = "src/crs/main.rs"
 [[bin]]
 name = "crius-shim"
 path = "src/shim/main.rs"
-required-features = ["shim"]
-
-[features]
-default = []
-shim = ["fern", "ctrlc", "libc"]
 
 [dependencies]
 # 异步运行时
@@ -76,10 +71,10 @@ chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"
 base64 = "0.21.7"
 
-# shim 专用依赖（条件编译）
-fern = { version = "0.6", optional = true }
-ctrlc = { version = "3.4", optional = true }
-libc = { version = "0.2", optional = true }
+# shim 依赖
+fern = "0.6"
+ctrlc = "3.4"
+libc = "0.2"
 
 # 网络相关
 async-trait = "0.1"

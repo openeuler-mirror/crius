@@ -14,28 +14,26 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-#![recursion_limit = "512"]
 
-//! # crius Rust Implementation
-//!
-//! A Rust implementation of the Kubernetes Container Runtime Interface (CRI).
+use std::unimplemented;
+use std::collections::HashMap;
 
+use crate::oci::spec::LinuxIntelRdt;
 
-pub mod error;
-pub mod config;
-pub mod defaults;
-pub mod server;
-pub mod image;
-pub mod storage;
-pub mod service;
-pub mod crs;
-pub mod proto;
-pub mod runtime;
-pub mod shim;
-pub mod shim_rpc;
-pub mod oci;
-pub mod security;
-pub mod cgroup;
-pub mod attach;
-pub mod network;
-pub mod state;
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ResourceClassRequest {
+    pub blockio_class: Option<String>,
+    pub rdt_class: Option<String>,
+}
+
+ pub fn requested_classes_from_annotations(
+    container_name: &str,
+    container_annotations: &HashMap<String, String>,
+    pod_annotations: &HashMap<String, String>,
+) -> ResourceClassRequest {
+    unimplemented!()
+}
+
+pub fn resolve_rdt_class(class_name: &str) -> Option<LinuxIntelRdt> {
+    unimplemented!()
+}
