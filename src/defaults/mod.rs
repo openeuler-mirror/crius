@@ -169,3 +169,9 @@ pub const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.locati
 pub const CONTAINER_TYPE_CONTAINER: &str = "container";
 pub const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
 pub const DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT: usize = 256;
+pub const SHIM_RPC_TIMEOUT: Duration = Duration::from_secs(5);
+pub const SHIM_RPC_READY_TIMEOUT: Duration = Duration::from_secs(5);
+pub const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-restore";
+pub const CRIO_LABELS_ANNOTATION: &str = "io.kubernetes.cri-o.Labels";
+pub const INTERNAL_UID_MAPPINGS_MOUNT_OPTION_PREFIX: &str = "__crius_uidmappings=";
+pub const INTERNAL_GID_MAPPINGS_MOUNT_OPTION_PREFIX: &str = "__crius_gidmappings=";

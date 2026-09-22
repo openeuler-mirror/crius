@@ -914,6 +914,39 @@ impl StorageManager {
         ).context("Failed to save snapshot")?;
         Ok(())
     }
+
+    pub fn replace_runtime_artifacts(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        records: &[RuntimeArtifactRecord],
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM runtime_artifacts WHERE owner_kind = ?1 AND owner_id = ?2",
+                [owner_kind, owner_id],
+            )
+            .context("Failed to delete runtime artifacts")?;
+        for record in records {
+            self.conn
+                .execute(
+                    "INSERT OR REPLACE INTO runtime_artifacts
+                 (owner_kind, owner_id, artifact_kind, path, state, runtime_handler, runtime_root)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        &record.owner_kind,
+                        &record.owner_id,
+                        &record.artifact_kind,
+                        &record.path,
+                        &record.state,
+                        record.runtime_handler.as_deref(),
+                        record.runtime_root.as_deref(),
+                    ],
+                )
+                .context("Failed to save runtime artifact")?;
+        }
+        Ok(())
+    }
 }
 
 /// 镜像记录
@@ -1024,4 +1057,16 @@ pub struct SnapshotRecord {
     pub mountpoint: String,
     pub snapshotter: String,
     pub runtime_managed: bool,
+}
+
+/// runtime工件记录
+#[derive(Debug, Clone)]
+pub struct RuntimeArtifactRecord {
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub artifact_kind: String,
+    pub path: String,
+    pub state: String,
+    pub runtime_handler: Option<String>,
+    pub runtime_root: Option<String>,
 }

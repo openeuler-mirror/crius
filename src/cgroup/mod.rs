@@ -325,3 +325,124 @@ impl CgroupManager {
     }
 
 }
+
+pub fn to_oci_resources(limits: &ResourceLimits) -> crate::oci::spec::LinuxResources {
+    crate::oci::spec::LinuxResources {
+        network: None,
+        unified: None,
+        cpu: limits.cpu.as_ref().map(|cpu| crate::oci::spec::LinuxCpu {
+            shares: cpu.shares,
+            quota: cpu.quota,
+            period: cpu.period,
+            realtime_runtime: cpu.realtime_runtime,
+            realtime_period: cpu.realtime_period,
+            cpus: cpu.cpus.clone(),
+            mems: cpu.mems.clone(),
+        }),
+        memory: limits
+            .memory
+            .as_ref()
+            .map(|memory| crate::oci::spec::LinuxMemory {
+                limit: memory.limit,
+                reservation: memory.reservation,
+                swap: memory.swap,
+                kernel: memory.kernel,
+                kernel_tcp: memory.kernel_tcp,
+                swappiness: memory.swappiness,
+                disable_oom_killer: memory.disable_oom_killer,
+                use_hierarchy: memory.use_hierarchy,
+            }),
+        pids: limits
+            .pids
+            .as_ref()
+            .map(|pids| crate::oci::spec::LinuxPids {
+                limit: pids.max.unwrap_or(-1),
+            }),
+        block_io: limits
+            .blkio
+            .as_ref()
+            .map(|blkio| crate::oci::spec::LinuxBlockIo {
+                weight: blkio.weight,
+                leaf_weight: blkio.leaf_weight,
+                weight_device: if blkio.device_weights.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_weights
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxWeightDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                weight: d.weight,
+                                leaf_weight: d.leaf_weight,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_read_bps_device: if blkio.device_read_bps.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_read_bps
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_write_bps_device: if blkio.device_write_bps.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_write_bps
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_read_iops_device: if blkio.device_read_iops.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_read_iops
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+                throttle_write_iops_device: if blkio.device_write_iops.is_empty() {
+                    None
+                } else {
+                    Some(
+                        blkio
+                            .device_write_iops
+                            .iter()
+                            .map(|d| crate::oci::spec::LinuxThrottleDevice {
+                                major: d.major,
+                                minor: d.minor,
+                                rate: d.rate,
+                            })
+                            .collect(),
+                    )
+                },
+            }),
+        hugepage_limits: None,
+        devices: None,
+        intel_rdt: None,
+    }
+}
