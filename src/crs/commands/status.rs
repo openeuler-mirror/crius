@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 
+use std::collections::HashMap;
+
+use serde_json::{Value, Map,};
+
 use crate::crs::{
     CliContext,
     format::{CommandOutput, TableRow, FormatOptions},
@@ -42,4 +46,26 @@ where
     }
 
     Ok(CommandResult::success())
+}
+
+pub(crate) fn parse_info_map(
+    info: &HashMap<String, String>,
+    warnings: &mut Vec<String>,
+) -> (Value, Value) {
+    let mut parsed = Map::new();
+    let mut raw = Map::new();
+
+    for (key, value) in info {
+        raw.insert(key.clone(), Value::String(value.clone()));
+        match serde_json::from_str::<Value>(value) {
+            Ok(json) => {
+                parsed.insert(key.clone(), json);
+            }
+            Err(source) => warnings.push(format!(
+                "failed to parse verbose info field {key:?} as JSON: {source}"
+            )),
+        }
+    }
+
+    (Value::Object(parsed), Value::Object(raw))
 }

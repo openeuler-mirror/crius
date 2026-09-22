@@ -86,6 +86,11 @@ where
         self.summary = summary;
         self
     }
+
+    pub(crate) fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
+        self
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -165,6 +170,32 @@ pub(crate) trait TableRow {
     }
     fn quiet_cell(&self) -> String {
         self.cells().into_iter().next().unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FilesystemUsageView {
+    pub kind: String,
+    pub mountpoint: String,
+    pub used_bytes: u64,
+    pub inodes_used: u64,
+    pub timestamp: i64,
+}
+
+impl TableRow for FilesystemUsageView {
+    fn headers() -> &'static [&'static str] {
+        &["KIND", "MOUNTPOINT", "USED", "INODES", "TIMESTAMP"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            self.mountpoint.clone(),
+            format_bytes(self.used_bytes),
+            self.inodes_used.to_string(),
+            self.timestamp.to_string(),
+        ]
     }
 }
 
@@ -326,4 +357,45 @@ pub(crate) fn format_bool(value: bool) -> &'static str {
     } else {
         "false"
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectView {
+    pub object_type: String,
+    pub id: String,
+    pub response: Value,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for InspectView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "ID", "NAME", "STATE", "IMAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        let status = self.response.get("status");
+        vec![
+            self.object_type.clone(),
+            self.id.clone(),
+            string_pointer(status, &["/metadata/name"]).unwrap_or_default(),
+            string_pointer(status, &["/state"]).unwrap_or_default(),
+            string_pointer(status, &["/image/image", "/imageRef"]).unwrap_or_default(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.id.clone()
+    }
+}
+
+fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .and_then(|value| value.pointer(path))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
 }
