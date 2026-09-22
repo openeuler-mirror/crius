@@ -39,7 +39,7 @@ pub(crate) async fn dispatch(
             image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
         }
         Command::Image(args) => image::handle(ctx, client, args).await,
-        Command::Inspect(args) => unimplemented!(),
+        Command::Inspect(args) => shortcuts::handle_inspect(ctx, client, args).await,
         Command::Debug(args) => unimplemented!(),
         Command::Completion(args) => unimplemented!(),
     }
