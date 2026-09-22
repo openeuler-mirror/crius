@@ -55,6 +55,90 @@ impl Spec {
             annotations: None,
         }
     }
+
+    /// 默认设备
+    pub fn default_devices(include_tty: bool) -> Vec<Device> {
+        let mut devices = vec![
+            Device {
+                device_type: "c".to_string(),
+                path: "/dev/null".to_string(),
+                major: Some(1),
+                minor: Some(3),
+                file_mode: Some(0o666),
+                uid: None,
+                gid: None,
+            },
+            Device {
+                device_type: "c".to_string(),
+                path: "/dev/zero".to_string(),
+                major: Some(1),
+                minor: Some(5),
+                file_mode: Some(0o666),
+                uid: None,
+                gid: None,
+            },
+            Device {
+                device_type: "c".to_string(),
+                path: "/dev/random".to_string(),
+                major: Some(1),
+                minor: Some(8),
+                file_mode: Some(0o666),
+                uid: None,
+                gid: None,
+            },
+            Device {
+                device_type: "c".to_string(),
+                path: "/dev/urandom".to_string(),
+                major: Some(1),
+                minor: Some(9),
+                file_mode: Some(0o666),
+                uid: None,
+                gid: None,
+            },
+        ];
+        if include_tty {
+            devices.push(Device {
+                device_type: "c".to_string(),
+                path: "/dev/tty".to_string(),
+                major: Some(5),
+                minor: Some(0),
+                file_mode: Some(0o666),
+                uid: None,
+                gid: None,
+            });
+        }
+        devices
+    }
+
+    /// 默认的受保护 `/proc` / `/sys` 路径。
+    pub fn default_masked_paths() -> Vec<String> {
+        vec![
+            "/proc/acpi".to_string(),
+            "/proc/kcore".to_string(),
+            "/proc/keys".to_string(),
+            "/proc/latency_stats".to_string(),
+            "/proc/sched_debug".to_string(),
+            "/proc/scsi".to_string(),
+            "/proc/timer_list".to_string(),
+            "/proc/timer_stats".to_string(),
+            "/proc/interrupts".to_string(),
+            "/sys/devices/virtual/powercap".to_string(),
+            "/sys/firmware".to_string(),
+            "/sys/fs/selinux".to_string(),
+        ]
+    }
+
+    /// 默认的只读 `/proc` 路径。
+    pub fn default_readonly_paths() -> Vec<String> {
+        vec![
+            "/proc/asound".to_string(),
+            "/proc/bus".to_string(),
+            "/proc/fs".to_string(),
+            "/proc/irq".to_string(),
+            "/proc/sys".to_string(),
+            "/proc/sysrq-trigger".to_string(),
+        ]
+    }
 }
 
 /// 进程配置

@@ -17,6 +17,7 @@ limitations under the License.
 
 pub mod devices;
 pub mod resource_classes;
+pub mod spec_patch;
 
 use std::unimplemented;
 
