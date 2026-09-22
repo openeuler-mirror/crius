@@ -17,6 +17,7 @@ limitations under the License.
 pub(crate) mod shortcuts;
 pub(crate) mod image;
 pub(crate) mod status;
+pub(crate) mod config;
 
 use std::unimplemented;
 

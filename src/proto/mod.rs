@@ -26,3 +26,9 @@ pub mod local {
         include!(concat!(env!("OUT_DIR"), "/local.v1.rs"));
     }
 }
+
+pub mod diagnostics {
+    pub mod v1 {
+        include!(concat!(env!("OUT_DIR"), "/diagnostics.v1.rs"));
+    }
+}

@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 
+use std::time::{
+    Duration, UNIX_EPOCH, SystemTime
+};
+
 use serde_json::{json, Value};
 use serde::Serialize;
 
@@ -390,6 +394,74 @@ impl TableRow for InspectView {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageTransferView {
+    pub image: String,
+    pub status: String,
+    pub updated: String,
+    pub error: String,
+}
+
+impl TableRow for ImageTransferView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "STATUS", "UPDATED", "ERROR"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.status.clone(),
+            self.updated.clone(),
+            self.error.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigReloadStatusView {
+    pub watcher: String,
+    pub last_reload: String,
+    pub last_error: String,
+    pub cni_watcher: String,
+}
+
+impl TableRow for ConfigReloadStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["WATCHER", "LAST RELOAD", "LAST ERROR", "CNI WATCHER"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.watcher.clone(),
+            self.last_reload.clone(),
+            self.last_error.clone(),
+            self.cni_watcher.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveConfigView {
+    pub config: Value,
+    pub redacted_fields: Vec<String>,
+}
+
+impl TableRow for EffectiveConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["REDACTED FIELDS", "CONFIG KEYS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.redacted_fields.join(","),
+            value_object_keys(&self.config).join(","),
+        ]
+    }
+}
+
 fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         value
@@ -398,4 +470,56 @@ fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
     })
+}
+
+pub(crate) fn format_unix_nanos(unix_nanos: i64, now: SystemTime) -> String {
+    let timestamp = if unix_nanos >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(unix_nanos as u64)
+    } else {
+        UNIX_EPOCH
+    };
+
+    let age = now.duration_since(timestamp).unwrap_or_default();
+    format!("{} ago", format_human_duration(age))
+}
+
+fn format_human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+
+    if seconds < 1 {
+        "Less than a second".to_string()
+    } else if seconds == 1 {
+        "1 second".to_string()
+    } else if seconds < 60 {
+        format!("{seconds} seconds")
+    } else {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            "About a minute".to_string()
+        } else if minutes < 60 {
+            format!("{minutes} minutes")
+        } else {
+            let hours = ((duration.as_secs_f64() / 3_600.0) + 0.5) as u64;
+            if hours == 1 {
+                "About an hour".to_string()
+            } else if hours < 48 {
+                format!("{hours} hours")
+            } else if hours < 24 * 7 * 2 {
+                format!("{} days", hours / 24)
+            } else if hours < 24 * 30 * 2 {
+                format!("{} weeks", hours / 24 / 7)
+            } else if hours < 24 * 365 * 2 {
+                format!("{} months", hours / 24 / 30)
+            } else {
+                format!("{} years", hours / 24 / 365)
+            }
+        }
+    }
+}
+
+fn value_object_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
 }

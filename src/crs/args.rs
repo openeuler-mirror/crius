@@ -190,3 +190,15 @@ pub struct CompletionArgs {
     #[arg(value_enum)]
     pub shell: CompletionShell,
 }
+
+#[derive(Debug, ClapArgs)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: ConfigCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    Show,
+    ReloadStatus,
+}

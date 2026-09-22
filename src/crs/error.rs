@@ -426,6 +426,25 @@ impl CliError {
         }
     }
 
+    pub(crate) fn diagnostics_unavailable(endpoint: impl Into<String>) -> Self {
+        let endpoint = endpoint.into();
+        Self::DiagnosticsUnavailable {
+            context: Box::new(ErrorContext::default().with_endpoint(endpoint.clone())),
+            endpoint,
+        }
+    }
+
+    pub(crate) fn from_diagnostics_status(
+        status: tonic::Status,
+        endpoint: impl Into<String>,
+    ) -> Self {
+        let endpoint = endpoint.into();
+        if status.code() == Code::Unimplemented {
+            Self::diagnostics_unavailable(endpoint)
+        } else {
+            Self::from_tonic_status(status).with_endpoint(endpoint)
+        }
+    }
     
 }
 
