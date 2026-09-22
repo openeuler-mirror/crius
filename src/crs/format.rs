@@ -462,6 +462,31 @@ impl TableRow for EffectiveConfigView {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageConfigView {
+    pub snapshotter: String,
+    pub policy: String,
+    pub auth_configured: String,
+    pub pinned_images: String,
+    pub config: Value,
+}
+
+impl TableRow for ImageConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["SNAPSHOTTER", "POLICY", "AUTH", "PINNED IMAGES"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.snapshotter.clone(),
+            self.policy.clone(),
+            self.auth_configured.clone(),
+            self.pinned_images.clone(),
+        ]
+    }
+}
+
 fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         value

@@ -25,15 +25,23 @@ use crate::proto::runtime::v1::{
     RemoveImageRequest, ImageFsInfoRequest,
     FilesystemUsage, StatusRequest,
 };
-use crate::proto::diagnostics::v1::ImageTransfersRequest;
+use crate::proto::diagnostics::v1::{
+    ImageTransfersRequest, EffectiveConfigRequest
+};
 use crate::crs::{
     CliContext, CrsClient,
     args::{ImageListArgs, ImageCommand, ImageArgs},
     CommandResult, commands::CliError,
     format::{ImageView, InspectView,
          FilesystemUsageView, ImageTransferView,},
-    format::{CommandOutput, ImageOperationView},
-    commands::status::{render_and_print, parse_info_map},
+    format::{
+        CommandOutput, ImageOperationView,
+        ImageConfigView,
+    },
+    commands::{
+        status::{render_and_print, parse_info_map},
+        config::load_effective_config
+    },
     builders::build_auth_config,
 };
 
@@ -49,7 +57,7 @@ pub(crate) async fn handle(
         ImageCommand::Remove { image } => handle_remove(ctx, client, image).await,
         ImageCommand::FsInfo => handle_fs_info(ctx, client).await,
         ImageCommand::Transfers => handle_transfers(ctx, client).await,
-        ImageCommand::Config => unimplemented!(),
+        ImageCommand::Config => handle_config(ctx, client).await,
     }
 }
 
@@ -306,6 +314,81 @@ async fn handle_transfers(ctx: &CliContext, client: &CrsClient) -> Result<Comman
             .with_summary(serde_json::json!({ "count": views.len() }))
             .with_warnings(warnings),
     )
+}
+
+async fn handle_config(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
+    let mut warnings = Vec::new();
+    let (config, _) = load_effective_config(client, "crs image config", &mut warnings)
+        .await
+        .ok_or_else(|| {
+            CliError::diagnostics_unavailable(client.endpoint()).with_command("crs image config")
+        })?;
+    let image_config = extract_image_config(&config);
+    let view = ImageConfigView {
+        snapshotter: string_field(&image_config, &["snapshotter", "defaultSnapshotter"])
+            .or_else(|| {
+                config
+                    .pointer("/imageSnapshotModel/snapshotter")
+                    .and_then(crate::crs::commands::config::value_to_display)
+            })
+            .unwrap_or_else(|| "unknown".to_string()),
+        policy: string_field(
+            &image_config,
+            &["signaturePolicy", "signaturePolicyDir", "policy"],
+        )
+        .unwrap_or_else(|| "unknown".to_string()),
+        auth_configured: auth_summary(&image_config),
+        pinned_images: string_array(&image_config, "pinnedImages").join(","),
+        config: image_config,
+    };
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImageConfig", client.endpoint(), vec![view.clone()])
+            .with_summary(serde_json::json!({
+                "snapshotter": view.snapshotter,
+                "authConfigured": view.auth_configured,
+                "pinnedImages": view.pinned_images,
+            }))
+            .with_warnings(warnings),
+    )
+}
+
+
+fn extract_image_config(config: &serde_json::Value) -> serde_json::Value {
+    config
+        .get("image")
+        .or_else(|| config.get("imageConfig"))
+        .cloned()
+        .unwrap_or_else(|| config.clone())
+}
+
+fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_array())
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(crate::crs::commands::config::value_to_display)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn auth_summary(config: &serde_json::Value) -> String {
+    let auth_keys = [
+        "auth",
+        "registryAuth",
+        "registryConfigDir",
+        "globalAuthFile",
+        "namespacedAuthDir",
+    ];
+    if auth_keys.iter().any(|key| config.get(*key).is_some()) {
+        "configured".to_string()
+    } else {
+        "unknown".to_string()
+    }
 }
 
 async fn load_transfers_from_status(
