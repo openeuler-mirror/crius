@@ -864,6 +864,56 @@ impl StorageManager {
             .map_err(|e| anyhow::anyhow!("Failed to close database: {:?}", e))?;
         Ok(())
     }
+
+    pub fn delete_shim_process(&mut self, container_id: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM shim_processes WHERE container_id = ?1",
+                [container_id],
+            )
+            .context("Failed to delete shim process")?;
+        Ok(())
+    }
+
+    pub fn list_snapshots(&self) -> Result<Vec<SnapshotRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT key, image_id, owner_kind, owner_id, state, mountpoint, snapshotter, runtime_managed FROM snapshots",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(SnapshotRecord {
+                    key: row.get(0)?,
+                    image_id: row.get(1)?,
+                    owner_kind: row.get(2)?,
+                    owner_id: row.get(3)?,
+                    state: row.get(4)?,
+                    mountpoint: row.get(5)?,
+                    snapshotter: row.get(6)?,
+                    runtime_managed: row.get(7)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list snapshots")?;
+        Ok(records)
+    }
+
+    pub fn save_snapshot(&mut self, record: &SnapshotRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO snapshots (key, image_id, owner_kind, owner_id, state, mountpoint, snapshotter, runtime_managed)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                &record.key,
+                &record.image_id,
+                &record.owner_kind,
+                &record.owner_id,
+                &record.state,
+                &record.mountpoint,
+                &record.snapshotter,
+                record.runtime_managed,
+            ],
+        ).context("Failed to save snapshot")?;
+        Ok(())
+    }
 }
 
 /// 镜像记录
@@ -961,4 +1011,17 @@ pub struct ContainerRecord {
     pub runtime_handler: Option<String>,
     pub runtime_backend: Option<String>,
     pub snapshot_key: Option<String>,
+}
+
+/// 快照记录
+#[derive(Debug, Clone)]
+pub struct SnapshotRecord {
+    pub key: String,
+    pub image_id: String,
+    pub owner_kind: String,
+    pub owner_id: String,
+    pub state: String,
+    pub mountpoint: String,
+    pub snapshotter: String,
+    pub runtime_managed: bool,
 }
