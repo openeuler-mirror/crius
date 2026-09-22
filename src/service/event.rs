@@ -21,7 +21,10 @@ use tonic::Status;
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::proto::runtime::v1::ContainerEventResponse;
-use crate::defaults::{MAX_INTERNAL_EVENT_DETAIL_BYTES, INTERNAL_EVENT_PREFIXES, INTERNAL_EVENT_SUBJECT_KINDS};
+use crate::defaults::{
+    MAX_INTERNAL_EVENT_DETAIL_BYTES, INTERNAL_EVENT_PREFIXES, 
+    INTERNAL_EVENT_SUBJECT_KINDS, DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT,
+};
 
 #[derive(Debug, Clone)]
 pub struct EventService {
@@ -34,11 +37,48 @@ pub struct EventService {
 
 impl EventService {
     pub fn stream(&self) -> ReceiverStream<Result<ContainerEventResponse, Status>> {
-        unimplemented!()
+        let mut events = self.subscribe();
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+
+        tokio::spawn(async move {
+            loop {
+                match events.recv().await {
+                    Ok(event) => {
+                        if tx.send(Ok(event)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        if tx
+                            .send(Err(Status::resource_exhausted(
+                                "CRI event stream lagged behind producer",
+                            )))
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+
+        ReceiverStream::new(rx)
     }
 
     pub fn from_sender(sender: tokio::sync::broadcast::Sender<ContainerEventResponse>) -> Self {
-        unimplemented!()
+        let (internal_sender, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            sender,
+            internal_sender,
+            ledger: None,
+            internal_retention_per_subject: DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT,
+        }
+    }
+
+    pub fn subscribe(&self) -> tokio::sync::broadcast::Receiver<ContainerEventResponse> {
+        self.sender.subscribe()
     }
 
     pub fn with_ledger(
@@ -51,7 +91,35 @@ impl EventService {
 
     pub async fn publish_internal(&self, event: InternalEvent) -> anyhow::Result<()> {
         event.validate_schema()?;
-        unimplemented!()
+        let persist_result = self.persist_internal_event(&event).await;
+        if let Err(err) = self.internal_sender.send(event) {
+            log::debug!("Dropping internal event without subscribers: {}", err);
+        }
+        persist_result
+    }
+
+    async fn persist_internal_event(&self, event: &InternalEvent) -> anyhow::Result<()> {
+        let Some(ledger) = &self.ledger else {
+            return Ok(());
+        };
+        event.validate_schema()?;
+        let mut persistence = ledger.lock().await;
+        let mut ledger = crate::state::StateLedgerWriter::new(&mut persistence);
+        ledger.append_typed_event_at(crate::storage::TypedEventInput {
+            event_type: &event.kind,
+            entity_type: &event.subject_kind,
+            entity_id: &event.subject_id,
+            old_state: None,
+            new_state: Some(event.severity.as_str()),
+            details: event.details_for_ledger().as_deref(),
+            timestamp: event.timestamp,
+        })?;
+        ledger.prune_events_for_subject(
+            &event.subject_kind,
+            &event.subject_id,
+            self.internal_retention_per_subject,
+        )?;
+        Ok(())
     }
 
     pub fn publish(&self, event: ContainerEventResponse) {

@@ -71,4 +71,22 @@ impl<'a> StateLedgerWriter<'a> {
             snapshot_key,
         )
     }
+
+    pub fn prune_events_for_subject(
+        &mut self,
+        subject_kind: &str,
+        subject_id: &str,
+        keep: usize,
+    ) -> Result<usize> {
+        self.persistence
+            .storage_mut()
+            .prune_events_for_subject(subject_kind, subject_id, keep)
+    }
+
+    pub fn append_typed_event_at(
+        &mut self,
+        input: crate::storage::TypedEventInput<'_>,
+    ) -> Result<()> {
+        self.persistence.storage_mut().append_typed_event_at(input)
+    }
 }

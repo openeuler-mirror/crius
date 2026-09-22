@@ -17,6 +17,7 @@ limitations under the License.
 pub(crate) mod shortcuts;
 pub(crate) mod image;
 pub(crate) mod status;
+pub(crate) mod config;
 
 use std::unimplemented;
 
@@ -34,9 +35,11 @@ pub(crate) async fn dispatch(
         Command::Version(args) => unimplemented!(),
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
-        Command::Rmi { image: image_name } => unimplemented!(),
-        Command::Image(args) => unimplemented!(),
-        Command::Inspect(args) => unimplemented!(),
+        Command::Rmi { image: image_name } => {
+            image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
+        }
+        Command::Image(args) => image::handle(ctx, client, args).await,
+        Command::Inspect(args) => shortcuts::handle_inspect(ctx, client, args).await,
         Command::Debug(args) => unimplemented!(),
         Command::Completion(args) => unimplemented!(),
     }

@@ -25,6 +25,8 @@ use tokio::net::UnixStream;
 use tower::service_fn;
 
 use crate::proto::runtime::v1::{runtime_service_client::RuntimeServiceClient, image_service_client::ImageServiceClient};
+use crate::proto::diagnostics::v1::diagnostics_service_client::DiagnosticsServiceClient;
+use crate::proto::local::v1::local_service_client::LocalServiceClient;
 use crate::crs::{CliContext, error::CliError, parsers::Endpoint};
 
 #[derive(Clone, Debug)]
@@ -35,8 +37,8 @@ pub(crate) struct CrsClient {
     rpc_timeout: Duration,
     runtime: Option<RuntimeServiceClient<Channel>>,
     image: Option<ImageServiceClient<Channel>>,
-    // diagnostics: Option<DiagnosticsServiceClient<Channel>>,
-    // local: Option<LocalServiceClient<Channel>>,
+    diagnostics: Option<DiagnosticsServiceClient<Channel>>,
+    local: Option<LocalServiceClient<Channel>>,
 }
 
 impl CrsClient {
@@ -51,8 +53,8 @@ impl CrsClient {
             rpc_timeout: ctx.rpc_timeout(),
             runtime: None,
             image: None,
-            // diagnostics: None,
-            // local: None,
+            diagnostics: None,
+            local: None,
         }
     }
 
@@ -122,6 +124,18 @@ impl CrsClient {
                 "runtime service client is not connected; call CrsClient::connect first",
             )
         })
+    }
+
+    #[allow(dead_code, clippy::result_large_err)]
+    pub(crate) fn diagnostics(&self) -> Result<DiagnosticsServiceClient<Channel>, CliError> {
+        self.diagnostics
+            .clone()
+            .ok_or_else(|| self.diagnostics_unavailable())
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn diagnostics_unavailable(&self) -> CliError {
+        CliError::diagnostics_unavailable(self.endpoint())
     }
 }
 

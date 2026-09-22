@@ -15,6 +15,10 @@ limitations under the License.
 */
 
 
+use std::time::{
+    Duration, UNIX_EPOCH, SystemTime
+};
+
 use serde_json::{json, Value};
 use serde::Serialize;
 
@@ -84,6 +88,11 @@ where
 
     pub(crate) fn with_summary(mut self, summary: Value) -> Self {
         self.summary = summary;
+        self
+    }
+
+    pub(crate) fn with_warnings(mut self, warnings: Vec<String>) -> Self {
+        self.warnings = warnings;
         self
     }
 }
@@ -165,6 +174,32 @@ pub(crate) trait TableRow {
     }
     fn quiet_cell(&self) -> String {
         self.cells().into_iter().next().unwrap_or_default()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct FilesystemUsageView {
+    pub kind: String,
+    pub mountpoint: String,
+    pub used_bytes: u64,
+    pub inodes_used: u64,
+    pub timestamp: i64,
+}
+
+impl TableRow for FilesystemUsageView {
+    fn headers() -> &'static [&'static str] {
+        &["KIND", "MOUNTPOINT", "USED", "INODES", "TIMESTAMP"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            self.mountpoint.clone(),
+            format_bytes(self.used_bytes),
+            self.inodes_used.to_string(),
+            self.timestamp.to_string(),
+        ]
     }
 }
 
@@ -326,4 +361,190 @@ pub(crate) fn format_bool(value: bool) -> &'static str {
     } else {
         "false"
     }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct InspectView {
+    pub object_type: String,
+    pub id: String,
+    pub response: Value,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for InspectView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "ID", "NAME", "STATE", "IMAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        let status = self.response.get("status");
+        vec![
+            self.object_type.clone(),
+            self.id.clone(),
+            string_pointer(status, &["/metadata/name"]).unwrap_or_default(),
+            string_pointer(status, &["/state"]).unwrap_or_default(),
+            string_pointer(status, &["/image/image", "/imageRef"]).unwrap_or_default(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageTransferView {
+    pub image: String,
+    pub status: String,
+    pub updated: String,
+    pub error: String,
+}
+
+impl TableRow for ImageTransferView {
+    fn headers() -> &'static [&'static str] {
+        &["IMAGE", "STATUS", "UPDATED", "ERROR"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.image.clone(),
+            self.status.clone(),
+            self.updated.clone(),
+            self.error.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConfigReloadStatusView {
+    pub watcher: String,
+    pub last_reload: String,
+    pub last_error: String,
+    pub cni_watcher: String,
+}
+
+impl TableRow for ConfigReloadStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["WATCHER", "LAST RELOAD", "LAST ERROR", "CNI WATCHER"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.watcher.clone(),
+            self.last_reload.clone(),
+            self.last_error.clone(),
+            self.cni_watcher.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EffectiveConfigView {
+    pub config: Value,
+    pub redacted_fields: Vec<String>,
+}
+
+impl TableRow for EffectiveConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["REDACTED FIELDS", "CONFIG KEYS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.redacted_fields.join(","),
+            value_object_keys(&self.config).join(","),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ImageConfigView {
+    pub snapshotter: String,
+    pub policy: String,
+    pub auth_configured: String,
+    pub pinned_images: String,
+    pub config: Value,
+}
+
+impl TableRow for ImageConfigView {
+    fn headers() -> &'static [&'static str] {
+        &["SNAPSHOTTER", "POLICY", "AUTH", "PINNED IMAGES"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.snapshotter.clone(),
+            self.policy.clone(),
+            self.auth_configured.clone(),
+            self.pinned_images.clone(),
+        ]
+    }
+}
+
+fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
+    paths.iter().find_map(|path| {
+        value
+            .and_then(|value| value.pointer(path))
+            .and_then(|value| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+    })
+}
+
+pub(crate) fn format_unix_nanos(unix_nanos: i64, now: SystemTime) -> String {
+    let timestamp = if unix_nanos >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(unix_nanos as u64)
+    } else {
+        UNIX_EPOCH
+    };
+
+    let age = now.duration_since(timestamp).unwrap_or_default();
+    format!("{} ago", format_human_duration(age))
+}
+
+fn format_human_duration(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+
+    if seconds < 1 {
+        "Less than a second".to_string()
+    } else if seconds == 1 {
+        "1 second".to_string()
+    } else if seconds < 60 {
+        format!("{seconds} seconds")
+    } else {
+        let minutes = seconds / 60;
+        if minutes == 1 {
+            "About a minute".to_string()
+        } else if minutes < 60 {
+            format!("{minutes} minutes")
+        } else {
+            let hours = ((duration.as_secs_f64() / 3_600.0) + 0.5) as u64;
+            if hours == 1 {
+                "About an hour".to_string()
+            } else if hours < 48 {
+                format!("{hours} hours")
+            } else if hours < 24 * 7 * 2 {
+                format!("{} days", hours / 24)
+            } else if hours < 24 * 30 * 2 {
+                format!("{} weeks", hours / 24 / 7)
+            } else if hours < 24 * 365 * 2 {
+                format!("{} months", hours / 24 / 30)
+            } else {
+                format!("{} years", hours / 24 / 365)
+            }
+        }
+    }
+}
+
+fn value_object_keys(value: &Value) -> Vec<String> {
+    value
+        .as_object()
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
 }
