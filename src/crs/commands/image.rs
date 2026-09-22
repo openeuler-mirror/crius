@@ -19,7 +19,8 @@ use std::unimplemented;
 use crate::proto::runtime::v1::{
     ListImagesRequest, ImageFilter, 
     ImageSpec, Image, PullImageRequest,
-    PodSandboxStatusRequest,
+    PodSandboxStatusRequest, ImageStatusRequest,
+    RemoveImageRequest,
 };
 use crate::crs::{
     CliContext, CrsClient,
@@ -123,6 +124,86 @@ pub(crate) async fn handle_pull(
     )
 }
 
+pub(crate) async fn handle_remove_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    image: String,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
+    if image.is_empty() {
+        return Err(CliError::invalid_input("image must not be empty").with_command(command_name));
+    }
+
+    let mut image_client = client.image()?;
+    let exists = client
+        .with_rpc_timeout(async {
+            image_client
+                .image_status(ImageStatusRequest {
+                    image: Some(ImageSpec {
+                        image: image.clone(),
+                        user_specified_image: image.clone(),
+                        ..Default::default()
+                    }),
+                    verbose: false,
+                })
+                .await
+                .map(|response| response.into_inner().image.is_some())
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+    if !exists {
+        return Err(
+            CliError::from_tonic_status(tonic::Status::not_found(format!(
+                "image {image} not found"
+            )))
+            .with_command(command_name)
+            .with_endpoint(client.endpoint())
+            .with_object(format!("image {image}")),
+        );
+    }
+
+    client
+        .with_rpc_timeout(async {
+            image_client
+                .remove_image(RemoveImageRequest {
+                    image: Some(ImageSpec {
+                        image: image.clone(),
+                        user_specified_image: image.clone(),
+                        ..Default::default()
+                    }),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("image {image}"))
+                })
+        })
+        .await?;
+
+    let view = ImageOperationView {
+        image: image.clone(),
+        image_ref: String::new(),
+        action: "removed".to_string(),
+        success: true,
+    };
+    render_and_print(
+        ctx,
+        CommandOutput::new("ImageRemove", client.endpoint(), vec![view]).with_summary(
+            serde_json::json!({
+                "image": image,
+                "removed": true,
+            }),
+        ),
+    )
+}
+
 pub(crate) fn image_view(image: Image) -> ImageView {
     let image_name = image
         .repo_tags
@@ -194,3 +275,5 @@ async fn fetch_sandbox_config(
             .with_object(format!("pod {pod}"))
         })
 }
+
+

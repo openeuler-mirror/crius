@@ -34,7 +34,9 @@ pub(crate) async fn dispatch(
         Command::Version(args) => unimplemented!(),
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
-        Command::Rmi { image: image_name } => unimplemented!(),
+        Command::Rmi { image: image_name } => {
+            image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
+        }
         Command::Image(args) => unimplemented!(),
         Command::Inspect(args) => unimplemented!(),
         Command::Debug(args) => unimplemented!(),

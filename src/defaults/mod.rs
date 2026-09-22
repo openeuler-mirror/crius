@@ -168,3 +168,4 @@ pub const SHIM_PIDFILE_NAME: &str = "shim.pid";
 pub const CHECKPOINT_LOCATION_ANNOTATION_KEY: &str = "io.crius.checkpoint.location";
 pub const CONTAINER_TYPE_CONTAINER: &str = "container";
 pub const INTERNAL_CONTAINER_STATE_KEY: &str = "io.crius.internal/container-state";
+pub const DEFAULT_INTERNAL_EVENT_RETENTION_PER_SUBJECT: usize = 256;

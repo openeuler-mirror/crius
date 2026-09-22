@@ -53,6 +53,11 @@ impl PersistenceManager {
         })
     }
 
+    /// 获取存储管理器的可变引用
+    pub fn storage_mut(&mut self) -> &mut StorageManager {
+        &mut self.storage
+    }
+
     pub fn update_container_ledger_metadata(
         &mut self,
         container_id: &str,

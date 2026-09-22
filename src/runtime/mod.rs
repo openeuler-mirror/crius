@@ -280,7 +280,7 @@ pub struct RuncRuntime {
 
 impl RuncRuntime {
     fn default_capabilities() -> Vec<String> {
-        unimplemented!()
+        crate::security::spec_patch::default_capabilities()
     }
 
     pub fn with_shim_and_image_storage(
