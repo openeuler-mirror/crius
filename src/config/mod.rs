@@ -1060,6 +1060,21 @@ impl NetworkConfig {
     }
 }
 
+/// External snapshotter 配置。
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(default)]
+pub struct ExternalSnapshotterConfig {
+    /// external snapshotter 类型，例如 `proxy`、`stargz`、`nydus`。
+    #[serde(rename = "type")]
+    pub snapshotter_type: String,
+    /// snapshotter 服务 endpoint；支持 unix socket、绝对路径 socket 或 TCP 地址。
+    pub endpoint: String,
+    /// snapshotter helper 或 plugin binary 路径；为空表示只通过 endpoint 探测。
+    pub path: String,
+    /// 配置声明或探测缓存中的能力列表。
+    pub capabilities: Vec<String>,
+}
+
 fn apply_string_override(env_name: &str, target: &mut String) {
     if let Some(value) = std::env::var_os(env_name) {
         *target = value.to_string_lossy().trim().to_string();

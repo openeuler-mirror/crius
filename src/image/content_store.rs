@@ -162,6 +162,10 @@ impl FsContentStore {
     pub fn total_usage(&self) -> Result<(u64, u64)> {
         collect_path_usage(&self.blobs_root())
     }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
