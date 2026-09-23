@@ -54,7 +54,7 @@ use crate::config::CgroupDriverConfig;
 use crate::runtime::shim_manager::ShimConfig;
 use crate::cgroup::{
     ResourceLimits, MemoryLimit, CpuLimit,
-    to_oci_resources,
+    to_oci_resources, CgroupManager,
 };
 use crate::image::snapshotter::RootfsHandleKind;
 use crate::storage::{
@@ -67,6 +67,10 @@ use crate::defaults::{
     CRIO_LABELS_ANNOTATION,
     INTERNAL_UID_MAPPINGS_MOUNT_OPTION_PREFIX,
     INTERNAL_GID_MAPPINGS_MOUNT_OPTION_PREFIX,
+    SHIM_EXIT_CODE_WAIT_TIMEOUT,
+    STOP_INITIAL_BACKOFF,
+    STOP_KILL_WAIT_TIMEOUT,
+    STOP_MAX_BACKOFF,
 };
 
 pub trait ContainerRuntime {
@@ -3040,35 +3044,490 @@ impl RuncRuntime {
 
         Ok(())
     }
+
+    fn ensure_container_create_not_expired(
+        &self,
+        deadline: std::time::Instant,
+        phase: &str,
+    ) -> Result<()> {
+        if std::time::Instant::now() > deadline {
+            return Err(anyhow::anyhow!(
+                "container create phase {} exceeded runtime create timeout of {}s",
+                phase,
+                self.container_create_timeout_secs
+            ));
+        }
+        Ok(())
+    }
+
+    fn wait_for_shim_exit_code(&self, container_id: &str) {
+        if let Some(shim_manager) = &self.shim_manager {
+            let deadline = std::time::Instant::now() + SHIM_EXIT_CODE_WAIT_TIMEOUT;
+            loop {
+                if matches!(shim_manager.get_exit_code(container_id), Ok(Some(_))) {
+                    return;
+                }
+                if !shim_manager.is_shim_running(container_id) {
+                    return;
+                }
+                let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now())
+                else {
+                    debug!(
+                        "Timed out waiting for shim to record exit code for container {}",
+                        container_id
+                    );
+                    return;
+                };
+                if remaining.is_zero() {
+                    debug!(
+                        "Timed out waiting for shim to record exit code for container {}",
+                        container_id
+                    );
+                    return;
+                }
+                std::thread::sleep(std::cmp::min(STOP_INITIAL_BACKOFF, remaining));
+            }
+        }
+    }
+
+    fn wait_for_container_stop_until(
+        &self,
+        container_id: &str,
+        deadline: std::time::Instant,
+    ) -> Result<bool> {
+        let mut backoff = STOP_INITIAL_BACKOFF;
+
+        loop {
+            match self.get_runc_state(container_id)? {
+                None => return Ok(true),
+                Some(state) if state.status == "stopped" => return Ok(true),
+                _ => {}
+            }
+
+            let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) else {
+                return Ok(false);
+            };
+            if remaining.is_zero() {
+                return Ok(false);
+            }
+
+            std::thread::sleep(std::cmp::min(backoff, remaining));
+            backoff = std::cmp::min(backoff.saturating_mul(2), STOP_MAX_BACKOFF);
+        }
+    }
+
+    fn rootfs_cleanup_target_from_runtime_state(&self, container_id: &str) -> Option<PathBuf> {
+        let state = self.get_runc_state(container_id).ok()??;
+        self.rootfs_cleanup_target_from_path(container_id, Path::new(&state.rootfs))
+    }
+
+    fn rootfs_cleanup_target(&self, container_id: &str) -> Option<PathBuf> {
+        let bundle_target = self.rootfs_cleanup_target_from_bundle(container_id);
+        if self.shim_manager.is_some() {
+            bundle_target
+        } else {
+            bundle_target.or_else(|| self.rootfs_cleanup_target_from_runtime_state(container_id))
+        }
+    }
+
+    fn notify_shim_to_reopen_log(&self, container_id: &str) -> Result<()> {
+        let shim_manager = self
+            .shim_manager
+            .as_ref()
+            .context("container log reopen requires shim-enabled runtime")?;
+        let socket_path = shim_manager.task_socket_path(container_id);
+        if !socket_path.exists() {
+            return Err(LogReopenError::MissingSocket {
+                container_id: container_id.to_string(),
+                socket_path,
+            }
+            .into());
+        }
+        shim_manager.reopen_log(container_id)
+    }
+
+    pub(crate) fn first_cpu_from_cpuset(cpuset: &str) -> Option<usize> {
+        cpuset
+            .split(',')
+            .map(str::trim)
+            .find(|entry| !entry.is_empty())
+            .and_then(|entry| {
+                entry
+                    .split_once('-')
+                    .map(|(start, _)| start)
+                    .or(Some(entry))
+            })
+            .and_then(|entry| entry.parse::<usize>().ok())
+    }
+
 }
 
 impl ContainerRuntime for RuncRuntime {
     fn create_container(&self, container_id: &str, config: &ContainerConfig) -> Result<String> {
-        unimplemented!()
+        info!("Creating container {}", container_id);
+        let deadline = std::time::Instant::now()
+            + std::time::Duration::from_secs(self.container_create_timeout_secs as u64);
+
+        // 分步 create 链路：prepare_rootfs -> build_spec -> write_bundle。
+        let rootfs_mount = self.prepare_rootfs_mount(container_id, config)?;
+        self.ensure_container_create_not_expired(deadline, "prepare_rootfs")?;
+        let spec = self.build_spec(container_id, config)?;
+        self.ensure_container_create_not_expired(deadline, "build_spec")?;
+        self.write_bundle(container_id, &config.rootfs, &spec)?;
+        self.ensure_container_create_not_expired(deadline, "write_bundle")?;
+
+        // 延迟到start阶段再调用runc，避免create阶段阻塞导致CRI超时。
+        info!("Container {} bundle prepared successfully", container_id);
+        self.create_task_from_prepared_bundle(container_id, rootfs_mount)?;
+        Ok(container_id.to_string())
     }
 
     fn start_container(&self, container_id: &str) -> Result<()> {
-        unimplemented!()
+        info!("Starting container {}", container_id);
+
+        // 与 containerd v2 一致：启用 shim 后，task 生命周期操作必须经 shim RPC。
+        if let Some(ref shim_manager) = self.shim_manager {
+            let bundle_path = self.bundle_path(container_id);
+            shim_manager.start_task(container_id, &bundle_path)?;
+            info!("Container {} started via shim task RPC", container_id);
+        } else {
+            let state = self.get_runc_state(container_id)?;
+            match state {
+                None => {
+                    // runc run -d is used when this container has not been created in runc yet.
+                    let bundle_path = self.bundle_path(container_id);
+                    let bundle_path = bundle_path.to_string_lossy().to_string();
+                    let mut run_args = vec!["run", "-d", "--bundle", bundle_path.as_str()];
+                    if self.no_pivot {
+                        run_args.push("--no-pivot");
+                    }
+                    if self.no_new_keyring {
+                        run_args.push("--no-new-keyring");
+                    }
+                    run_args.push(container_id);
+                    self.runc_exec(&run_args)?;
+                    info!("Container {} started via runc run -d", container_id);
+                }
+                Some(s) if s.status == "created" => {
+                    self.runc_exec(&["start", container_id])?;
+                    info!("Container {} started via runc start", container_id);
+                }
+                Some(s) if s.status == "running" => {
+                    info!("Container {} already running", container_id);
+                }
+                Some(_) => {
+                    self.runc_exec(&["start", container_id])?;
+                    info!("Container {} started via runc start", container_id);
+                }
+            }
+        }
+
+        Ok(())
     }
 
     fn stop_container(&self, container_id: &str, timeout: Option<u32>) -> Result<()> {
-        unimplemented!()
+        info!("Stopping container {}", container_id);
+
+        if let Some(ref shim_manager) = self.shim_manager {
+            let status = shim_manager.status(container_id)?;
+            match status.state {
+                crate::shim_rpc::TaskState::Stopped | crate::shim_rpc::TaskState::Deleted => {
+                    self.wait_for_shim_exit_code(container_id);
+                    info!("Container {} already stopped", container_id);
+                    return Ok(());
+                }
+                crate::shim_rpc::TaskState::Paused => {
+                    shim_manager.resume_task(container_id)?;
+                }
+                crate::shim_rpc::TaskState::Init
+                | crate::shim_rpc::TaskState::Created
+                | crate::shim_rpc::TaskState::Running => {}
+            }
+
+            let timeout_secs = timeout.unwrap_or(self.container_stop_timeout_secs);
+            shim_manager.kill_task(container_id, "TERM", true)?;
+            let graceful_timeout = std::time::Duration::from_secs(timeout_secs as u64);
+            if shim_manager
+                .wait_task(container_id, Some(graceful_timeout))?
+                .is_some()
+            {
+                self.wait_for_shim_exit_code(container_id);
+                info!("Container {} stopped gracefully", container_id);
+                return Ok(());
+            }
+
+            info!(
+                "Container {} did not stop gracefully, sending SIGKILL through shim",
+                container_id
+            );
+            shim_manager.kill_task(container_id, "KILL", true)?;
+            if shim_manager
+                .wait_task(container_id, Some(STOP_KILL_WAIT_TIMEOUT))?
+                .is_none()
+            {
+                return Err(anyhow::anyhow!(
+                    "container {} did not stop after SIGKILL retries",
+                    container_id
+                ));
+            }
+
+            self.wait_for_shim_exit_code(container_id);
+            info!("Container {} stopped", container_id);
+            return Ok(());
+        }
+
+        // 获取当前状态
+        let state = self.get_runc_state(container_id)?;
+
+        match state {
+            None => {
+                self.wait_for_shim_exit_code(container_id);
+                info!("Container {} not found, already stopped", container_id);
+                return Ok(());
+            }
+            Some(s) => {
+                if s.status == "stopped" {
+                    self.wait_for_shim_exit_code(container_id);
+                    info!("Container {} already stopped", container_id);
+                    return Ok(());
+                }
+                if s.status == "paused" {
+                    self.resume_container(container_id)?;
+                }
+            }
+        }
+
+        let timeout_secs = timeout.unwrap_or(self.container_stop_timeout_secs);
+        self.runc_exec(&["kill", container_id, "TERM"])?;
+
+        let graceful_deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs as u64);
+        if self.wait_for_container_stop_until(container_id, graceful_deadline)? {
+            self.wait_for_shim_exit_code(container_id);
+            info!("Container {} stopped gracefully", container_id);
+            return Ok(());
+        }
+
+        info!(
+            "Container {} did not stop gracefully, entering SIGKILL retry loop",
+            container_id
+        );
+        let kill_deadline = std::time::Instant::now() + STOP_KILL_WAIT_TIMEOUT;
+        let mut backoff = STOP_INITIAL_BACKOFF;
+        loop {
+            match self.get_runc_state(container_id)? {
+                None => break,
+                Some(state) if state.status == "stopped" => break,
+                _ => {}
+            }
+
+            if std::time::Instant::now() >= kill_deadline {
+                return Err(anyhow::anyhow!(
+                    "container {} did not stop after SIGKILL retries",
+                    container_id
+                ));
+            }
+
+            let kill_result = self.runc_exec(&["kill", container_id, "KILL"]);
+            if let Err(err) = kill_result {
+                match self.get_runc_state(container_id)? {
+                    None => break,
+                    Some(state) if state.status == "stopped" => break,
+                    _ => debug!(
+                        "SIGKILL retry for container {} failed but container is still present: {}",
+                        container_id, err
+                    ),
+                }
+            }
+
+            let remaining = kill_deadline
+                .checked_duration_since(std::time::Instant::now())
+                .unwrap_or_default();
+            std::thread::sleep(std::cmp::min(backoff, remaining));
+            backoff = std::cmp::min(backoff.saturating_mul(2), STOP_MAX_BACKOFF);
+        }
+
+        self.wait_for_shim_exit_code(container_id);
+        info!("Container {} stopped", container_id);
+        Ok(())
     }
 
     fn remove_container(&self, container_id: &str) -> Result<()> {
-        unimplemented!()
+        info!("Removing container {}", container_id);
+        let rootfs_cleanup_target = self.rootfs_cleanup_target(container_id);
+
+        // 首先停止容器（如果还在运行）
+        let _ = self.stop_container(container_id, None);
+
+        // 删除容器
+        if let Some(ref shim_manager) = self.shim_manager {
+            let _ = shim_manager.delete_task(
+                container_id,
+                Some(container_id),
+                rootfs_cleanup_target.as_deref(),
+            );
+        } else {
+            let output = self.run_command_output(&["delete", container_id])?;
+
+            if !output.status.success() {
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                // 检查是否已经是"container does not exist"错误
+                if stderr.contains("does not exist") {
+                    info!("Container {} does not exist", container_id);
+                } else {
+                    return Err(anyhow::anyhow!("Failed to delete container: {}", stderr));
+                }
+            }
+        }
+
+        // 清理bundle目录
+        let bundle_path = self.bundle_path(container_id);
+        if bundle_path.exists() {
+            std::fs::remove_dir_all(&bundle_path).context("Failed to remove bundle directory")?;
+        }
+        let image_volume_state_dir = self.image_volume_state_dir(container_id);
+        if image_volume_state_dir.exists() {
+            std::fs::remove_dir_all(&image_volume_state_dir)
+                .context("Failed to remove image volume state directory")?;
+        }
+        if self.shim_manager.is_none() {
+            if let Some(container_root_dir) = rootfs_cleanup_target {
+                if container_root_dir.exists() {
+                    std::fs::remove_dir_all(&container_root_dir).with_context(|| {
+                        format!(
+                            "Failed to remove container root directory {}",
+                            container_root_dir.display()
+                        )
+                    })?;
+                }
+            }
+        }
+        let legacy_container_root_dir = self.root.join("containers").join(container_id);
+        if legacy_container_root_dir.exists() {
+            std::fs::remove_dir_all(&legacy_container_root_dir).with_context(|| {
+                format!(
+                    "Failed to remove legacy container root directory {}",
+                    legacy_container_root_dir.display()
+                )
+            })?;
+        }
+        if let Some(mut storage) = self.ledger_storage()? {
+            let _ = storage.replace_runtime_artifacts("container", container_id, &[]);
+            if self.shim_manager.is_none() {
+                let _ = storage.delete_snapshot(container_id);
+            }
+        }
+
+        info!("Container {} removed", container_id);
+        Ok(())
     }
 
     fn container_status(&self, container_id: &str) -> Result<ContainerStatus> {
-        unimplemented!()
+        if let Some(ref shim_manager) = self.shim_manager {
+            let status = shim_manager.status(container_id)?;
+            return match status.state {
+                crate::shim_rpc::TaskState::Created => Ok(ContainerStatus::Created),
+                crate::shim_rpc::TaskState::Running | crate::shim_rpc::TaskState::Paused => {
+                    Ok(ContainerStatus::Running)
+                }
+                crate::shim_rpc::TaskState::Stopped => Ok(ContainerStatus::Stopped(
+                    status.exit_code.unwrap_or_default(),
+                )),
+                crate::shim_rpc::TaskState::Deleted | crate::shim_rpc::TaskState::Init => {
+                    Ok(ContainerStatus::Unknown)
+                }
+            };
+        }
+
+        match self.get_runc_state(container_id)? {
+            None => Ok(ContainerStatus::Unknown),
+            Some(state) => {
+                let status = match state.status.as_str() {
+                    "created" => ContainerStatus::Created,
+                    "running" => ContainerStatus::Running,
+                    "stopped" => ContainerStatus::Stopped(0),
+                    _ => ContainerStatus::Unknown,
+                };
+                Ok(status)
+            }
+        }
     }
 
     fn reopen_container_log(&self, container_id: &str) -> Result<()> {
-        unimplemented!()
+        self.notify_shim_to_reopen_log(container_id)
     }
 
     fn exec_in_container(&self, container_id: &str, command: &[String], tty: bool) -> Result<i32> {
-        unimplemented!()
+        if let Some(ref shim_manager) = self.shim_manager {
+            let affinity_cpu = if self.exec_cpu_affinity == "first" {
+                self.load_bundle_config_value(container_id)
+                    .ok()
+                    .and_then(|config| {
+                        config
+                            .get("linux")
+                            .and_then(|linux| linux.get("resources"))
+                            .and_then(|resources| resources.get("cpu"))
+                            .and_then(|cpu| cpu.get("cpus"))
+                            .and_then(|cpus| cpus.as_str())
+                            .and_then(Self::first_cpu_from_cpuset)
+                    })
+            } else {
+                None
+            };
+            return shim_manager.exec_process(container_id, command, tty, affinity_cpu);
+        }
+        info!(
+            "Executing command in container {}: {:?}",
+            container_id, command
+        );
+
+        let mut cmd = self.runtime_command();
+        cmd.arg("exec");
+
+        if tty {
+            cmd.arg("-t");
+        }
+
+        // 添加容器ID
+        cmd.arg(container_id);
+
+        // 添加命令
+        for arg in command {
+            cmd.arg(arg);
+        }
+
+        let affinity_cpu = if self.exec_cpu_affinity == "first" {
+            self.load_bundle_config_value(container_id)
+                .ok()
+                .and_then(|config| {
+                    config
+                        .get("linux")
+                        .and_then(|linux| linux.get("resources"))
+                        .and_then(|resources| resources.get("cpu"))
+                        .and_then(|cpu| cpu.get("cpus"))
+                        .and_then(|cpus| cpus.as_str())
+                        .and_then(Self::first_cpu_from_cpuset)
+                })
+        } else {
+            None
+        };
+        Self::apply_exec_cpu_affinity_to_std_command(&mut cmd, affinity_cpu);
+
+        // 执行命令并等待结果
+        let output = cmd.output().context("Failed to execute runc exec")?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("exec failed: {}", stderr));
+        }
+
+        // 返回退出码
+        let exit_code = output.status.code().unwrap_or(0);
+        info!(
+            "Command executed in container {} with exit code {}",
+            container_id, exit_code
+        );
+        Ok(exit_code)
     }
 
     fn update_container_resources(
@@ -3076,7 +3535,31 @@ impl ContainerRuntime for RuncRuntime {
         container_id: &str,
         resources: &LinuxContainerResources,
     ) -> Result<()> {
-        unimplemented!()
+        if let Some(ref shim_manager) = self.shim_manager {
+            return shim_manager.update_resources(container_id, resources);
+        }
+        if self.disable_cgroup {
+            return Err(anyhow::anyhow!(
+                "cgroup support is disabled; container resource updates are unavailable"
+            ));
+        }
+        info!(
+            "Updating container {} resources: CPU shares={}, Memory limit={}",
+            container_id, resources.cpu_shares, resources.memory_limit_in_bytes
+        );
+
+        // 将 CRI LinuxContainerResources 转换为 ResourceLimits
+        let limits = Self::cri_to_limits(resources);
+
+        // 使用 CgroupManager 直接更新 cgroup 资源
+        let cgroup_manager = CgroupManager::new(container_id.to_string())
+            .context("Failed to create cgroup manager")?;
+        cgroup_manager
+            .set_resources(&limits)
+            .context("Failed to set cgroup resources")?;
+
+        info!("Container {} resources updated successfully", container_id);
+        Ok(())
     }
 }
 
@@ -3247,4 +3730,13 @@ struct ImageRuntimeDefaults {
     entrypoint: Vec<String>,
     cmd: Vec<String>,
     working_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Error)]
+pub enum LogReopenError {
+    #[error("container {container_id} reopen log control socket {socket_path} is missing")]
+    MissingSocket {
+        container_id: String,
+        socket_path: PathBuf,
+    },
 }

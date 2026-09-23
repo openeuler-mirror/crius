@@ -1030,6 +1030,33 @@ impl ShimManager {
 
         Ok(String::new())
     }
+
+    fn exit_code_file_path(&self, container_id: &str) -> PathBuf {
+        self.config.container_exits_dir.join(container_id)
+    }
+
+    fn read_exit_code_file(path: &Path) -> Result<Option<i32>> {
+        if !path.exists() {
+            return Ok(None);
+        }
+        let content = fs::read_to_string(path)?;
+        let exit_code = content
+            .trim()
+            .parse::<i32>()
+            .context("Failed to parse exit code")?;
+        Ok(Some(exit_code))
+    }
+
+    /// 获取容器的退出码
+    pub fn get_exit_code(&self, container_id: &str) -> Result<Option<i32>> {
+        let processes = self.processes.lock().unwrap();
+
+        if let Some(process) = processes.iter().find(|p| p.container_id == container_id) {
+            return Self::read_exit_code_file(&process.exit_code_file);
+        }
+
+        Self::read_exit_code_file(&self.exit_code_file_path(container_id))
+    }
 }
 
 pub fn default_shim_work_dir() -> PathBuf {
