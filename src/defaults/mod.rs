@@ -175,3 +175,7 @@ pub const INTERNAL_CHECKPOINT_RESTORE_KEY: &str = "io.crius.internal/checkpoint-
 pub const CRIO_LABELS_ANNOTATION: &str = "io.kubernetes.cri-o.Labels";
 pub const INTERNAL_UID_MAPPINGS_MOUNT_OPTION_PREFIX: &str = "__crius_uidmappings=";
 pub const INTERNAL_GID_MAPPINGS_MOUNT_OPTION_PREFIX: &str = "__crius_gidmappings=";
+pub const SHIM_EXIT_CODE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub const STOP_INITIAL_BACKOFF: std::time::Duration = std::time::Duration::from_millis(20);
+pub const STOP_KILL_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+pub const STOP_MAX_BACKOFF: std::time::Duration = std::time::Duration::from_secs(1);
