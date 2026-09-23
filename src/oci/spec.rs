@@ -139,6 +139,153 @@ impl Spec {
             "/proc/sysrq-trigger".to_string(),
         ]
     }
+
+    /// 默认命名空间配置
+    pub fn default_namespaces() -> Vec<Namespace> {
+        vec![
+            Namespace {
+                ns_type: "pid".to_string(),
+                path: None,
+            },
+            Namespace {
+                ns_type: "network".to_string(),
+                path: None,
+            },
+            Namespace {
+                ns_type: "ipc".to_string(),
+                path: None,
+            },
+            Namespace {
+                ns_type: "uts".to_string(),
+                path: None,
+            },
+            Namespace {
+                ns_type: "mount".to_string(),
+                path: None,
+            },
+        ]
+    }
+
+    /// 默认挂载点
+    pub fn default_mounts() -> Vec<Mount> {
+        vec![
+            Mount {
+                destination: "/proc".to_string(),
+                source: Some("proc".to_string()),
+                mount_type: Some("proc".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/sys".to_string(),
+                source: Some("sysfs".to_string()),
+                mount_type: Some("sysfs".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "ro".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/dev".to_string(),
+                source: Some("tmpfs".to_string()),
+                mount_type: Some("tmpfs".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "strictatime".to_string(),
+                    "mode=755".to_string(),
+                    "size=65536k".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/dev/pts".to_string(),
+                source: Some("devpts".to_string()),
+                mount_type: Some("devpts".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "newinstance".to_string(),
+                    "ptmxmode=0666".to_string(),
+                    "mode=0620".to_string(),
+                    "gid=5".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/dev/shm".to_string(),
+                source: Some("tmpfs".to_string()),
+                mount_type: Some("tmpfs".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "mode=1777".to_string(),
+                    "size=65536k".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/dev/mqueue".to_string(),
+                source: Some("mqueue".to_string()),
+                mount_type: Some("mqueue".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/dev/hugepages".to_string(),
+                source: Some("hugetlbfs".to_string()),
+                mount_type: Some("hugetlbfs".to_string()),
+                options: Some(vec![
+                    "rw".to_string(),
+                    "nosuid".to_string(),
+                    "strictatime".to_string(),
+                    "mode=1777".to_string(),
+                    "size=0".to_string(),
+                ]),
+            },
+            Mount {
+                destination: "/sys/fs/cgroup".to_string(),
+                source: Some("cgroup".to_string()),
+                mount_type: Some("cgroup".to_string()),
+                options: Some(vec![
+                    "nosuid".to_string(),
+                    "noexec".to_string(),
+                    "nodev".to_string(),
+                    "relatime".to_string(),
+                    "ro".to_string(),
+                ]),
+            },
+        ]
+    }
+
+    /// 序列化为JSON字符串
+    pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        serde_json::to_string_pretty(self)
+    }
+
+    /// 保存到文件
+    pub fn save(&self, path: impl AsRef<std::path::Path>) -> Result<(), crate::error::Error> {
+        let json = self.to_json()?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// 从JSON字符串解析
+    pub fn from_json(json: &str) -> Result<Self, serde_json::Error> {
+        serde_json::from_str(json)
+    }
+
+    /// 从文件加载
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, crate::error::Error> {
+        let content = std::fs::read_to_string(path)?;
+        let spec = Self::from_json(&content)?;
+        Ok(spec)
+    }
 }
 
 /// 进程配置
