@@ -124,10 +124,10 @@ pub struct RuntimeServiceConfig {
     pub container_stop_timeout: u32,
     pub version_file: PathBuf,
     pub version_file_persist: PathBuf,
-    // pub criu_path: PathBuf,
-    // pub criu_image_path: PathBuf,
-    // pub criu_work_path: PathBuf,
-    // pub enable_criu_support: bool,
+    pub criu_path: PathBuf,
+    pub criu_image_path: PathBuf,
+    pub criu_work_path: PathBuf,
+    pub enable_criu_support: bool,
     pub internal_wipe: bool,
     pub internal_repair: bool,
     pub bind_mount_prefix: PathBuf,
@@ -413,6 +413,50 @@ pub enum RuntimeReloadWatcherStatus {
     Running,
     Backoff,
     Error,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryStageSummary {
+    pub name: String,
+    pub success: bool,
+    pub duration_millis: u64,
+    pub items: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryReconcileSummary {
+    pub reconnected_shims: Vec<String>,
+    pub broken_containers: usize,
+    pub broken_pods: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryOrphanCleanupSummary {
+    pub skipped: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+    pub runtime_bundles_removed: usize,
+    pub pod_workspaces_removed: usize,
+    pub shim_dirs_removed: usize,
+    pub attach_socket_dirs_removed: usize,
+    pub pause_processes_killed: usize,
+    pub failures: usize,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryResultSummary {
+    pub finished_at_unix_millis: i64,
+    pub success: bool,
+    pub total_duration_millis: u64,
+    pub stages: Vec<RecoveryStageSummary>,
+    pub reconcile: RecoveryReconcileSummary,
+    pub orphan_cleanup: RecoveryOrphanCleanupSummary,
 }
 
 #[derive(Clone)]
@@ -918,6 +962,14 @@ impl RuntimeServiceImpl {
 
         output
     }
+
+    pub fn current_reload_state(&self) -> RuntimeReloadState {
+        self.reload_state
+            .lock()
+            .expect("reload state lock poisoned")
+            .clone()
+    }
+
 }
 
 

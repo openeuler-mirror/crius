@@ -509,6 +509,54 @@ impl TableRow for RuntimeVersionView {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConditionView {
+    pub kind: String,
+    pub status: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+impl TableRow for ConditionView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "STATUS", "REASON", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            format_bool(self.status).to_string(),
+            self.reason.clone(),
+            self.message.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeStatusView {
+    pub runtime_ready: bool,
+    pub network_ready: bool,
+    pub conditions: Vec<ConditionView>,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for RuntimeStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME READY", "NETWORK READY", "CONDITIONS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            format_bool(self.runtime_ready).to_string(),
+            format_bool(self.network_ready).to_string(),
+            self.conditions.len().to_string(),
+        ]
+    }
+}
+
 fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         value

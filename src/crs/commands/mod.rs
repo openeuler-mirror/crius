@@ -34,6 +34,7 @@ pub(crate) async fn dispatch(
 ) -> Result<CommandResult, CliError> {
     match command {
         Command::Version(args) => version::handle(ctx, client, args).await,
+        Command::Status(args) => status::handle(ctx, client, args).await,
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
         Command::Rmi { image: image_name } => {

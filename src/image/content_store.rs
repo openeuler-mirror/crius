@@ -368,6 +368,16 @@ impl ContentTransferTracker {
         inner.recent.insert(0, record);
         inner.recent.truncate(Self::RECENT_LIMIT);
     }
+
+    pub fn snapshot(&self) -> ContentTransferStatus {
+        let Ok(inner) = self.inner.lock() else {
+            return ContentTransferStatus::default();
+        };
+        ContentTransferStatus {
+            active: inner.active.clone(),
+            recent: inner.recent.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -477,6 +487,12 @@ impl ContentTransferGuard {
     }
 }
 
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ContentTransferStatus {
+    pub active: Vec<ContentTransferRecord>,
+    pub recent: Vec<ContentTransferRecord>,
+}
 
 fn now_unix_nanos() -> i64 {
     chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default()

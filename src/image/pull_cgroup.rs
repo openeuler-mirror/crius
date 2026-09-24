@@ -274,6 +274,13 @@ impl PullCgroupExecutor {
             CgroupDriverConfig::Cgroupfs => Ok(sanitize_relative_cgroup_path(raw)),
         }
     }
+
+    pub fn last_scope(&self) -> Option<PullCgroupScopeRecord> {
+        self.last_scope
+            .read()
+            .ok()
+            .and_then(|record| record.clone())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]

@@ -59,6 +59,7 @@ pub enum OutputArg {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     Version(VersionArgs),
+    Status(StatusArgs),
     Images(ImageListArgs),
     Pull(ImagePullArgs),
     Rmi {
@@ -201,4 +202,10 @@ pub struct ConfigArgs {
 pub enum ConfigCommand {
     Show,
     ReloadStatus,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct StatusArgs {
+    #[arg(long)]
+    pub verbose: bool,
 }

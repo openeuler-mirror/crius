@@ -17,6 +17,8 @@ limitations under the License.
 
 use std::unimplemented;
 
+use serde::{Serialize, Deserialize};
+
 use tonic::Status;
 use tokio_stream::wrappers::ReceiverStream;
 
@@ -127,9 +129,34 @@ impl EventService {
             log::debug!("Dropping CRI event without subscribers: {}", err);
         }
     }
+
+    pub async fn recent_internal_events(
+        &self,
+        subject_kind: &str,
+        subject_id: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<InternalEvent>> {
+        let Some(ledger) = &self.ledger else {
+            return Ok(Vec::new());
+        };
+        let persistence = ledger.lock().await;
+        let ledger = crate::state::StateLedger::new(&persistence);
+        let mut events = Vec::new();
+        for event in ledger.recent_events_for_subject(subject_kind, subject_id, limit)? {
+            match InternalEvent::from_state_event(event) {
+                Ok(event) => events.push(event),
+                Err(err) => log::debug!("Skipping non-internal ledger event: {}", err),
+            }
+        }
+        Ok(events)
+    }
+
+    pub fn subscriber_count(&self) -> usize {
+        self.sender.receiver_count()
+    }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct InternalEvent {
     pub kind: String,
     pub subject_kind: String,
@@ -193,9 +220,26 @@ impl InternalEvent {
     fn details_for_ledger(&self) -> Option<String> {
         (!self.details.is_null()).then(|| self.details.to_string())
     }
+
+    fn from_state_event(event: crate::storage::StateEvent) -> anyhow::Result<Self> {
+        let details = event
+            .details
+            .as_deref()
+            .map(serde_json::from_str)
+            .transpose()?
+            .unwrap_or(serde_json::Value::Null);
+        Ok(Self {
+            kind: event.event_type,
+            subject_kind: event.entity_type,
+            subject_id: event.entity_id,
+            severity: InternalEventSeverity::parse(&event.new_state)?,
+            timestamp: event.timestamp,
+            details,
+        })
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub enum InternalEventSeverity {
     Debug,
     Info,
@@ -210,6 +254,16 @@ impl InternalEventSeverity {
             Self::Info => "info",
             Self::Warning => "warning",
             Self::Error => "error",
+        }
+    }
+
+    fn parse(value: &str) -> anyhow::Result<Self> {
+        match value {
+            "debug" => Ok(Self::Debug),
+            "info" => Ok(Self::Info),
+            "warning" => Ok(Self::Warning),
+            "error" => Ok(Self::Error),
+            other => anyhow::bail!("invalid internal event severity: {other}"),
         }
     }
 }

@@ -134,3 +134,95 @@ pub struct CapabilitiesConfig {
     /// 删除的能力
     pub drop: Vec<String>,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCapabilityState {
+    Available,
+    Degraded,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostCapabilityProbe {
+    pub name: String,
+    pub state: HostCapabilityState,
+    pub reason: String,
+}
+
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct HostCapabilityReport {
+    pub seccomp: HostCapabilityProbe,
+    pub apparmor: HostCapabilityProbe,
+    pub selinux: HostCapabilityProbe,
+    pub cdi: HostCapabilityProbe,
+    pub blockio: HostCapabilityProbe,
+    pub rdt: HostCapabilityProbe,
+    pub devices: HostCapabilityProbe,
+    pub cgroup: HostCapabilityProbe,
+}
+
+impl HostCapabilityReport {
+    pub fn degraded_probes(&self) -> Vec<&HostCapabilityProbe> {
+        [
+            &self.seccomp,
+            &self.apparmor,
+            &self.selinux,
+            &self.cdi,
+            &self.blockio,
+            &self.rdt,
+            &self.devices,
+            &self.cgroup,
+        ]
+        .into_iter()
+        .filter(|probe| !probe.is_available())
+        .collect()
+    }
+
+    pub fn degraded_capability_names(&self) -> Vec<String> {
+        self.degraded_probes()
+            .into_iter()
+            .map(|probe| probe.name.clone())
+            .collect()
+    }
+
+    pub fn degraded_reasons(&self) -> Vec<String> {
+        self.degraded_probes()
+            .into_iter()
+            .map(|probe| format!("{}: {}", probe.name, probe.reason))
+            .collect()
+    }
+}
+
+impl HostCapabilityProbe {
+    pub fn available(name: &str, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            state: HostCapabilityState::Available,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn degraded(name: &str, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            state: HostCapabilityState::Degraded,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn unavailable(name: &str, reason: impl Into<String>) -> Self {
+        Self {
+            name: name.to_string(),
+            state: HostCapabilityState::Unavailable,
+            reason: reason.into(),
+        }
+    }
+
+    pub fn is_available(&self) -> bool {
+        self.state == HostCapabilityState::Available
+    }
+}

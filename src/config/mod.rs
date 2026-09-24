@@ -558,7 +558,7 @@ pub struct RuntimeWorkloadResources {
 }
 
 /// 守护进程 cgroup driver 配置。
-#[derive(Debug, Clone, Deserialize, Copy, Serialize, PartialEq)]
+#[derive(Debug, Clone, Deserialize, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum CgroupDriverConfig {
     Systemd,
