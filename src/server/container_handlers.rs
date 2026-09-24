@@ -163,7 +163,18 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        unimplemented!()
+        log::info!("CreateContainer called");
+        let req = request.into_inner();
+        let pod_sandbox_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        let config = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("Container config not specified"))?;
+        self.create_container_from_input(ContainerCreateInput {
+            config,
+            sandbox_config: req.sandbox_config,
+            owner: ContainerOwner::Pod { pod_sandbox_id },
+        })
+        .await
     }
 
     async fn create_container_from_input(

@@ -18,6 +18,7 @@ pub(crate) mod shortcuts;
 pub(crate) mod image;
 pub(crate) mod status;
 pub(crate) mod config;
+pub(crate) mod version;
 
 use std::unimplemented;
 
@@ -32,7 +33,7 @@ pub(crate) async fn dispatch(
     command: Command,
 ) -> Result<CommandResult, CliError> {
     match command {
-        Command::Version(args) => unimplemented!(),
+        Command::Version(args) => version::handle(ctx, client, args).await,
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
         Command::Rmi { image: image_name } => {

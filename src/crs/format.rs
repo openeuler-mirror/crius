@@ -487,6 +487,28 @@ impl TableRow for ImageConfigView {
     }
 }
 
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeVersionView {
+    pub runtime_name: String,
+    pub runtime_version: String,
+    pub runtime_api_version: String,
+}
+
+impl TableRow for RuntimeVersionView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME", "VERSION", "API VERSION"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.runtime_name.clone(),
+            self.runtime_version.clone(),
+            self.runtime_api_version.clone(),
+        ]
+    }
+}
+
 fn string_pointer(value: Option<&Value>, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         value

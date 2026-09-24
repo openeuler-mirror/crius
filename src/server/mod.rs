@@ -656,4 +656,31 @@ impl RuntimeServiceImpl {
             ts
         }
     }
+
+    async fn resolve_pod_sandbox_id(&self, requested_id: &str) -> Result<String, Status> {
+        if let Ok(removed) = self.removed_pod_sandbox_ids.lock() {
+            if removed.contains(requested_id) {
+                return Err(Status::not_found("Pod sandbox not found"));
+            }
+        }
+        let pod_sandboxes = self.pod_sandboxes.lock().await;
+        if pod_sandboxes.contains_key(requested_id) {
+            return Ok(requested_id.to_string());
+        }
+
+        let matches: Vec<String> = pod_sandboxes
+            .keys()
+            .filter(|id| id.starts_with(requested_id))
+            .cloned()
+            .collect();
+
+        match matches.len() {
+            0 => Err(Status::not_found("Pod sandbox not found")),
+            1 => Ok(matches[0].clone()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous pod sandbox id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
 }

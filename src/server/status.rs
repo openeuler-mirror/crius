@@ -135,4 +135,12 @@ impl RuntimeServiceImpl {
             }),
         })
     }
+
+    pub(super) fn cri_runtime_name(&self) -> &'static str {
+        env!("CARGO_PKG_NAME")
+    }
+
+    pub(super) fn cri_runtime_version(&self) -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
 }

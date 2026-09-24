@@ -929,12 +929,17 @@ impl RuntimeServiceImpl {
 impl RuntimeService for RuntimeServiceImpl {
     // ---- PodSandbox 生命周期 ----
 
-    // TODO: 返回运行时名称、版本及 API 版本
+    // 返回运行时名称、版本及 API 版本
     async fn version(
         &self,
         _request: tonic::Request<VersionRequest>,
     ) -> std::result::Result<tonic::Response<VersionResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("version: not implemented"))
+        Ok(Response::new(VersionResponse {
+            version: self.cri_runtime_version().to_string(),
+            runtime_name: self.cri_runtime_name().to_string(),
+            runtime_version: self.cri_runtime_version().to_string(),
+            runtime_api_version: "v1".to_string(),
+        }))
     }
 
     // TODO: 创建并启动 Pod 沙箱
