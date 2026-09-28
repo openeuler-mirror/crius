@@ -55,6 +55,8 @@ use crate::defaults::{
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
     INTERNAL_POD_STATE_KEY,
     CHECKPOINT_LOCATION_ANNOTATION_KEY,
+    CRIO_RUNTIME_HANDLER_ANNOTATION,
+    CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
 };
 
 enum ContainerOwner {
@@ -799,7 +801,7 @@ impl RuntimeServiceImpl {
                     .await
                     .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
                     .map_err(|e| {
-                        Status::internal(format!("Failed to prepare container rootfs: {}", e))
+                        Status::internal(format!("Failed to prepare container rootfs: {:?}", e))
                     })
                 })
                 .await
@@ -1050,7 +1052,73 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let container_id = req.container_id;
+
+        log::info!("Starting container {}", container_id);
+
+        let (runtime_handler, pod_sandbox_id) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            let handler = container
+                .annotations
+                .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+                .or_else(|| container.annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("")
+                .to_string();
+            (handler, container.pod_sandbox_id.clone())
+        };
+
+        let runtime_backend = self
+            .runtime
+            .runtime_for_handler(&runtime_handler)
+            .map_err(|e| Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e)))?;
+
+        let task_container_id = container_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            runtime_backend.task_controller().start_container(&task_container_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?;
+
+        match result {
+            Ok(()) => {
+                let mut containers = self.containers.lock().await;
+                if let Some(container) = containers.get_mut(&container_id) {
+                    container.state = ContainerState::ContainerRunning as i32;
+                }
+                drop(containers);
+
+                self.publish_container_lifecycle_event(
+                    &container_id,
+                    "start_complete",
+                    InternalEventSeverity::Info,
+                    json!({
+                        "podSandboxId": pod_sandbox_id,
+                    }),
+                )
+                .await;
+
+                log::info!("Container {} started", container_id);
+                Ok(Response::new(StartContainerResponse {}))
+            }
+            Err(e) => {
+                self.publish_container_lifecycle_event(
+                    &container_id,
+                    "start_failed",
+                    InternalEventSeverity::Error,
+                    json!({
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                Err(Status::internal(format!("Failed to start container: {}", e)))
+            }
+        }
     }
 
     pub(super) async fn update_container_resources(
@@ -1190,7 +1258,9 @@ impl RuntimeServiceImpl {
     ) -> Result<NameReservationGuard, Status> {
         match self.reserve_container_name(container_id, name) {
             Ok(guard) => Ok(guard),
-            Err(status)if status.code() == tonic::Code::AlreadyExists => unimplemented!(),
+            Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                Err(Status::already_exists(format!("container name {} is already in use", name)))
+            }
             Err(status) => Err(status),
         }
     }

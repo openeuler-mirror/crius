@@ -370,19 +370,34 @@ impl FilesystemSnapshotter {
     }
 
     fn resolve_image(&self, image_ref: &str) -> Result<(ImageMeta, PathBuf)> {
-        self.metadata_store
-            .find_by_reference(image_ref, |image, requested_ref| {
+        let requested_ref = image_ref.trim();
+        let result = self.metadata_store
+            .find_by_reference(requested_ref, |image, requested_ref| {
                 if image.id == requested_ref {
                     return true;
                 }
-                image.repo_tags.iter().any(|tag| tag == requested_ref)
+                image.repo_tags.iter().any(|tag| {
+                    tag == requested_ref
+                        || tag.ends_with(&format!("/{requested_ref}"))
+                        || requested_ref.ends_with(&format!("/{tag}"))
+                        || tag.starts_with(requested_ref)
+                        || requested_ref.starts_with(tag)
+                })
                     || image
                         .repo_digests
                         .iter()
-                        .any(|digest| digest == requested_ref)
+                        .any(|digest| {
+                            digest == requested_ref
+                                || digest.starts_with(requested_ref)
+                                || requested_ref.starts_with(digest)
+                        })
                     || image.id.starts_with(requested_ref)
-            })?
-            .map(|record| (record.meta, record.record_dir))
+            })?;
+        match &result {
+            Some(record) => log::debug!("resolve_image: found image {} for ref {}", record.meta.id, image_ref),
+            None => log::warn!("resolve_image: image {} not found locally (storage_root={})", image_ref, self.metadata_store.storage_root().display()),
+        }
+        result.map(|record| (record.meta, record.record_dir))
             .ok_or_else(|| anyhow::anyhow!("image {image_ref} is not present locally"))
     }
 

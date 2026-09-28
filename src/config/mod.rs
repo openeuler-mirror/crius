@@ -713,7 +713,7 @@ impl Default for RuntimeConfig {
             pinns_path: String::new(),
             drop_infra_ctr: false,
             cgroup_driver: None,
-            shim_path: "/usr/bin/crius-shim".to_string(),
+            shim_path: "/usr/local/bin/crius-shim".to_string(),
             monitor_cgroup: String::new(),
             shim_dir: DEFAULT_RUNTIME_SHIM_DIR.to_string(),
             attach_socket_dir: DEFAULT_RUNTIME_ATTACH_SOCKET_DIR.to_string(),

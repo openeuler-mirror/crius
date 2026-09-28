@@ -1155,10 +1155,14 @@ impl RuncRuntime {
             crate::image::content_store::FsContentStore::new_with_ledger(
                 &self.image_storage_root,
                 self.state_db_path.clone(),
-            )?,
+            ).with_context(|| format!("FsContentStore::new_with_ledger failed: root={}", self.image_storage_root.display()))?,
             self.state_db_path.clone(),
         );
-        snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
+        snapshotter.prepare(container_id, image_ref, rootfs_dir)
+            .with_context(|| format!("snapshotter.prepare failed: image_ref={image_ref}, rootfs={}, metadata_store_root={}, content_store_root={}",
+                rootfs_dir.display(),
+                self.image_storage_root.join("images").display(),
+                self.image_storage_root.display()))?;
         self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
         let mount = if self.state_db_path.is_some() {
             PreparedRootfsMount::from(snapshotter.mount(container_id)?)
@@ -1189,7 +1193,10 @@ impl RuncRuntime {
             .unwrap_or(config.image.as_str());
         let mount = self
             .prepare_rootfs_from_image(image_ref, &config.rootfs, container_id)
-            .context("Failed to prepare rootfs from image")?;
+            .with_context(|| format!("Failed to prepare rootfs from image {image_ref} (storage_root={}, state_db={:?}, rootfs={})",
+                self.image_storage_root.display(),
+                self.state_db_path,
+                config.rootfs.display()))?;
         self.ensure_mount_targets(&config.rootfs, &config.mounts)
             .context("Failed to prepare mount targets")?;
         Ok(mount)

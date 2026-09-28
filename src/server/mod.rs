@@ -394,12 +394,11 @@ impl RuntimeServiceImpl {
 
     fn effective_apparmor_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Result<Option<String>, Status> {
-        let security = Self::security_availability();
-        unimplemented!()
+        Ok(None)
     }
 
     #[allow(deprecated)]
@@ -413,30 +412,29 @@ impl RuntimeServiceImpl {
 
     fn effective_selinux_label_from_proto(
         &self,
-        options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
-        host_network: bool,
-        auto_level_seed: Option<&str>,
+        _options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
+        _host_network: bool,
+        _auto_level_seed: Option<&str>,
     ) -> Option<String> {
-        let security = Self::security_availability();
-        unimplemented!()
+        None
     }
 
     fn effective_seccomp_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Option<SeccompProfile> {
-        unimplemented!()
+        None
     }
 
     fn effective_stored_seccomp_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Option<StoredSecurityProfile> {
-        unimplemented!()
+        None
     }
 
     #[allow(deprecated)]

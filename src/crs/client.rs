@@ -65,7 +65,7 @@ impl CrsClient {
         client.runtime = Some(RuntimeServiceClient::new(channel.clone()));
         client.image = Some(ImageServiceClient::new(channel.clone()));
         // client.diagnostics = Some(DiagnosticsServiceClient::new(channel.clone()));
-        // client.local = Some(LocalServiceClient::new(channel));
+        client.local = Some(LocalServiceClient::new(channel));
         Ok(client)
     }
 
@@ -136,6 +136,16 @@ impl CrsClient {
     #[allow(dead_code)]
     pub(crate) fn diagnostics_unavailable(&self) -> CliError {
         CliError::diagnostics_unavailable(self.endpoint())
+    }
+
+    #[allow(dead_code, clippy::result_large_err)]
+    pub(crate) fn local(&self) -> Result<LocalServiceClient<Channel>, CliError> {
+        self.local.clone().ok_or_else(|| {
+            CliError::daemon_unavailable(
+                self.endpoint(),
+                "local service client is not connected; this crius daemon may not support native local containers",
+            )
+        })
     }
 }
 

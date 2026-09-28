@@ -55,7 +55,12 @@ pub struct SecurityManager {
 impl SecurityManager {
     /// 创建新的安全管理器
     pub fn new() -> Self {
-        unimplemented!()
+        Self {
+            selinux_available: false,
+            apparmor_available: false,
+            seccomp_available: false,
+            _default_config: SecurityConfig::default(),
+        }
     }
 }
 

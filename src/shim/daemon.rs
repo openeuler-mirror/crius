@@ -1115,12 +1115,13 @@ impl Daemon {
             target.to_string()
         };
 
-        move_pid_to_cgroup(std::process::id(), &cgroup_target).with_context(|| {
-            format!(
-                "failed to move shim {} into monitor cgroup {}",
-                self.container_id, cgroup_target
-            )
-        })
+        move_pid_to_cgroup(std::process::id(), &cgroup_target).map_err(|err| {
+            log::warn!(
+                "failed to move shim {} into monitor cgroup {}: {}; continuing without monitor cgroup",
+                self.container_id, cgroup_target, err
+            );
+        }).ok();
+        Ok(())
     }
 
     fn load_container_state(&self, config: &ShimBundleConfig) -> Option<ShimStoredContainerState> {

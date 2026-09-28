@@ -189,3 +189,5 @@ pub const RDT_CONTAINER_ANNOTATION: &str = "io.kubernetes.cri.rdt-class";
 pub const RDT_POD_ANNOTATION: &str = "rdt.resources.beta.kubernetes.io/pod";
 pub const RDT_POD_CONTAINER_PREFIX: &str = "rdt.resources.beta.kubernetes.io/container.";
 pub const STATUS_RECENT_NETWORK_EVENT_LIMIT: usize = 16;
+pub const STOPPED_STREAMING_STATUS_WAIT: Duration = Duration::from_secs(2);
+pub const STOPPED_STREAMING_STATUS_POLL: Duration = Duration::from_millis(100);

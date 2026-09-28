@@ -24,6 +24,7 @@ pub(crate) mod commands;
 pub(crate) mod format;
 pub(crate) mod ids;
 pub(crate) mod builders;
+pub(crate) mod streaming;
 
 use std::ffi::OsString;
 

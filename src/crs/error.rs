@@ -94,6 +94,14 @@ impl CommandResult {
             Self::Exit { code } | Self::ContainerExit { code } => code,
         }
     }
+    
+    pub fn from_code(exit_code: i32) -> Self {
+        Self::Exit { code: exit_code }
+    }
+
+    pub fn container_exit(code: i32) -> Self {
+        Self::ContainerExit { code }
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize)]

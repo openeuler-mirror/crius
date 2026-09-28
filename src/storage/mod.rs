@@ -210,6 +210,75 @@ impl StorageManager {
             [],
         )?;
 
+        // 快照表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshots (
+                key TEXT PRIMARY KEY,
+                image_id TEXT NOT NULL,
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mountpoint TEXT NOT NULL,
+                snapshotter TEXT NOT NULL,
+                runtime_managed INTEGER NOT NULL DEFAULT 0
+            )",
+                [],
+            )
+            .context("Failed to create snapshots table")?;
+
+        // 运行时产物表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS runtime_artifacts (
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                runtime_handler TEXT,
+                runtime_root TEXT,
+                PRIMARY KEY(owner_kind, owner_id, artifact_kind, path)
+            )",
+                [],
+            )
+            .context("Failed to create runtime_artifacts table")?;
+
+        // shim 进程表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS shim_processes (
+                container_id TEXT PRIMARY KEY,
+                shim_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                socket_path TEXT NOT NULL,
+                exit_code_file TEXT NOT NULL,
+                log_file TEXT NOT NULL,
+                bundle_path TEXT NOT NULL,
+                state TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create shim_processes table")?;
+
+        // 事件表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL DEFAULT 'container',
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                old_state TEXT,
+                new_state TEXT,
+                timestamp INTEGER NOT NULL,
+                details TEXT
+            )",
+                [],
+            )
+            .context("Failed to create events table")?;
+
         debug!("Database tables initialized");
         Ok(())
     }
