@@ -23,8 +23,11 @@ use crate::crs::{
     args::{
         ImageListArgs, ImagePullArgs, 
         InspectArgs, ObjectType,
+        ListArgs, ContainerListArgs,
     },
-    CommandResult,commands::CliError
+    CommandResult,commands::{
+        CliError, container,
+    },
 };
 
 pub(crate) async fn handle_images(
@@ -185,4 +188,20 @@ fn not_found_error(
     .with_command(command_name)
     .with_endpoint(client.endpoint())
     .with_object(format!("{object_type} {target}"))
+}
+
+pub(crate) async fn handle_ps(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ListArgs,
+) -> Result<CommandResult, CliError> {
+    container::handle_list(
+        ctx,
+        client,
+        ContainerListArgs {
+            all: args.all,
+            ..Default::default()
+        },
+    )
+    .await
 }

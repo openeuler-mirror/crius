@@ -45,7 +45,10 @@ use crate::server::state_model::{
 };
 use crate::network::{NetworkManager, DefaultNetworkManager};
 use crate::server::{annotations, CgroupResourceSupport};
-use crate::runtime::{MountConfig, ContainerConfig, NamespacePaths, ContainerRuntime};
+use crate::runtime::{
+    MountConfig, ContainerConfig, NamespacePaths, 
+    ContainerRuntime, ContainerStatus,
+};
 use crate::security::devices::DeviceMapping;
 use crate::runtime::backend::RuntimeContextKind;
 use crate::defaults::INTERNAL_CONTAINER_STATE_KEY;
@@ -1681,5 +1684,93 @@ impl RuntimeServiceImpl {
         );
     }
 
+    pub(super) async fn finalize_container_stop_state(
+        &self,
+        container_id: &str,
+        final_runtime_status: ContainerStatus,
+    ) -> Result<Option<Container>, Status> {
+        let mut resolved_exit_code = match &final_runtime_status {
+            ContainerStatus::Stopped(code) => Some(*code),
+            _ => None,
+        };
+
+        let updated_container = {
+            let mut containers = self.containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(None);
+            };
+
+            container.state = match &final_runtime_status {
+                ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+                ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+                ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+                ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+            };
+            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            ) {
+                match &final_runtime_status {
+                    ContainerStatus::Created => {}
+                    ContainerStatus::Running => {
+                        state.finished_at = None;
+                        state.exit_code = None;
+                    }
+                    ContainerStatus::Stopped(_) | ContainerStatus::Unknown => {
+                        state.finished_at.get_or_insert(Self::now_nanos());
+                        if resolved_exit_code.is_none() {
+                            resolved_exit_code = state.exit_code;
+                        }
+                        if let Some(code) = resolved_exit_code {
+                            state.exit_code = Some(code);
+                        }
+                    }
+                }
+                if let Err(err) = Self::insert_internal_state(
+                    &mut container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                    &state,
+                ) {
+                    log::warn!(
+                        "Failed to persist in-memory container state for {}: {}",
+                        container_id,
+                        err
+                    );
+                }
+            }
+            if container.state == ContainerState::ContainerUnknown as i32
+                && resolved_exit_code.is_some()
+            {
+                container.state = ContainerState::ContainerExited as i32;
+            }
+
+            Some(container.clone())
+        };
+
+        let persistence_status = match &final_runtime_status {
+            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+            ContainerStatus::Stopped(_) => {
+                crate::runtime::ContainerStatus::Stopped(resolved_exit_code.unwrap_or(-1))
+            }
+            ContainerStatus::Unknown => match resolved_exit_code {
+                Some(code) => crate::runtime::ContainerStatus::Stopped(code),
+                None => crate::runtime::ContainerStatus::Unknown,
+            },
+        };
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
+            log::error!(
+                "Failed to update container {} state in database: {}",
+                container_id,
+                err
+            );
+        }
+        drop(persistence);
+
+        Ok(updated_container)
+    }
     
 }

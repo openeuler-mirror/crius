@@ -31,12 +31,19 @@ use crate::proto::runtime::v1::{
     StatusRequest, StatusResponse, ContainerState,
     NamespaceMode, PodIp, LinuxPodSandboxStatus,
     NamespaceOption, Namespace, RuntimeStatus,
+    Container, ContainerMetadata, ImageSpec,
+
 };
+use crate::runtime::ContainerStatus;
 use crate::server::state_model::
 {
-    StoredPodState, StoredNamespaceOptions
+    StoredPodState, StoredNamespaceOptions,
+    StoredContainerState,
 };
-use crate::defaults::STATUS_RECENT_NETWORK_EVENT_LIMIT;
+use crate::defaults::{
+    STATUS_RECENT_NETWORK_EVENT_LIMIT,
+    INTERNAL_CONTAINER_STATE_KEY,
+};
 
 impl RuntimeServiceImpl {
 
@@ -44,7 +51,139 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<ListContainersRequest>,
     ) -> Result<Response<ListContainersResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let filter = if let Some(mut filter) = req.filter {
+            if !filter.id.is_empty() {
+                let Some(resolved_id) = self.resolve_container_id_for_filter(&filter.id).await
+                else {
+                    return Ok(Response::new(ListContainersResponse {
+                        containers: Vec::new(),
+                    }));
+                };
+                filter.id = resolved_id;
+            }
+
+            if !filter.pod_sandbox_id.is_empty() {
+                let Some(resolved_pod_id) = self
+                    .resolve_pod_sandbox_id_for_filter(&filter.pod_sandbox_id)
+                    .await
+                else {
+                    return Ok(Response::new(ListContainersResponse {
+                        containers: Vec::new(),
+                    }));
+                };
+                filter.pod_sandbox_id = resolved_pod_id;
+            }
+
+            Some(filter)
+        } else {
+            None
+        };
+        let pod_meta_by_id: HashMap<String, (String, String, String, Option<String>)> = {
+            let pod_sandboxes = self.pod_sandboxes.lock().await;
+            pod_sandboxes
+                .iter()
+                .map(|(id, pod)| {
+                    let (name, namespace, uid) = pod
+                        .metadata
+                        .as_ref()
+                        .map(|m| (m.name.clone(), m.namespace.clone(), m.uid.clone()))
+                        .unwrap_or_else(|| {
+                            ("unknown".to_string(), "default".to_string(), id.clone())
+                        });
+                    (
+                        id.clone(),
+                        (name, namespace, uid, pod.labels.get("component").cloned()),
+                    )
+                })
+                .collect()
+        };
+        let container_snapshots: Vec<Container> = {
+            let containers = self.containers.lock().await;
+            containers.values().cloned().collect()
+        };
+
+        let mut containers_list = Vec::with_capacity(container_snapshots.len());
+        for mut c in container_snapshots {
+            if c.metadata.is_none() {
+                c.metadata = Some(ContainerMetadata {
+                    name: c.id.clone(),
+                    attempt: 1,
+                });
+            }
+            if c.image.is_none() {
+                c.image = Some(ImageSpec {
+                    image: c.image_ref.clone(),
+                    ..Default::default()
+                });
+            }
+            if let Some((pod_name, pod_namespace, pod_uid, component)) =
+                pod_meta_by_id.get(&c.pod_sandbox_id)
+            {
+                c.labels
+                    .entry("io.kubernetes.pod.name".to_string())
+                    .or_insert_with(|| pod_name.clone());
+                c.labels
+                    .entry("io.kubernetes.pod.namespace".to_string())
+                    .or_insert_with(|| pod_namespace.clone());
+                c.labels
+                    .entry("io.kubernetes.pod.uid".to_string())
+                    .or_insert_with(|| pod_uid.clone());
+                if let Some(component) = component.as_ref() {
+                    c.labels
+                        .entry("component".to_string())
+                        .or_insert_with(|| component.clone());
+                }
+            }
+            c.created_at = Self::normalize_timestamp_nanos(c.created_at);
+            let runtime_status = self.runtime_container_status_checked(&c.id).await;
+            if matches!(runtime_status, crate::runtime::ContainerStatus::Stopped(_)) {
+                if let Some(updated) = self
+                    .finalize_container_stop_state(&c.id, runtime_status.clone())
+                    .await?
+                {
+                    c = updated;
+                }
+            }
+            c.state = Self::effective_runtime_state_for_container(&c, runtime_status);
+            if let Some((pod_name, pod_namespace, pod_uid, component)) =
+                pod_meta_by_id.get(&c.pod_sandbox_id)
+            {
+                c.labels
+                    .entry("io.kubernetes.pod.name".to_string())
+                    .or_insert_with(|| pod_name.clone());
+                c.labels
+                    .entry("io.kubernetes.pod.namespace".to_string())
+                    .or_insert_with(|| pod_namespace.clone());
+                c.labels
+                    .entry("io.kubernetes.pod.uid".to_string())
+                    .or_insert_with(|| pod_uid.clone());
+                if let Some(component) = component.as_ref() {
+                    c.labels
+                        .entry("component".to_string())
+                        .or_insert_with(|| component.clone());
+                }
+            }
+            c.annotations = Self::external_container_annotations(&c.annotations);
+            containers_list.push(c);
+        }
+        let mut containers_list: Vec<_> = containers_list
+            .into_iter()
+            .filter(|c| {
+                if let Some(f) = &filter {
+                    Self::container_matches_filter(c, f)
+                } else {
+                    true
+                }
+            })
+            .collect();
+        if filter.as_ref().is_none_or(|f| f.id.is_empty()) {
+            containers_list = Self::retain_best_logical_containers(containers_list);
+        }
+
+        Ok(Response::new(ListContainersResponse {
+            containers: containers_list,
+        }))
     }
 
     pub(super) async fn container_status(
@@ -690,5 +829,136 @@ impl RuntimeServiceImpl {
 
     pub(super) fn cri_runtime_version(&self) -> &'static str {
         env!("CARGO_PKG_VERSION")
+    }
+
+    async fn runtime_container_status_checked(&self, container_id: &str) -> ContainerStatus {
+        let runtime = match self.runtime_for_container_request(container_id).await {
+            Ok(runtime) => runtime,
+            Err(_) => return ContainerStatus::Unknown,
+        };
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_status(&container_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(ContainerStatus::Unknown)
+    }
+
+    pub(super) fn effective_runtime_state_for_container(
+        container: &Container,
+        runtime_status: crate::runtime::ContainerStatus,
+    ) -> i32 {
+        let runtime_state = Self::map_runtime_container_state(runtime_status);
+        if runtime_state != ContainerState::ContainerUnknown as i32 {
+            return runtime_state;
+        }
+
+        let stored_state = container.state;
+        if stored_state == ContainerState::ContainerExited as i32
+            || stored_state == ContainerState::ContainerRunning as i32
+            || stored_state == ContainerState::ContainerCreated as i32
+        {
+            return stored_state;
+        }
+
+        let container_state = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        );
+        if container_state
+            .as_ref()
+            .and_then(|state| state.finished_at)
+            .is_some()
+            || container_state
+                .as_ref()
+                .and_then(|state| state.exit_code)
+                .is_some()
+        {
+            return ContainerState::ContainerExited as i32;
+        }
+
+        ContainerState::ContainerUnknown as i32
+    }
+
+    pub(super) fn container_matches_filter(
+        container: &Container,
+        filter: &crate::proto::runtime::v1::ContainerFilter,
+    ) -> bool {
+        if !(filter.id.is_empty()
+            || container.id == filter.id
+            || container.id.starts_with(&filter.id)
+            || filter.id.starts_with(&container.id))
+        {
+            return false;
+        }
+
+        if let Some(state) = &filter.state {
+            if container.state != state.state {
+                return false;
+            }
+        }
+
+        if !(filter.pod_sandbox_id.is_empty()
+            || container.pod_sandbox_id == filter.pod_sandbox_id
+            || container.pod_sandbox_id.starts_with(&filter.pod_sandbox_id)
+            || filter.pod_sandbox_id.starts_with(&container.pod_sandbox_id))
+        {
+            return false;
+        }
+
+        for (k, v) in &filter.label_selector {
+            if container.labels.get(k) != Some(v) {
+                return false;
+            }
+        }
+
+        true
+    }
+
+    pub(super) fn container_identity_key(container: &Container) -> Option<String> {
+        let metadata = container.metadata.as_ref()?;
+        let pod_uid = container
+            .labels
+            .get("io.kubernetes.pod.uid")
+            .filter(|uid| !uid.is_empty())?;
+        Some(format!("{}\u{1f}{}", pod_uid, metadata.name))
+    }
+
+    pub(super) fn container_rank(container: &Container) -> (u8, i64) {
+        let live = matches!(
+            container.state,
+            x if x == ContainerState::ContainerRunning as i32
+                || x == ContainerState::ContainerCreated as i32
+        ) as u8;
+        (live, container.created_at)
+    }
+
+    pub(super) fn retain_best_logical_containers(containers: Vec<Container>) -> Vec<Container> {
+        let mut best: HashMap<String, Container> = HashMap::new();
+        let mut passthrough = Vec::new();
+
+        for container in containers {
+            let Some(identity) = Self::container_identity_key(&container) else {
+                passthrough.push(container);
+                continue;
+            };
+
+            match best.entry(identity) {
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    if Self::container_rank(&container) > Self::container_rank(entry.get()) {
+                        entry.insert(container);
+                    }
+                }
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    entry.insert(container);
+                }
+            }
+        }
+
+        let mut deduped: Vec<_> = best.into_values().collect();
+        deduped.extend(passthrough);
+        deduped
     }
 }

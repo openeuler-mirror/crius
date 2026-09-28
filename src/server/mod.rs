@@ -39,9 +39,11 @@ use crate::server::service::{
     RuntimeServiceConfig, RuntimeServiceImpl,
     ContainerCreateDeadline,
 };
-use crate::runtime::backend::RuntimeBackend;
-use crate::runtime::shim_manager::ShimConfig;
-use crate::runtime::SeccompProfile;
+use crate::runtime::{
+    backend::RuntimeBackend,
+    shim_manager::ShimConfig,
+    SeccompProfile, ContainerStatus,
+};
 use crate::server::state_model::{
     StoredSecurityProfile, CgroupResourceSupport,
     StoredLinuxResources,
@@ -683,6 +685,96 @@ impl RuntimeServiceImpl {
                 "ambiguous pod sandbox id prefix: {}",
                 requested_id
             ))),
+        }
+    }
+
+    async fn resolve_container_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_container_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn resolve_container_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_container_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                self.resolve_persisted_container_id_if_exists(requested_id)
+                    .await
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn resolve_persisted_container_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        let persistence = self.persistence.lock().await;
+        let records = crate::state::StateLedger::new(&persistence)
+            .container_records()
+            .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
+        drop(persistence);
+
+        if let Ok(removed) = self.removed_container_ids.lock() {
+            if removed.contains(requested_id) {
+                return Ok(None);
+            }
+        }
+        if records.iter().any(|record| record.id == requested_id) {
+            return Ok(Some(requested_id.to_string()));
+        }
+
+        let matches: Vec<String> = records
+            .into_iter()
+            .filter(|record| {
+                self.removed_container_ids
+                    .lock()
+                    .ok()
+                    .map(|removed| !removed.contains(&record.id))
+                    .unwrap_or(true)
+            })
+            .filter(|record| record.id.starts_with(requested_id))
+            .map(|record| record.id)
+            .collect();
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous container id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
+
+    async fn resolve_pod_sandbox_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_pod_sandbox_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn resolve_pod_sandbox_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_pod_sandbox_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
+    fn map_runtime_container_state(status: crate::runtime::ContainerStatus) -> i32 {
+        match status {
+            ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+            ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+            ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+            ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
         }
     }
 }

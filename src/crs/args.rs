@@ -62,6 +62,7 @@ pub enum Command {
     Status(StatusArgs),
     Images(ImageListArgs),
     Run(Box<RunArgs>),
+    Ps(ListArgs),
     Pull(ImagePullArgs),
     Rmi {
         image: String,
@@ -70,6 +71,34 @@ pub enum Command {
     Inspect(InspectArgs),
     Debug(DebugArgs),
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ListArgs {
+    #[arg(short = 'a', long)]
+    pub all: bool,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum ContainerStateArg {
+    Created,
+    Running,
+    Exited,
+    Unknown,
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerListArgs {
+    #[arg(long)]
+    pub id: Option<String>,
+    #[arg(long, help = "Join an existing local Pod sandbox")]
+    pub pod: Option<String>,
+    #[arg(long, value_enum)]
+    pub state: Option<ContainerStateArg>,
+    #[arg(short = 'l', long = "label")]
+    pub labels: Vec<String>,
+    #[arg(long)]
+    pub all: bool,
 }
 
 #[derive(Debug, Default, ClapArgs)]
