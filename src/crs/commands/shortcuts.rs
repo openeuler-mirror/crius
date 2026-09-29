@@ -150,12 +150,12 @@ pub(crate) async fn handle_inspect(
     args: InspectArgs,
 ) -> Result<CommandResult, CliError> {
     match args.object_type {
-        Some(ObjectType::Container) => unimplemented!(),
+        Some(ObjectType::Container) => container::handle_inspect(ctx, client, args.target).await,
         Some(ObjectType::Pod) => unimplemented!(),
         Some(ObjectType::Image) => image::handle_inspect(ctx, client, args.target).await,
         None => match resolve_inspect_target(client, &args.target).await? {
             InspectCandidate::Container => {
-                unimplemented!()
+                container::handle_inspect(ctx, client, args.target).await
             }
             InspectCandidate::Pod => unimplemented!(),
             InspectCandidate::Image => image::handle_inspect(ctx, client, args.target).await,

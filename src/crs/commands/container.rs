@@ -18,7 +18,7 @@ limitations under the License.
 use crate::proto::runtime::v1::{
     ListContainersRequest, ContainerFilter,
     ContainerStateValue, ContainerState,
-    Container, ExecSyncRequest,
+    Container, ExecSyncRequest, ContainerStatusRequest,
 };
 use crate::crs::{
     CliContext, CrsClient,
@@ -30,7 +30,7 @@ use crate::crs::{
         ContainerListArgs, ContainerStateArg,
     },
     format::{
-        CommandOutput, ContainerView,
+        CommandOutput, ContainerView, InspectView,
         format_unix_nanos,
     },
     parsers::parse_key_value,
@@ -198,4 +198,75 @@ pub(crate) async fn exec_sync_with_command(
     }
 
     Ok(CommandResult::from_code(response.exit_code))
+}
+
+pub(crate) async fn handle_inspect(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+) -> Result<CommandResult, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .container_status(ContainerStatusRequest {
+                    container_id: id.clone(),
+                    verbose: true,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs inspect")
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {id}"))
+                })
+        })
+        .await?
+        .into_inner();
+
+    let id = response
+        .status
+        .as_ref()
+        .map(|status| status.id.clone())
+        .unwrap_or_else(|| id.clone());
+
+    let status = response.status.as_ref();
+    let response_json = serde_json::json!({
+        "status": {
+            "id": status.map(|s| s.id.clone()).unwrap_or_default(),
+            "state": status.map(|s| s.state).unwrap_or_default(),
+            "createdAt": status.map(|s| s.created_at).unwrap_or_default(),
+            "startedAt": status.map(|s| s.started_at).unwrap_or_default(),
+            "finishedAt": status.map(|s| s.finished_at).unwrap_or_default(),
+            "imageRef": status.map(|s| s.image_ref.clone()).unwrap_or_default(),
+            "metadata": status.and_then(|s| s.metadata.as_ref()).map(|m| {
+                serde_json::json!({
+                    "name": m.name,
+                    "attempt": m.attempt,
+                })
+            }),
+            "image": status.and_then(|s| s.image.as_ref()).map(|i| {
+                serde_json::json!({
+                    "image": i.image,
+                })
+            }),
+        },
+    });
+    let info_json = serde_json::to_value(&response.info)
+        .unwrap_or(serde_json::Value::Null);
+
+    render_and_print(
+        ctx,
+        CommandOutput::new(
+            "ContainerInspect",
+            client.endpoint(),
+            vec![InspectView {
+                object_type: "container".to_string(),
+                id,
+                response: response_json,
+                info_json: info_json.clone(),
+                info_raw: info_json,
+            }],
+        ),
+    )
 }

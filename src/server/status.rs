@@ -194,7 +194,37 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<ContainerStatusRequest>,
     ) -> Result<Response<ContainerStatusResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let actual_container_id = self.resolve_container_id(&req.container_id).await?;
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(&actual_container_id).cloned()
+        }
+        .ok_or_else(|| Status::not_found("Container not found"))?;
+
+        let runtime_status = self
+            .runtime_container_status_checked(&actual_container_id)
+            .await;
+        let container = if matches!(runtime_status, crate::runtime::ContainerStatus::Stopped(_)) {
+            self.finalize_container_stop_state(&actual_container_id, runtime_status.clone())
+                .await?
+                .unwrap_or(container)
+        } else {
+            container
+        };
+        let runtime_state = Self::effective_runtime_state_for_container(&container, runtime_status);
+        let status = Self::build_container_status_snapshot(&container, runtime_state);
+        let info = if req.verbose {
+            self.build_container_verbose_info(&container, runtime_state)
+                .await?
+        } else {
+            HashMap::new()
+        };
+
+        Ok(Response::new(ContainerStatusResponse {
+            status: Some(status),
+            info,
+        }))
     }
 
     pub(super) fn runtime_binary_version(&self) -> Option<String> {
