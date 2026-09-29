@@ -39,9 +39,11 @@ use crate::server::service::{
     RuntimeServiceConfig, RuntimeServiceImpl,
     ContainerCreateDeadline,
 };
-use crate::runtime::backend::RuntimeBackend;
-use crate::runtime::shim_manager::ShimConfig;
-use crate::runtime::SeccompProfile;
+use crate::runtime::{
+    backend::RuntimeBackend,
+    shim_manager::ShimConfig,
+    SeccompProfile, ContainerStatus,
+};
 use crate::server::state_model::{
     StoredSecurityProfile, CgroupResourceSupport,
     StoredLinuxResources,
@@ -139,6 +141,10 @@ impl RuntimeServiceConfig {
             container_stop_timeout: config.runtime.container_stop_timeout,
             version_file: PathBuf::from(&config.runtime.version_file),
             version_file_persist: PathBuf::from(&config.runtime.version_file_persist),
+            criu_path: PathBuf::new(),
+            criu_image_path: PathBuf::new(),
+            criu_work_path: PathBuf::new(),
+            enable_criu_support: false,
             internal_wipe: config.runtime.internal_wipe,
             internal_repair: config.runtime.internal_repair,
             bind_mount_prefix: PathBuf::from(&config.runtime.bind_mount_prefix),
@@ -390,12 +396,11 @@ impl RuntimeServiceImpl {
 
     fn effective_apparmor_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Result<Option<String>, Status> {
-        let security = Self::security_availability();
-        unimplemented!()
+        Ok(None)
     }
 
     #[allow(deprecated)]
@@ -409,30 +414,29 @@ impl RuntimeServiceImpl {
 
     fn effective_selinux_label_from_proto(
         &self,
-        options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
-        host_network: bool,
-        auto_level_seed: Option<&str>,
+        _options: Option<&crate::proto::runtime::v1::SeLinuxOption>,
+        _host_network: bool,
+        _auto_level_seed: Option<&str>,
     ) -> Option<String> {
-        let security = Self::security_availability();
-        unimplemented!()
+        None
     }
 
     fn effective_seccomp_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Option<SeccompProfile> {
-        unimplemented!()
+        None
     }
 
     fn effective_stored_seccomp_profile_from_proto(
         &self,
-        profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
-        deprecated_profile: &str,
-        privileged: bool,
+        _profile: Option<&crate::proto::runtime::v1::SecurityProfile>,
+        _deprecated_profile: &str,
+        _privileged: bool,
     ) -> Option<StoredSecurityProfile> {
-        unimplemented!()
+        None
     }
 
     #[allow(deprecated)]
@@ -655,5 +659,173 @@ impl RuntimeServiceImpl {
         } else {
             ts
         }
+    }
+
+    async fn resolve_pod_sandbox_id(&self, requested_id: &str) -> Result<String, Status> {
+        if let Ok(removed) = self.removed_pod_sandbox_ids.lock() {
+            if removed.contains(requested_id) {
+                return Err(Status::not_found("Pod sandbox not found"));
+            }
+        }
+        let pod_sandboxes = self.pod_sandboxes.lock().await;
+        if pod_sandboxes.contains_key(requested_id) {
+            return Ok(requested_id.to_string());
+        }
+
+        let matches: Vec<String> = pod_sandboxes
+            .keys()
+            .filter(|id| id.starts_with(requested_id))
+            .cloned()
+            .collect();
+
+        match matches.len() {
+            0 => Err(Status::not_found("Pod sandbox not found")),
+            1 => Ok(matches[0].clone()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous pod sandbox id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
+
+    async fn resolve_container_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_container_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn resolve_container_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_container_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => {
+                self.resolve_persisted_container_id_if_exists(requested_id)
+                    .await
+            }
+            Err(status) => Err(status),
+        }
+    }
+
+    async fn resolve_persisted_container_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        let persistence = self.persistence.lock().await;
+        let records = crate::state::StateLedger::new(&persistence)
+            .container_records()
+            .map_err(|e| Status::internal(format!("Failed to list containers: {}", e)))?;
+        drop(persistence);
+
+        if let Ok(removed) = self.removed_container_ids.lock() {
+            if removed.contains(requested_id) {
+                return Ok(None);
+            }
+        }
+        if records.iter().any(|record| record.id == requested_id) {
+            return Ok(Some(requested_id.to_string()));
+        }
+
+        let matches: Vec<String> = records
+            .into_iter()
+            .filter(|record| {
+                self.removed_container_ids
+                    .lock()
+                    .ok()
+                    .map(|removed| !removed.contains(&record.id))
+                    .unwrap_or(true)
+            })
+            .filter(|record| record.id.starts_with(requested_id))
+            .map(|record| record.id)
+            .collect();
+
+        match matches.len() {
+            0 => Ok(None),
+            1 => Ok(matches.into_iter().next()),
+            _ => Err(Status::invalid_argument(format!(
+                "ambiguous container id prefix: {}",
+                requested_id
+            ))),
+        }
+    }
+
+    async fn resolve_pod_sandbox_id_for_filter(&self, requested_id: &str) -> Option<String> {
+        self.resolve_pod_sandbox_id_if_exists(requested_id)
+            .await
+            .ok()
+            .flatten()
+    }
+
+    async fn resolve_pod_sandbox_id_if_exists(
+        &self,
+        requested_id: &str,
+    ) -> Result<Option<String>, Status> {
+        match self.resolve_pod_sandbox_id(requested_id).await {
+            Ok(id) => Ok(Some(id)),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(status),
+        }
+    }
+
+    fn map_runtime_container_state(status: crate::runtime::ContainerStatus) -> i32 {
+        match status {
+            ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+            ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+            ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+            ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+        }
+    }
+
+    fn runtime_container_status_name(status: &ContainerStatus) -> &'static str {
+        match status {
+            ContainerStatus::Created => "created",
+            ContainerStatus::Running => "running",
+            ContainerStatus::Stopped(_) => "stopped",
+            ContainerStatus::Unknown => "unknown",
+        }
+    }
+
+    async fn runtime_handler_name_for_container_request(
+        &self,
+        container_id: &str,
+    ) -> Result<String, Status> {
+        let annotations = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(container_id)
+                .map(|container| container.annotations.clone())
+        };
+
+        if let Some(annotations) = annotations {
+            return Ok(self
+                .runtime
+                .runtime_handler_name_for_annotations_map(&annotations));
+        }
+
+        self.runtime
+            .runtime_handler_name_for_container(container_id)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve runtime handler for container {}: {}",
+                    container_id, e
+                ))
+            })
+    }
+
+    async fn runtime_container_status_checked(&self, container_id: &str) -> ContainerStatus {
+        let runtime = match self.runtime_for_container_request(container_id).await {
+            Ok(runtime) => runtime,
+            Err(_) => return ContainerStatus::Unknown,
+        };
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_status(&container_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(ContainerStatus::Unknown)
     }
 }

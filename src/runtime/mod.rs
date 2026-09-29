@@ -24,7 +24,6 @@ use std::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::process::{Output, Command, Stdio,};
 use std::os::unix::process::CommandExt;
-use std::unimplemented;
 
 use thiserror::Error;
 use log::{debug, error, info};
@@ -1156,10 +1155,14 @@ impl RuncRuntime {
             crate::image::content_store::FsContentStore::new_with_ledger(
                 &self.image_storage_root,
                 self.state_db_path.clone(),
-            )?,
+            ).with_context(|| format!("FsContentStore::new_with_ledger failed: root={}", self.image_storage_root.display()))?,
             self.state_db_path.clone(),
         );
-        snapshotter.prepare(container_id, image_ref, rootfs_dir)?;
+        snapshotter.prepare(container_id, image_ref, rootfs_dir)
+            .with_context(|| format!("snapshotter.prepare failed: image_ref={image_ref}, rootfs={}, metadata_store_root={}, content_store_root={}",
+                rootfs_dir.display(),
+                self.image_storage_root.join("images").display(),
+                self.image_storage_root.display()))?;
         self.ensure_minimum_rootfs_layout(image_ref, rootfs_dir)?;
         let mount = if self.state_db_path.is_some() {
             PreparedRootfsMount::from(snapshotter.mount(container_id)?)
@@ -1190,7 +1193,10 @@ impl RuncRuntime {
             .unwrap_or(config.image.as_str());
         let mount = self
             .prepare_rootfs_from_image(image_ref, &config.rootfs, container_id)
-            .context("Failed to prepare rootfs from image")?;
+            .with_context(|| format!("Failed to prepare rootfs from image {image_ref} (storage_root={}, state_db={:?}, rootfs={})",
+                self.image_storage_root.display(),
+                self.state_db_path,
+                config.rootfs.display()))?;
         self.ensure_mount_targets(&config.rootfs, &config.mounts)
             .context("Failed to prepare mount targets")?;
         Ok(mount)
@@ -3160,6 +3166,24 @@ impl RuncRuntime {
             .and_then(|entry| entry.parse::<usize>().ok())
     }
 
+    pub(crate) fn apply_exec_cpu_affinity_to_tokio_command(
+        command: &mut tokio::process::Command,
+        cpu: Option<usize>,
+    ) {
+        let Some(cpu) = cpu else {
+            return;
+        };
+        unsafe {
+            command.pre_exec(move || {
+                let mut set = nix::sched::CpuSet::new();
+                set.set(cpu)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+    }
 }
 
 impl ContainerRuntime for RuncRuntime {

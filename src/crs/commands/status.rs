@@ -17,15 +17,18 @@ limitations under the License.
 
 use std::collections::HashMap;
 
-use serde_json::{Value, Map,};
+use serde_json::{Map, Value};
 
 use crate::crs::{
-    CliContext,
-    format::{CommandOutput, TableRow, FormatOptions},
-    commands::CliError,
-    CommandResult,
-    format::render_output,
+    args::StatusArgs,
+    client::CrsClient,
+    context::CliContext,
+    error::{CliError, CommandResult},
+    format::{
+        render_output, CommandOutput, ConditionView, FormatOptions, RuntimeStatusView, TableRow,
+    },
 };
+use crate::proto::runtime::v1::StatusRequest;
 
 pub(crate) fn render_and_print<T>(
     ctx: &CliContext,
@@ -68,4 +71,63 @@ pub(crate) fn parse_info_map(
     }
 
     (Value::Object(parsed), Value::Object(raw))
+}
+
+pub(crate) async fn handle(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: StatusArgs,
+) -> Result<CommandResult, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .status(StatusRequest {
+                    verbose: args.verbose,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs status")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+
+    let mut warnings = Vec::new();
+    let (info_json, info_raw) = parse_info_map(&response.info, &mut warnings);
+    let conditions = response
+        .status
+        .map(|status| status.conditions)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|condition| ConditionView {
+            kind: condition.r#type,
+            status: condition.status,
+            reason: condition.reason,
+            message: condition.message,
+        })
+        .collect::<Vec<_>>();
+
+    let view = RuntimeStatusView {
+        runtime_ready: condition_status(&conditions, "RuntimeReady"),
+        network_ready: condition_status(&conditions, "NetworkReady"),
+        conditions,
+        info_json,
+        info_raw,
+    };
+
+    render_and_print(
+        ctx,
+        CommandOutput::new("RuntimeStatus", client.endpoint(), vec![view]).with_warnings(warnings),
+    )
+}
+
+fn condition_status(conditions: &[ConditionView], kind: &str) -> bool {
+    conditions
+        .iter()
+        .find(|condition| condition.kind == kind)
+        .map(|condition| condition.status)
+        .unwrap_or(false)
 }

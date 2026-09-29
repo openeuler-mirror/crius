@@ -180,6 +180,38 @@ impl CniConfig {
     pub fn conf_template(&self) -> Option<&Path> {
         self.conf_template.as_deref()
     }
+
+    pub fn cache_dir(&self) -> &Path {
+        &self.cache_dir
+    }
+
+    pub fn handler_max_conf_num(&self, runtime_handler: &str) -> Option<usize> {
+        self.runtime_handler_max_conf_nums
+            .get(runtime_handler)
+            .copied()
+    }
+
+    pub fn handler_config_dirs(&self, runtime_handler: &str) -> Option<&[PathBuf]> {
+        self.runtime_handler_config_dirs
+            .get(runtime_handler)
+            .map(Vec::as_slice)
+    }
+
+    pub fn namespace_helper_path(&self) -> Option<&Path> {
+        self.namespace_helper_path.as_deref()
+    }
+
+    pub fn netns_mount_dir(&self) -> &Path {
+        &self.netns_mount_dir
+    }
+
+    pub fn netns_mounts_under_state_dir(&self) -> bool {
+        self.netns_mounts_under_state_dir
+    }
+
+    pub fn disable_hostport_mapping(&self) -> bool {
+        self.disable_hostport_mapping
+    }
 }
 
 /// 网络管理器接口

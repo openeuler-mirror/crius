@@ -17,9 +17,11 @@ limitations under the License.
 pub(crate) mod shortcuts;
 pub(crate) mod image;
 pub(crate) mod status;
-pub(crate) mod config;
-
-use std::unimplemented;
+pub(crate) mod version;
+pub(crate) mod run;
+pub(crate) mod container;
+pub(crate) mod logs;
+pub(crate) mod exec;
 
 use crate::crs::{
     args::Command, client::CrsClient, context::CliContext, error::{CliError, CommandResult},
@@ -32,15 +34,18 @@ pub(crate) async fn dispatch(
     command: Command,
 ) -> Result<CommandResult, CliError> {
     match command {
-        Command::Version(args) => unimplemented!(),
+        Command::Version(args) => version::handle(ctx, client, args).await,
+        Command::Status(args) => status::handle(ctx, client, args).await,
         Command::Images(args) => shortcuts::handle_images(ctx, client, args).await,
+        Command::Run(args) => run::handle(ctx, client, *args).await,
+        Command::Ps(args) => shortcuts::handle_ps(ctx, client, args).await,
+        Command::Exec(args) => exec::handle(ctx, client, args).await,
+        Command::Logs(args) => logs::handle(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
         Command::Rmi { image: image_name } => {
             image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
         }
         Command::Image(args) => image::handle(ctx, client, args).await,
         Command::Inspect(args) => shortcuts::handle_inspect(ctx, client, args).await,
-        Command::Debug(args) => unimplemented!(),
-        Command::Completion(args) => unimplemented!(),
     }
 }

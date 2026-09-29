@@ -465,8 +465,8 @@ impl ShimManager {
 
         let mut child = cmd
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .context("Failed to start shim process")?;
 

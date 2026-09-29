@@ -32,7 +32,11 @@ use tokio::net::UnixListener as TokioUnixListener;
 use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
 
 use crius::proto::runtime::v1::{runtime_service_server::RuntimeServiceServer, image_service_server::ImageServiceServer};
+use crius::proto::diagnostics::v1::diagnostics_service_server::DiagnosticsServiceServer;
 use crius::proto::local::v1::local_service_server::LocalServiceServer;
+use crius::service::diagnostics::{
+    DiagnosticsState, DiagnosticsServiceImpl
+};
 use crius::service::local::LocalServiceImpl;
 
 use crius::config::Config;
@@ -58,62 +62,6 @@ struct Args {
     /// Listen address (IP:port or unix://path/to/socket). TCP requires api.allow_tcp_service=true.
     #[clap(long)]
     listen: Option<String>,
-
-    /// Override the OCI runtime binary path.
-    #[clap(long)]
-    runtime_path: Option<PathBuf>,
-
-    /// Override the runtime-specific config file path.
-    #[clap(long)]
-    runtime_config_path: Option<PathBuf>,
-
-    /// Override the runtime state/runroot directory.
-    #[clap(long)]
-    runtime_root: Option<PathBuf>,
-
-    /// Override the pause image reference used for PodSandbox.
-    #[clap(long)]
-    pause_image: Option<String>,
-
-    /// Override CNI config directories, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    cni_config_dirs: Vec<String>,
-
-    /// Override CNI plugin directories, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    cni_plugin_dirs: Vec<String>,
-
-    /// Override the streaming server bind address.
-    #[clap(long)]
-    stream_address: Option<String>,
-
-    /// Override the streaming server bind port.
-    #[clap(long)]
-    stream_port: Option<u16>,
-
-    /// Override whether the streaming server uses TLS.
-    #[clap(long)]
-    stream_enable_tls: Option<bool>,
-
-    /// Override the streaming TLS certificate file path.
-    #[clap(long)]
-    stream_tls_cert_file: Option<PathBuf>,
-
-    /// Override the streaming TLS private key file path.
-    #[clap(long)]
-    stream_tls_key_file: Option<PathBuf>,
-
-    /// Override the streaming TLS client CA file path.
-    #[clap(long)]
-    stream_tls_ca_file: Option<PathBuf>,
-
-    /// Override the streaming TLS minimum version.
-    #[clap(long)]
-    stream_tls_min_version: Option<String>,
-
-    /// Override the streaming TLS cipher suite list, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    stream_tls_cipher_suites: Vec<String>,
 
     /// Print the built-in default configuration as TOML and exit.
     #[clap(long, conflicts_with = "write_default_config")]
@@ -155,6 +103,16 @@ async fn main() -> Result<(), Error> {
         )))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
+    let diagnostics_state = DiagnosticsState::from_runtime(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_COMMIT").unwrap_or("unknown"),
+        &config,
+        &runtime_service,
+        listen
+            .strip_prefix("unix://")
+            .unwrap_or(&listen)
+            .to_string(),
+    );
     
     let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
@@ -165,13 +123,17 @@ async fn main() -> Result<(), Error> {
     let local_service_server = LocalServiceServer::new(LocalServiceImpl::new(runtime_service.clone()))
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let diagnostics_service_server = DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     // 注册路由
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(reflection_service)
         .add_service(image_service_server)
-        .add_service(local_service_server);
+        .add_service(local_service_server)
+        .add_service(diagnostics_service_server);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();
 

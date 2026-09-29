@@ -43,9 +43,17 @@ use crate::image::content_store::{RemoteContentProviderKind, ContentTransferReco
 use crate::storage::StorageManager;
 use crate::service::event::{InternalEventSeverity, InternalEvent, LedgerInternalEventSink};
 
-use content_store::{FsContentStore, ContentTransferTracker, ContentStore};
+use content_store::{
+    FsContentStore, 
+    ContentTransferTracker, 
+    ContentStore, 
+    ContentTransferStatus,
+};
 use metadata_store::FilesystemImageMetadataStore;
-use pull_cgroup::PullCgroupExecutor;
+use pull_cgroup::{
+    PullCgroupExecutor, PullCgroupEffectiveConfig,
+    PullCgroupScopeRecord, 
+};
 
 /// 镜像服务实现
 #[derive(Clone)]
@@ -2206,6 +2214,17 @@ impl ImageServiceImpl {
         )))
     }
 
+    pub fn pull_cgroup_effective_config(&self) -> PullCgroupEffectiveConfig {
+        self.pull_cgroup.effective_config()
+    }
+
+    pub fn last_pull_cgroup_scope(&self) -> Option<PullCgroupScopeRecord> {
+        self.pull_cgroup.last_scope()
+    }
+
+    pub fn content_transfer_status(&self) -> ContentTransferStatus {
+        self.transfer_tracker.snapshot()
+    }
 }
 
 #[tonic::async_trait]

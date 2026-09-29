@@ -25,7 +25,10 @@ use serde::Serialize;
 use crate::crs::{
     CliContext,
     args::OutputArg,
-    ids::{truncate_field, short_image_id},
+    ids::{
+        truncate_field, short_image_id,
+        short_id,
+    },
 };
 
 pub(crate) const API_VERSION: &str = "crius.io/crs/v1";
@@ -484,6 +487,139 @@ impl TableRow for ImageConfigView {
             self.auth_configured.clone(),
             self.pinned_images.clone(),
         ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeVersionView {
+    pub runtime_name: String,
+    pub runtime_version: String,
+    pub runtime_api_version: String,
+}
+
+impl TableRow for RuntimeVersionView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME", "VERSION", "API VERSION"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.runtime_name.clone(),
+            self.runtime_version.clone(),
+            self.runtime_api_version.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ConditionView {
+    pub kind: String,
+    pub status: bool,
+    pub reason: String,
+    pub message: String,
+}
+
+impl TableRow for ConditionView {
+    fn headers() -> &'static [&'static str] {
+        &["TYPE", "STATUS", "REASON", "MESSAGE"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.kind.clone(),
+            format_bool(self.status).to_string(),
+            self.reason.clone(),
+            self.message.clone(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct RuntimeStatusView {
+    pub runtime_ready: bool,
+    pub network_ready: bool,
+    pub conditions: Vec<ConditionView>,
+    pub info_json: Value,
+    pub info_raw: Value,
+}
+
+impl TableRow for RuntimeStatusView {
+    fn headers() -> &'static [&'static str] {
+        &["RUNTIME READY", "NETWORK READY", "CONDITIONS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            format_bool(self.runtime_ready).to_string(),
+            format_bool(self.network_ready).to_string(),
+            self.conditions.len().to_string(),
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerView {
+    pub container_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pod: String,
+    pub image: String,
+    pub state: String,
+    pub created: String,
+    pub name: String,
+    pub attempt: u32,
+}
+
+impl TableRow for ContainerView {
+    fn headers() -> &'static [&'static str] {
+        &[
+            "CONTAINER ID",
+            "POD",
+            "IMAGE",
+            "STATE",
+            "CREATED",
+            "NAME",
+            "ATTEMPT",
+        ]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.pod.clone(),
+            self.image.clone(),
+            self.state.clone(),
+            self.created.clone(),
+            self.name.clone(),
+            self.attempt.to_string(),
+        ]
+    }
+
+    fn table_cells(&self, no_trunc: bool) -> Vec<String> {
+        vec![
+            if no_trunc {
+                self.container_id.clone()
+            } else {
+                short_id(&self.container_id).to_string()
+            },
+            if no_trunc || self.pod.is_empty() {
+                self.pod.clone()
+            } else {
+                short_id(&self.pod).to_string()
+            },
+            self.image.clone(),
+            self.state.clone(),
+            self.created.clone(),
+            self.name.clone(),
+            self.attempt.to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
     }
 }
 

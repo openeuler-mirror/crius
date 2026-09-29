@@ -45,7 +45,10 @@ use crate::server::state_model::{
 };
 use crate::network::{NetworkManager, DefaultNetworkManager};
 use crate::server::{annotations, CgroupResourceSupport};
-use crate::runtime::{MountConfig, ContainerConfig, NamespacePaths, ContainerRuntime};
+use crate::runtime::{
+    MountConfig, ContainerConfig, NamespacePaths, 
+    ContainerRuntime, ContainerStatus,
+};
 use crate::security::devices::DeviceMapping;
 use crate::runtime::backend::RuntimeContextKind;
 use crate::defaults::INTERNAL_CONTAINER_STATE_KEY;
@@ -55,6 +58,8 @@ use crate::defaults::{
     RANDOM_NAME_LEFT, RANDOM_NAME_RIGHT,
     INTERNAL_POD_STATE_KEY,
     CHECKPOINT_LOCATION_ANNOTATION_KEY,
+    CRIO_RUNTIME_HANDLER_ANNOTATION,
+    CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
 };
 
 enum ContainerOwner {
@@ -163,7 +168,18 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<CreateContainerRequest>,
     ) -> Result<Response<CreateContainerResponse>, Status> {
-        unimplemented!()
+        log::info!("CreateContainer called");
+        let req = request.into_inner();
+        let pod_sandbox_id = self.resolve_pod_sandbox_id(&req.pod_sandbox_id).await?;
+        let config = req
+            .config
+            .ok_or_else(|| Status::invalid_argument("Container config not specified"))?;
+        self.create_container_from_input(ContainerCreateInput {
+            config,
+            sandbox_config: req.sandbox_config,
+            owner: ContainerOwner::Pod { pod_sandbox_id },
+        })
+        .await
     }
 
     async fn create_container_from_input(
@@ -788,7 +804,7 @@ impl RuntimeServiceImpl {
                     .await
                     .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
                     .map_err(|e| {
-                        Status::internal(format!("Failed to prepare container rootfs: {}", e))
+                        Status::internal(format!("Failed to prepare container rootfs: {:?}", e))
                     })
                 })
                 .await
@@ -1039,7 +1055,73 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<StartContainerRequest>,
     ) -> Result<Response<StartContainerResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let container_id = req.container_id;
+
+        log::info!("Starting container {}", container_id);
+
+        let (runtime_handler, pod_sandbox_id) = {
+            let containers = self.containers.lock().await;
+            let container = containers
+                .get(&container_id)
+                .ok_or_else(|| Status::not_found("Container not found"))?;
+            let handler = container
+                .annotations
+                .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+                .or_else(|| container.annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
+                .map(|value| value.trim())
+                .filter(|value| !value.is_empty())
+                .unwrap_or("")
+                .to_string();
+            (handler, container.pod_sandbox_id.clone())
+        };
+
+        let runtime_backend = self
+            .runtime
+            .runtime_for_handler(&runtime_handler)
+            .map_err(|e| Status::failed_precondition(format!("Failed to resolve runtime handler: {}", e)))?;
+
+        let task_container_id = container_id.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            runtime_backend.task_controller().start_container(&task_container_id)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?;
+
+        match result {
+            Ok(()) => {
+                let mut containers = self.containers.lock().await;
+                if let Some(container) = containers.get_mut(&container_id) {
+                    container.state = ContainerState::ContainerRunning as i32;
+                }
+                drop(containers);
+
+                self.publish_container_lifecycle_event(
+                    &container_id,
+                    "start_complete",
+                    InternalEventSeverity::Info,
+                    json!({
+                        "podSandboxId": pod_sandbox_id,
+                    }),
+                )
+                .await;
+
+                log::info!("Container {} started", container_id);
+                Ok(Response::new(StartContainerResponse {}))
+            }
+            Err(e) => {
+                self.publish_container_lifecycle_event(
+                    &container_id,
+                    "start_failed",
+                    InternalEventSeverity::Error,
+                    json!({
+                        "error": e.to_string(),
+                    }),
+                )
+                .await;
+                Err(Status::internal(format!("Failed to start container: {}", e)))
+            }
+        }
     }
 
     pub(super) async fn update_container_resources(
@@ -1179,7 +1261,9 @@ impl RuntimeServiceImpl {
     ) -> Result<NameReservationGuard, Status> {
         match self.reserve_container_name(container_id, name) {
             Ok(guard) => Ok(guard),
-            Err(status)if status.code() == tonic::Code::AlreadyExists => unimplemented!(),
+            Err(status) if status.code() == tonic::Code::AlreadyExists => {
+                Err(Status::already_exists(format!("container name {} is already in use", name)))
+            }
             Err(status) => Err(status),
         }
     }
@@ -1600,5 +1684,93 @@ impl RuntimeServiceImpl {
         );
     }
 
+    pub(super) async fn finalize_container_stop_state(
+        &self,
+        container_id: &str,
+        final_runtime_status: ContainerStatus,
+    ) -> Result<Option<Container>, Status> {
+        let mut resolved_exit_code = match &final_runtime_status {
+            ContainerStatus::Stopped(code) => Some(*code),
+            _ => None,
+        };
+
+        let updated_container = {
+            let mut containers = self.containers.lock().await;
+            let Some(container) = containers.get_mut(container_id) else {
+                return Ok(None);
+            };
+
+            container.state = match &final_runtime_status {
+                ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+                ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+                ContainerStatus::Stopped(_) => ContainerState::ContainerExited as i32,
+                ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+            };
+            if let Some(mut state) = Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            ) {
+                match &final_runtime_status {
+                    ContainerStatus::Created => {}
+                    ContainerStatus::Running => {
+                        state.finished_at = None;
+                        state.exit_code = None;
+                    }
+                    ContainerStatus::Stopped(_) | ContainerStatus::Unknown => {
+                        state.finished_at.get_or_insert(Self::now_nanos());
+                        if resolved_exit_code.is_none() {
+                            resolved_exit_code = state.exit_code;
+                        }
+                        if let Some(code) = resolved_exit_code {
+                            state.exit_code = Some(code);
+                        }
+                    }
+                }
+                if let Err(err) = Self::insert_internal_state(
+                    &mut container.annotations,
+                    INTERNAL_CONTAINER_STATE_KEY,
+                    &state,
+                ) {
+                    log::warn!(
+                        "Failed to persist in-memory container state for {}: {}",
+                        container_id,
+                        err
+                    );
+                }
+            }
+            if container.state == ContainerState::ContainerUnknown as i32
+                && resolved_exit_code.is_some()
+            {
+                container.state = ContainerState::ContainerExited as i32;
+            }
+
+            Some(container.clone())
+        };
+
+        let persistence_status = match &final_runtime_status {
+            ContainerStatus::Created => crate::runtime::ContainerStatus::Created,
+            ContainerStatus::Running => crate::runtime::ContainerStatus::Running,
+            ContainerStatus::Stopped(_) => {
+                crate::runtime::ContainerStatus::Stopped(resolved_exit_code.unwrap_or(-1))
+            }
+            ContainerStatus::Unknown => match resolved_exit_code {
+                Some(code) => crate::runtime::ContainerStatus::Stopped(code),
+                None => crate::runtime::ContainerStatus::Unknown,
+            },
+        };
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = crate::state::StateLedgerWriter::new(&mut persistence)
+            .update_container_state(container_id, persistence_status)
+        {
+            log::error!(
+                "Failed to update container {} state in database: {}",
+                container_id,
+                err
+            );
+        }
+        drop(persistence);
+
+        Ok(updated_container)
+    }
     
 }

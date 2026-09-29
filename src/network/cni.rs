@@ -99,6 +99,10 @@ impl CniLoadStatus {
             default_network_name,
         }
     }
+
+    pub fn condition(&self) -> (bool, String, String) {
+        (self.ready, self.reason.clone(), self.message.clone())
+    }
 }
 
 struct CniPluginInvocation<'a> {
@@ -1207,5 +1211,9 @@ impl CniManager {
     /// 解析CNI结果
     fn parse_cni_result(&self, result: Option<&Value>) -> Result<NetworkStatus> {
         Self::network_status_from_cni_result_with_preference(result, self.ip_pref)
+    }
+    
+    pub fn last_load_status(&self) -> Option<&CniLoadStatus> {
+        self.last_load_status.as_ref()
     }
 }

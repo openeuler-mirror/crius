@@ -210,6 +210,75 @@ impl StorageManager {
             [],
         )?;
 
+        // 快照表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS snapshots (
+                key TEXT PRIMARY KEY,
+                image_id TEXT NOT NULL,
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                state TEXT NOT NULL,
+                mountpoint TEXT NOT NULL,
+                snapshotter TEXT NOT NULL,
+                runtime_managed INTEGER NOT NULL DEFAULT 0
+            )",
+                [],
+            )
+            .context("Failed to create snapshots table")?;
+
+        // 运行时产物表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS runtime_artifacts (
+                owner_kind TEXT NOT NULL,
+                owner_id TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL,
+                path TEXT NOT NULL,
+                state TEXT NOT NULL DEFAULT 'active',
+                runtime_handler TEXT,
+                runtime_root TEXT,
+                PRIMARY KEY(owner_kind, owner_id, artifact_kind, path)
+            )",
+                [],
+            )
+            .context("Failed to create runtime_artifacts table")?;
+
+        // shim 进程表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS shim_processes (
+                container_id TEXT PRIMARY KEY,
+                shim_pid INTEGER NOT NULL,
+                work_dir TEXT NOT NULL,
+                socket_path TEXT NOT NULL,
+                exit_code_file TEXT NOT NULL,
+                log_file TEXT NOT NULL,
+                bundle_path TEXT NOT NULL,
+                state TEXT NOT NULL,
+                last_seen_at INTEGER NOT NULL
+            )",
+                [],
+            )
+            .context("Failed to create shim_processes table")?;
+
+        // 事件表
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL DEFAULT 'container',
+                entity_type TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                old_state TEXT,
+                new_state TEXT,
+                timestamp INTEGER NOT NULL,
+                details TEXT
+            )",
+                [],
+            )
+            .context("Failed to create events table")?;
+
         debug!("Database tables initialized");
         Ok(())
     }
@@ -947,6 +1016,254 @@ impl StorageManager {
         }
         Ok(())
     }
+
+    /// 获取所有容器
+    pub fn list_containers(&self) -> Result<Vec<ContainerRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, pod_id, state, image, command, created_at, labels, annotations, exit_code, exit_time, runtime_handler, runtime_backend, snapshot_key
+             FROM containers"
+        )?;
+
+        let records = stmt
+            .query_map([], |row| {
+                Ok(ContainerRecord {
+                    id: row.get(0)?,
+                    pod_id: row.get(1)?,
+                    state: row.get(2)?,
+                    image: row.get(3)?,
+                    command: row.get(4)?,
+                    created_at: row.get(5)?,
+                    labels: row.get(6)?,
+                    annotations: row.get(7)?,
+                    exit_code: row.get(8)?,
+                    exit_time: row.get(9)?,
+                    runtime_handler: row.get(10)?,
+                    runtime_backend: row.get(11)?,
+                    snapshot_key: row.get(12)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list containers")?;
+
+        Ok(records)
+    }
+
+    pub fn list_content_blob_refs(
+        &self,
+        owner_kind: Option<&str>,
+        owner_id: Option<&str>,
+    ) -> Result<Vec<ContentBlobRefRecord>> {
+        let mut sql =
+            "SELECT owner_kind, owner_id, digest, ref_kind FROM content_blob_refs".to_string();
+        let records = match (owner_kind, owner_id) {
+            (Some(kind), Some(id)) => {
+                sql.push_str(" WHERE owner_kind = ?1 AND owner_id = ?2");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows =
+                    stmt.query_map(rusqlite::params![kind, id], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (Some(kind), None) => {
+                sql.push_str(" WHERE owner_kind = ?1");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([kind], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (None, Some(id)) => {
+                sql.push_str(" WHERE owner_id = ?1");
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([id], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+            (None, None) => {
+                let mut stmt = self.conn.prepare(&sql)?;
+                let rows = stmt.query_map([], content_blob_ref_from_row)?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            }
+        };
+        Ok(records)
+    }
+
+    pub fn list_content_transfers(&self) -> Result<Vec<ContentTransferRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, source, provider, state, current_stage, bytes_total, bytes_completed, started_at, finished_at, error
+             FROM content_transfers
+             ORDER BY started_at DESC, id DESC",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let bytes_total: i64 = row.get(5)?;
+                let bytes_completed: i64 = row.get(6)?;
+                Ok(ContentTransferRecord {
+                    id: row.get(0)?,
+                    source: row.get(1)?,
+                    provider: row.get(2)?,
+                    state: row.get(3)?,
+                    current_stage: row.get(4)?,
+                    bytes_total: bytes_total.max(0) as u64,
+                    bytes_completed: bytes_completed.max(0) as u64,
+                    started_at: row.get(7)?,
+                    finished_at: row.get(8)?,
+                    error: row.get(9)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list content transfers")?;
+        Ok(records)
+    }
+
+    pub fn list_content_blobs(&self) -> Result<Vec<ContentBlobRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT digest, media_type, size, relative_path, created_at, last_used_at
+             FROM content_blobs",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                let size: i64 = row.get(2)?;
+                Ok(ContentBlobRecord {
+                    digest: row.get(0)?,
+                    media_type: row.get(1)?,
+                    size: size.max(0) as u64,
+                    relative_path: row.get(3)?,
+                    created_at: row.get(4)?,
+                    last_used_at: row.get(5)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list content blobs")?;
+        Ok(records)
+    }
+
+    pub fn list_content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        let refs = self.list_content_blob_refs(None, None)?;
+        let transfers = self.list_content_transfers()?;
+        self.list_content_blobs()?
+            .into_iter()
+            .map(|blob| {
+                let mut blockers = refs
+                    .iter()
+                    .filter(|record| record.digest == blob.digest)
+                    .map(|record| ContentGcBlocker::ContentRef {
+                        owner_kind: record.owner_kind.clone(),
+                        owner_id: record.owner_id.clone(),
+                        ref_kind: record.ref_kind.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                blockers.extend(
+                    transfers
+                        .iter()
+                        .filter(|record| record.state == "running")
+                        .filter(|record| transfer_source_matches_blob(record, &blob))
+                        .map(|record| ContentGcBlocker::ActiveTransfer {
+                            transfer_id: record.id.clone(),
+                            source: record.source.clone(),
+                        }),
+                );
+                Ok(ContentGcCandidate { blob, blockers })
+            })
+            .collect()
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        Ok(self
+            .latest_schema_migration()?
+            .map(|record| record.version)
+            .unwrap_or(0))
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.conn
+            .query_row(
+                "SELECT version, migration_name, dirty, applied_at
+                 FROM schema_version
+                 ORDER BY version DESC
+                 LIMIT 1",
+                [],
+                |row| {
+                    Ok(SchemaMigrationRecord {
+                        version: row.get(0)?,
+                        migration_name: row.get(1)?,
+                        dirty: row.get::<_, i64>(2)? != 0,
+                        applied_at: row.get(3)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Failed to read schema_version")
+    }
+
+    pub fn list_runtime_artifacts(&self) -> Result<Vec<RuntimeArtifactRecord>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT owner_kind, owner_id, artifact_kind, path, state, runtime_handler, runtime_root
+             FROM runtime_artifacts",
+        )?;
+        let records = stmt
+            .query_map([], |row| {
+                Ok(RuntimeArtifactRecord {
+                    owner_kind: row.get(0)?,
+                    owner_id: row.get(1)?,
+                    artifact_kind: row.get(2)?,
+                    path: row.get(3)?,
+                    state: row.get(4)?,
+                    runtime_handler: row.get(5)?,
+                    runtime_root: row.get(6)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("Failed to list runtime artifacts")?;
+        Ok(records)
+    }
+
+    pub fn get_shim_process(&self, container_id: &str) -> Result<Option<ShimProcessRecord>> {
+        let record = self.conn.query_row(
+            "SELECT container_id, shim_pid, work_dir, socket_path, exit_code_file, log_file, bundle_path, state, last_seen_at
+             FROM shim_processes WHERE container_id = ?1",
+            [container_id],
+            |row| {
+                Ok(ShimProcessRecord {
+                    container_id: row.get(0)?,
+                    shim_pid: row.get(1)?,
+                    work_dir: row.get(2)?,
+                    socket_path: row.get(3)?,
+                    exit_code_file: row.get(4)?,
+                    log_file: row.get(5)?,
+                    bundle_path: row.get(6)?,
+                    state: row.get(7)?,
+                    last_seen_at: row.get(8)?,
+                })
+            },
+        ).optional().context("Failed to get shim process")?;
+        Ok(record)
+    }
+
+    pub fn update_runtime_artifact_state(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runtime_artifacts
+                 SET state = ?5
+                 WHERE owner_kind = ?1 AND owner_id = ?2 AND artifact_kind = ?3 AND path = ?4",
+                rusqlite::params![owner_kind, owner_id, artifact_kind, path, state],
+            )
+            .context("Failed to update runtime artifact state")?;
+        Ok(())
+    }
+
+    pub fn update_shim_process_state(&mut self, container_id: &str, state: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE shim_processes SET state = ?2, last_seen_at = ?3 WHERE container_id = ?1",
+                rusqlite::params![container_id, state, chrono::Utc::now().timestamp()],
+            )
+            .context("Failed to update shim process state")?;
+        Ok(())
+    }
 }
 
 /// 镜像记录
@@ -1069,4 +1386,65 @@ pub struct RuntimeArtifactRecord {
     pub state: String,
     pub runtime_handler: Option<String>,
     pub runtime_root: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContentGcBlocker {
+    ContentRef {
+        owner_kind: String,
+        owner_id: String,
+        ref_kind: String,
+    },
+    ActiveTransfer {
+        transfer_id: String,
+        source: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentGcCandidate {
+    pub blob: ContentBlobRecord,
+    pub blockers: Vec<ContentGcBlocker>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SchemaMigrationRecord {
+    pub version: i64,
+    pub migration_name: String,
+    pub dirty: bool,
+    pub applied_at: i64,
+}
+
+/// Pod沙箱记录
+#[derive(Debug, Clone)]
+pub struct PodSandboxRecord {
+    pub id: String,
+    pub state: String,
+    pub name: String,
+    pub namespace: String,
+    pub uid: String,
+    pub created_at: i64,
+    pub netns_path: String,
+    pub labels: String,      // JSON
+    pub annotations: String, // JSON
+    pub pause_container_id: Option<String>,
+    pub ip: Option<String>,
+}
+
+fn content_blob_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentBlobRefRecord> {
+    Ok(ContentBlobRefRecord {
+        owner_kind: row.get(0)?,
+        owner_id: row.get(1)?,
+        digest: row.get(2)?,
+        ref_kind: row.get(3)?,
+    })
+}
+
+fn transfer_source_matches_blob(
+    transfer: &ContentTransferRecord,
+    blob: &ContentBlobRecord,
+) -> bool {
+    transfer.source == blob.digest
+        || transfer.source.contains(&blob.digest)
+        || (!blob.relative_path.is_empty() && transfer.source.contains(&blob.relative_path))
 }

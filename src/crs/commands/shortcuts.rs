@@ -23,8 +23,11 @@ use crate::crs::{
     args::{
         ImageListArgs, ImagePullArgs, 
         InspectArgs, ObjectType,
+        ListArgs, ContainerListArgs,
     },
-    CommandResult,commands::CliError
+    CommandResult,commands::{
+        CliError, container,
+    },
 };
 
 pub(crate) async fn handle_images(
@@ -147,12 +150,12 @@ pub(crate) async fn handle_inspect(
     args: InspectArgs,
 ) -> Result<CommandResult, CliError> {
     match args.object_type {
-        Some(ObjectType::Container) => unimplemented!(),
+        Some(ObjectType::Container) => container::handle_inspect(ctx, client, args.target).await,
         Some(ObjectType::Pod) => unimplemented!(),
         Some(ObjectType::Image) => image::handle_inspect(ctx, client, args.target).await,
         None => match resolve_inspect_target(client, &args.target).await? {
             InspectCandidate::Container => {
-                unimplemented!()
+                container::handle_inspect(ctx, client, args.target).await
             }
             InspectCandidate::Pod => unimplemented!(),
             InspectCandidate::Image => image::handle_inspect(ctx, client, args.target).await,
@@ -185,4 +188,20 @@ fn not_found_error(
     .with_command(command_name)
     .with_endpoint(client.endpoint())
     .with_object(format!("{object_type} {target}"))
+}
+
+pub(crate) async fn handle_ps(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ListArgs,
+) -> Result<CommandResult, CliError> {
+    container::handle_list(
+        ctx,
+        client,
+        ContainerListArgs {
+            all: args.all,
+            ..Default::default()
+        },
+    )
+    .await
 }

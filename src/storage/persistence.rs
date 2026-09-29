@@ -20,7 +20,11 @@ use std::collections::HashMap;
 use anyhow::Result;
 
 use crate::storage::{
-    StorageManager, ContainerRecord
+    StorageManager, ContainerRecord,
+    ContentGcCandidate, ImageRecord,
+    ImageRefRecord, ContentTransferRecord,
+    SchemaMigrationRecord, SnapshotRecord,
+    RuntimeArtifactRecord, ShimProcessRecord,
 };
 use crate::runtime::ContainerStatus;
 
@@ -110,6 +114,81 @@ impl PersistenceManager {
     /// 删除容器记录
     pub fn delete_container(&mut self, container_id: &str) -> Result<()> {
         self.storage.delete_container(container_id)
+    }
+
+    /// 恢复所有容器状态
+    pub fn recover_containers(&self) -> Result<Vec<(String, ContainerStatus, ContainerRecord)>> {
+        let records = self.storage.list_containers()?;
+
+        let mut result = Vec::new();
+        for record in records {
+            let status = record_to_container_status(&record);
+            result.push((record.id.clone(), status, record));
+        }
+
+        Ok(result)
+    }
+
+    pub fn list_content_gc_candidates(&self) -> Result<Vec<ContentGcCandidate>> {
+        self.storage.list_content_gc_candidates()
+    }
+
+    /// 获取存储管理器的引用
+    pub fn storage(&self) -> &StorageManager {
+        &self.storage
+    }
+
+    pub fn save_image_record(
+        &mut self,
+        record: &ImageRecord,
+        refs: &[ImageRefRecord],
+    ) -> Result<()> {
+        self.storage.save_image(record)?;
+        self.storage.replace_image_refs(&record.id, refs)
+    }
+
+    pub fn get_image_record(&self, image_id: &str) -> Result<Option<ImageRecord>> {
+        self.storage.get_image(image_id)
+    }
+
+    pub fn list_image_records(&self) -> Result<Vec<ImageRecord>> {
+        self.storage.list_images()
+    }
+
+    pub fn list_image_refs(&self, image_id: Option<&str>) -> Result<Vec<ImageRefRecord>> {
+        self.storage.list_image_refs(image_id)
+    }
+
+    pub fn list_content_transfer_records(&self) -> Result<Vec<ContentTransferRecord>> {
+        self.storage.list_content_transfers()
+    }
+
+    pub fn schema_version(&self) -> Result<i64> {
+        self.storage.schema_version()
+    }
+
+    pub fn latest_schema_migration(&self) -> Result<Option<SchemaMigrationRecord>> {
+        self.storage.latest_schema_migration()
+    }
+
+    pub fn list_snapshot_records(&self) -> Result<Vec<SnapshotRecord>> {
+        self.storage.list_snapshots()
+    }
+
+    pub fn list_runtime_artifacts(&self) -> Result<Vec<RuntimeArtifactRecord>> {
+        self.storage.list_runtime_artifacts()
+    }
+
+    pub fn list_shim_process_records(&self) -> Result<Vec<ShimProcessRecord>> {
+        self.storage.list_shim_processes()
+    }
+
+    pub fn get_shim_process_record(&self, container_id: &str) -> Result<Option<ShimProcessRecord>> {
+        self.storage.get_shim_process(container_id)
+    }
+
+    pub fn delete_shim_process_record(&mut self, container_id: &str) -> Result<()> {
+        self.storage.delete_shim_process(container_id)
     }
 }
 

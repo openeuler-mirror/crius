@@ -16,10 +16,19 @@ limitations under the License.
 
 
 use std::time::Duration;
+use std::path::Path;
+use std::fs;
+use std::net::IpAddr;
 
 use base64::Engine;
 
-use crate::proto::runtime::v1::AuthConfig;
+use crate::proto::runtime::v1::{
+    AuthConfig, HugepageLimit,
+    Device, IdMapping, MountPropagation,
+    Mount, ImageSpec, PortMapping,
+    Protocol, SecurityProfile, 
+    SeLinuxOption,
+};
 
 pub(crate) const DEFAULT_ENDPOINT: &str = "unix:///run/crius/crius.sock";
 
@@ -86,6 +95,26 @@ impl From<AuthConfigJson> for AuthConfig {
             registry_token: value.registry_token,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct KeyValuePair {
+    pub(crate) key: String,
+    pub(crate) value: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct ResourceFragment {
+    pub(crate) cpu_period: Option<i64>,
+    pub(crate) cpu_quota: Option<i64>,
+    pub(crate) cpu_shares: Option<i64>,
+    pub(crate) memory_limit_in_bytes: Option<i64>,
+    pub(crate) memory_swap_limit_in_bytes: Option<i64>,
+    pub(crate) oom_score_adj: Option<i64>,
+    pub(crate) cpuset_cpus: Option<String>,
+    pub(crate) cpuset_mems: Option<String>,
+    pub(crate) hugepages: Vec<HugepageLimit>,
+    pub(crate) unified: Vec<KeyValuePair>,
 }
 
 pub(crate) fn parse_duration(value: &str) -> Result<Duration, String> {
@@ -175,4 +204,669 @@ fn decode_docker_auth(source: &str, auth: &str) -> Result<(String, String), Stri
     };
 
     Ok((username.to_string(), password.to_string()))
+}
+
+fn parse_i64_field(kind: &str, source: &str, value: &str) -> Result<i64, String> {
+    value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid {kind} \"{source}\": expected integer"))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_byte_size(value: &str) -> Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        ));
+    }
+
+    let split_at = trimmed
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, unit) = trimmed.split_at(split_at);
+
+    if digits.is_empty() {
+        return Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        ));
+    }
+
+    let amount = digits
+        .parse::<u64>()
+        .map_err(|_| format!("invalid byte size \"{value}\": value is out of range"))?;
+
+    match unit {
+        "" | "B" => Ok(amount),
+        "KiB" => amount
+            .checked_mul(1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "MiB" => amount
+            .checked_mul(1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "GiB" => amount
+            .checked_mul(1024 * 1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        "TiB" => amount
+            .checked_mul(1024 * 1024 * 1024 * 1024)
+            .ok_or_else(|| format!("invalid byte size \"{value}\": value is out of range")),
+        _ => Err(format!(
+            "invalid byte size \"{value}\": expected an integer optionally followed by B, KiB, MiB, GiB, or TiB"
+        )),
+    }
+}
+
+fn parse_byte_size_as_i64(kind: &str, source: &str, value: &str) -> Result<i64, String> {
+    let bytes = parse_byte_size(value)?;
+    i64::try_from(bytes).map_err(|_| format!("invalid {kind} \"{source}\": value is out of range"))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_key_value(flag: &str, value: &str) -> Result<KeyValuePair, String> {
+    let Some((key, parsed_value)) = value.split_once('=') else {
+        return Err(format!(
+            "invalid {flag} value \"{value}\": expected KEY=VALUE"
+        ));
+    };
+
+    if key.is_empty() {
+        return Err(format!(
+            "invalid {flag} value \"{value}\": key must not be empty"
+        ));
+    }
+
+    Ok(KeyValuePair {
+        key: key.to_string(),
+        value: parsed_value.to_string(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_resource_spec(value: &str) -> Result<ResourceFragment, String> {
+    let mut fragment = ResourceFragment::default();
+    if value.is_empty() {
+        return Err("invalid resource spec \"\": expected comma-separated KEY=VALUE".into());
+    }
+
+    for part in value.split(',') {
+        let pair = parse_key_value("resource spec", part)?;
+        match pair.key.as_str() {
+            "cpu-period" | "cpu_period" => {
+                fragment.cpu_period = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpu-quota" | "cpu_quota" | "cpu" => {
+                fragment.cpu_quota = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpu-shares" | "cpu_shares" => {
+                fragment.cpu_shares = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "memory" => {
+                fragment.memory_limit_in_bytes =
+                    Some(parse_byte_size_as_i64("resource spec", value, &pair.value)?)
+            }
+            "swap" | "memory-swap" | "memory_swap" => {
+                fragment.memory_swap_limit_in_bytes =
+                    Some(parse_byte_size_as_i64("resource spec", value, &pair.value)?)
+            }
+            "oom" | "oom-score-adj" | "oom_score_adj" => {
+                fragment.oom_score_adj = Some(parse_i64_field("resource spec", value, &pair.value)?)
+            }
+            "cpuset" | "cpuset-cpus" | "cpuset_cpus" => fragment.cpuset_cpus = Some(pair.value),
+            "cpuset-mems" | "cpuset_mems" => fragment.cpuset_mems = Some(pair.value),
+            "hugepage" => fragment.hugepages.push(parse_hugepage(&pair.value)?),
+            "unified" => fragment
+                .unified
+                .push(parse_key_value("resource unified", &pair.value)?),
+            key => {
+                return Err(format!(
+                    "invalid resource spec \"{value}\": unsupported key \"{key}\""
+                ));
+            }
+        }
+    }
+
+    Ok(fragment)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_hugepage(value: &str) -> Result<HugepageLimit, String> {
+    let Some((page_size, limit)) = value.split_once('=') else {
+        return Err(format!("invalid hugepage \"{value}\": expected SIZE=BYTES"));
+    };
+    if page_size.is_empty() || limit.is_empty() {
+        return Err(format!(
+            "invalid hugepage \"{value}\": size and bytes must not be empty"
+        ));
+    }
+
+    Ok(HugepageLimit {
+        page_size: page_size.to_string(),
+        limit: parse_byte_size(limit)?,
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_device(value: &str) -> Result<Device, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.is_empty() || parts.len() > 3 || parts[0].is_empty() {
+        return Err(format!(
+            "invalid device \"{value}\": expected HOST[:CONTAINER[:PERMS]]"
+        ));
+    }
+
+    let host_path = parts[0].to_string();
+    let container_path = parts
+        .get(1)
+        .filter(|path| !path.is_empty())
+        .copied()
+        .unwrap_or(parts[0])
+        .to_string();
+    let permissions = parts.get(2).copied().unwrap_or("rwm");
+    validate_device_permissions(value, permissions)?;
+
+    Ok(Device {
+        container_path,
+        host_path,
+        permissions: permissions.to_string(),
+    })
+}
+
+fn validate_device_permissions(source: &str, permissions: &str) -> Result<(), String> {
+    if permissions.is_empty() {
+        return Err(format!(
+            "invalid device \"{source}\": permissions must contain r, w, and/or m"
+        ));
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for permission in permissions.chars() {
+        if !matches!(permission, 'r' | 'w' | 'm') || !seen.insert(permission) {
+            return Err(format!(
+                "invalid device \"{source}\": permissions must contain unique r, w, and/or m"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_env_file(path: impl AsRef<Path>) -> Result<Vec<KeyValuePair>, String> {
+    let path = path.as_ref();
+    let source = path.display().to_string();
+    let content = fs::read_to_string(path)
+        .map_err(|error| format!("failed to read env file \"{source}\": {error}"))?;
+
+    content
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                None
+            } else {
+                Some((index + 1, line))
+            }
+        })
+        .map(|(line_number, line)| {
+            parse_key_value("env file", line).map_err(|error| {
+                format!("invalid env file \"{source}\" line {line_number}: {error}")
+            })
+        })
+        .collect()
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_id_mapping(value: &str) -> Result<IdMapping, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid ID mapping \"{value}\": expected HOST:CONTAINER:LENGTH"
+        ));
+    }
+    let host_id = parse_id_mapping_field(value, parts[0])?;
+    let container_id = parse_id_mapping_field(value, parts[1])?;
+    let length = parse_id_mapping_field(value, parts[2])?;
+    if length == 0 {
+        return Err(format!(
+            "invalid ID mapping \"{value}\": length must be greater than 0"
+        ));
+    }
+
+    Ok(IdMapping {
+        host_id,
+        container_id,
+        length,
+    })
+}
+
+fn parse_id_mapping_field(source: &str, value: &str) -> Result<u32, String> {
+    value.parse::<u32>().map_err(|_| {
+        format!("invalid ID mapping \"{source}\": fields must be non-negative integers")
+    })
+}
+
+fn apply_mount_option(
+    source: &str,
+    option: &str,
+    readonly: &mut bool,
+    selinux_relabel: &mut bool,
+) -> Result<(), String> {
+    match option {
+        "ro" | "readonly" => {
+            *readonly = true;
+            Ok(())
+        }
+        "rw" => {
+            *readonly = false;
+            Ok(())
+        }
+        "z" | "Z" => {
+            *selinux_relabel = true;
+            Ok(())
+        }
+        "" => Err(format!("invalid mount \"{source}\": empty mount option")),
+        _ => Err(format!(
+            "invalid mount \"{source}\": unsupported mount option \"{option}\""
+        )),
+    }
+}
+
+fn parse_bool(kind: &str, source: &str, value: &str) -> Result<bool, String> {
+    match value {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!(
+            "invalid {kind} \"{source}\": expected boolean true or false"
+        )),
+    }
+}
+
+fn parse_mount_propagation(source: &str, value: &str) -> Result<i32, String> {
+    match value {
+        "private" | "rprivate" => Ok(MountPropagation::PropagationPrivate as i32),
+        "host-to-container" | "rslave" => {
+            Ok(MountPropagation::PropagationHostToContainer as i32)
+        }
+        "bidirectional" | "rshared" => Ok(MountPropagation::PropagationBidirectional as i32),
+        _ => Err(format!(
+            "invalid mount \"{source}\": propagation must be private, host-to-container, or bidirectional"
+        )),
+    }
+}
+
+fn parse_mount_id_mapping(source: &str, value: &str) -> Result<IdMapping, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 3 {
+        return Err(format!(
+            "invalid mount \"{source}\": ID mapping must be HOST:CONTAINER:LENGTH"
+        ));
+    }
+    let host_id = parse_u32_field("mount", source, parts[0])?;
+    let container_id = parse_u32_field("mount", source, parts[1])?;
+    let length = parse_u32_field("mount", source, parts[2])?;
+    if length == 0 {
+        return Err(format!(
+            "invalid mount \"{source}\": ID mapping length must be greater than 0"
+        ));
+    }
+
+    Ok(IdMapping {
+        host_id,
+        container_id,
+        length,
+    })
+}
+
+fn parse_u32_field(kind: &str, source: &str, value: &str) -> Result<u32, String> {
+    value
+        .parse::<u32>()
+        .map_err(|_| format!("invalid {kind} \"{source}\": expected non-negative integer"))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_mount(value: &str) -> Result<Mount, String> {
+    let mut mount_type: Option<String> = None;
+    let mut source: Option<String> = None;
+    let mut destination: Option<String> = None;
+    let mut image: Option<String> = None;
+    let mut image_sub_path = String::new();
+    let mut readonly = false;
+    let mut selinux_relabel = false;
+    let mut recursive_read_only = false;
+    let mut propagation = MountPropagation::PropagationPrivate as i32;
+    let mut uid_mappings = Vec::new();
+    let mut gid_mappings = Vec::new();
+
+    for part in value.split(',') {
+        if part.is_empty() {
+            return Err(format!(
+                "invalid mount \"{value}\": entries must not be empty"
+            ));
+        }
+        let Some((key, raw_value)) = part.split_once('=') else {
+            match part {
+                "ro" | "readonly" => readonly = true,
+                "rw" => readonly = false,
+                "z" | "Z" => selinux_relabel = true,
+                "recursive-ro" | "recursive_read_only" => recursive_read_only = true,
+                _ => {
+                    return Err(format!(
+                        "invalid mount \"{value}\": option \"{part}\" must be KEY=VALUE or a supported flag"
+                    ));
+                }
+            }
+            continue;
+        };
+
+        match key {
+            "type" => mount_type = Some(raw_value.to_string()),
+            "src" | "source" => source = Some(raw_value.to_string()),
+            "dst" | "target" | "destination" => destination = Some(raw_value.to_string()),
+            "image" => image = Some(raw_value.to_string()),
+            "subpath" | "image-subpath" | "image_sub_path" => {
+                image_sub_path = raw_value.to_string()
+            }
+            "options" | "option" => {
+                for option in raw_value.split(':') {
+                    apply_mount_option(value, option, &mut readonly, &mut selinux_relabel)?;
+                }
+            }
+            "readonly" | "ro" => readonly = parse_bool("mount", value, raw_value)?,
+            "recursive-ro" | "recursive_read_only" => {
+                recursive_read_only = parse_bool("mount", value, raw_value)?
+            }
+            "propagation" => propagation = parse_mount_propagation(value, raw_value)?,
+            "uidmap" | "uid-map" => uid_mappings.push(parse_mount_id_mapping(value, raw_value)?),
+            "gidmap" | "gid-map" => gid_mappings.push(parse_mount_id_mapping(value, raw_value)?),
+            _ => {
+                return Err(format!(
+                    "invalid mount \"{value}\": unsupported key \"{key}\""
+                ));
+            }
+        }
+    }
+
+    let mount_type = mount_type
+        .ok_or_else(|| format!("invalid mount \"{value}\": type must be bind or image"))?;
+    let container_path =
+        destination.ok_or_else(|| format!("invalid mount \"{value}\": dst/target is required"))?;
+
+    if recursive_read_only
+        && (!readonly || propagation != MountPropagation::PropagationPrivate as i32)
+    {
+        return Err(format!(
+            "invalid mount \"{value}\": recursive-ro requires readonly=true and private propagation"
+        ));
+    }
+
+    match mount_type.as_str() {
+        "bind" => {
+            let host_path = source.ok_or_else(|| {
+                format!("invalid mount \"{value}\": bind mount requires src/source")
+            })?;
+            if image.is_some() {
+                return Err(format!(
+                    "invalid mount \"{value}\": bind mount must not include image"
+                ));
+            }
+            Ok(Mount {
+                container_path,
+                host_path,
+                readonly,
+                selinux_relabel,
+                propagation,
+                uid_mappings,
+                gid_mappings,
+                recursive_read_only,
+                image: None,
+                image_sub_path,
+            })
+        }
+        "image" => {
+            if source.is_some() {
+                return Err(format!(
+                    "invalid mount \"{value}\": image mount must not include src/source"
+                ));
+            }
+            let image = image
+                .ok_or_else(|| format!("invalid mount \"{value}\": image mount requires image"))?;
+            Ok(Mount {
+                container_path,
+                host_path: String::new(),
+                readonly: true,
+                selinux_relabel,
+                propagation,
+                uid_mappings,
+                gid_mappings,
+                recursive_read_only,
+                image: Some(ImageSpec {
+                    image,
+                    annotations: Default::default(),
+                    user_specified_image: String::new(),
+                    runtime_handler: String::new(),
+                }),
+                image_sub_path,
+            })
+        }
+        _ => Err(format!(
+            "invalid mount \"{value}\": type must be bind or image"
+        )),
+    }
+}
+
+fn parse_port(source: &str, value: &str) -> Result<i32, String> {
+    let port = value
+        .parse::<u16>()
+        .map_err(|_| format!("invalid port mapping \"{source}\": port must be 1-65535"))?;
+    if port == 0 {
+        return Err(format!(
+            "invalid port mapping \"{source}\": port must be 1-65535"
+        ));
+    }
+    Ok(i32::from(port))
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_port_mapping(value: &str) -> Result<PortMapping, String> {
+    parse_port_mapping_with_host_ip(value, None)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_port_mapping_with_host_ip(
+    value: &str,
+    default_host_ip: Option<&str>,
+) -> Result<PortMapping, String> {
+    let (mapping, protocol) = value.split_once('/').unwrap_or((value, "tcp"));
+    let protocol = parse_protocol(value, protocol)?;
+    let (host_ip, ports) = split_mapping_host_ip(value, mapping, default_host_ip)?;
+    let (host_port, container_port) = ports.split_once(':').ok_or_else(|| {
+        format!("invalid port mapping \"{value}\": expected HOST:CONTAINER[/PROTO]")
+    })?;
+
+    Ok(PortMapping {
+        protocol,
+        container_port: parse_port(value, container_port)?,
+        host_port: parse_port(value, host_port)?,
+        host_ip,
+    })
+}
+
+fn parse_protocol(source: &str, protocol: &str) -> Result<i32, String> {
+    match protocol.to_ascii_lowercase().as_str() {
+        "tcp" => Ok(Protocol::Tcp as i32),
+        "udp" => Ok(Protocol::Udp as i32),
+        "sctp" => Ok(Protocol::Sctp as i32),
+        _ => Err(format!(
+            "invalid port mapping \"{source}\": protocol must be tcp, udp, or sctp"
+        )),
+    }
+}
+
+fn split_mapping_host_ip<'a>(
+    source: &str,
+    mapping: &'a str,
+    default_host_ip: Option<&str>,
+) -> Result<(String, &'a str), String> {
+    if let Some(rest) = mapping.strip_prefix('[') {
+        let Some((host_ip, ports)) = rest.split_once("]:") else {
+            return Err(format!(
+                "invalid port mapping \"{source}\": bracket IPv6 host IP must be followed by :HOST:CONTAINER"
+            ));
+        };
+        host_ip
+            .parse::<std::net::Ipv6Addr>()
+            .map_err(|error| format!("invalid port mapping \"{source}\": {error}"))?;
+        return Ok((host_ip.to_string(), ports));
+    }
+
+    let colon_count = mapping.matches(':').count();
+    match colon_count {
+        1 => Ok((default_host_ip.unwrap_or_default().to_string(), mapping)),
+        2 => {
+            let Some((host_ip, ports)) = mapping.split_once(':') else {
+                unreachable!("colon_count checked above")
+            };
+            host_ip
+                .parse::<IpAddr>()
+                .map_err(|error| format!("invalid port mapping \"{source}\": {error}"))?;
+            Ok((host_ip.to_string(), ports))
+        }
+        count if count > 2 => Err(format!(
+            "invalid port mapping \"{source}\": IPv6 host IP must be enclosed in brackets"
+        )),
+        _ => Err(format!(
+            "invalid port mapping \"{source}\": expected HOST:CONTAINER[/PROTO]"
+        )),
+    }
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_security_profile(value: &str) -> Result<SecurityProfile, String> {
+    let profile_type = match value {
+        "runtime/default" => {
+            crate::proto::runtime::v1::security_profile::ProfileType::RuntimeDefault
+        }
+        "unconfined" => crate::proto::runtime::v1::security_profile::ProfileType::Unconfined,
+        _ => {
+            let Some(localhost_ref) = value.strip_prefix("localhost:") else {
+                return Err(format!(
+                    "invalid security profile \"{value}\": expected runtime/default, unconfined, or localhost:VALUE"
+                ));
+            };
+            if localhost_ref.is_empty() {
+                return Err(format!(
+                    "invalid security profile \"{value}\": localhost value must not be empty"
+                ));
+            }
+            return Ok(SecurityProfile {
+                profile_type: crate::proto::runtime::v1::security_profile::ProfileType::Localhost
+                    as i32,
+                localhost_ref: localhost_ref.to_string(),
+            });
+        }
+    };
+
+    Ok(SecurityProfile {
+        profile_type: profile_type as i32,
+        localhost_ref: String::new(),
+    })
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_selinux_option(value: &str) -> Result<SeLinuxOption, String> {
+    let parts: Vec<_> = value.split(':').collect();
+    if parts.len() != 4 {
+        return Err(format!(
+            "invalid SELinux option \"{value}\": expected user:role:type:level"
+        ));
+    }
+
+    Ok(SeLinuxOption {
+        user: parts[0].to_string(),
+        role: parts[1].to_string(),
+        r#type: parts[2].to_string(),
+        level: parts[3].to_string(),
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum ParsedUser {
+    Id { uid: i64, gid: Option<i64> },
+    Name(String),
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_user(value: &str) -> Result<ParsedUser, String> {
+    if value.is_empty() {
+        return Err("invalid user \"\": expected UID, UID:GID, or username".into());
+    }
+
+    if let Some((uid, gid)) = value.split_once(':') {
+        if uid.is_empty() || gid.is_empty() {
+            return Err(format!(
+                "invalid user \"{value}\": UID and GID must not be empty"
+            ));
+        }
+        return Ok(ParsedUser::Id {
+            uid: parse_user_id(value, uid)?,
+            gid: Some(parse_user_id(value, gid)?),
+        });
+    }
+
+    match value.parse::<i64>() {
+        Ok(uid) if uid >= 0 => Ok(ParsedUser::Id { uid, gid: None }),
+        Ok(_) => Err(format!(
+            "invalid user \"{value}\": UID must be non-negative"
+        )),
+        Err(_) => Ok(ParsedUser::Name(value.to_string())),
+    }
+}
+
+fn parse_user_id(source: &str, value: &str) -> Result<i64, String> {
+    let id = value
+        .parse::<i64>()
+        .map_err(|_| format!("invalid user \"{source}\": UID and GID must be numeric"))?;
+    if id < 0 {
+        return Err(format!(
+            "invalid user \"{source}\": UID and GID must be non-negative"
+        ));
+    }
+    Ok(id)
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_since(value: &str) -> Result<i64, String> {
+    parse_since_at(value, chrono::Utc::now())
+}
+
+#[allow(dead_code)]
+pub(crate) fn parse_since_at(
+    value: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<i64, String> {
+    if value.trim().is_empty() {
+        return Err("invalid since \"\": expected RFC3339 timestamp or duration".into());
+    }
+
+    if let Ok(timestamp) = chrono::DateTime::parse_from_rfc3339(value) {
+        return timestamp_to_unix_nanos(timestamp.with_timezone(&chrono::Utc), value);
+    }
+
+    let duration = parse_duration(value).map_err(|_| {
+        format!("invalid since \"{value}\": expected RFC3339 timestamp or duration")
+    })?;
+    let chrono_duration = chrono::Duration::from_std(duration)
+        .map_err(|_| format!("invalid since \"{value}\": duration is out of range"))?;
+    let since = now
+        .checked_sub_signed(chrono_duration)
+        .ok_or_else(|| format!("invalid since \"{value}\": duration is out of range"))?;
+    timestamp_to_unix_nanos(since, value)
+}
+
+fn timestamp_to_unix_nanos(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    source: &str,
+) -> Result<i64, String> {
+    timestamp
+        .timestamp_nanos_opt()
+        .ok_or_else(|| format!("invalid since \"{source}\": timestamp is out of range"))
 }
