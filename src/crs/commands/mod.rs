@@ -17,14 +17,11 @@ limitations under the License.
 pub(crate) mod shortcuts;
 pub(crate) mod image;
 pub(crate) mod status;
-pub(crate) mod config;
 pub(crate) mod version;
 pub(crate) mod run;
 pub(crate) mod container;
 pub(crate) mod logs;
 pub(crate) mod exec;
-
-use std::unimplemented;
 
 use crate::crs::{
     args::Command, client::CrsClient, context::CliContext, error::{CliError, CommandResult},
@@ -50,7 +47,5 @@ pub(crate) async fn dispatch(
         }
         Command::Image(args) => image::handle(ctx, client, args).await,
         Command::Inspect(args) => shortcuts::handle_inspect(ctx, client, args).await,
-        Command::Debug(args) => unimplemented!(),
-        Command::Completion(args) => unimplemented!(),
     }
 }

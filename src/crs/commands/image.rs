@@ -40,7 +40,6 @@ use crate::crs::{
     },
     commands::{
         status::{render_and_print, parse_info_map},
-        config::load_effective_config
     },
     builders::build_auth_config,
 };
@@ -55,9 +54,6 @@ pub(crate) async fn handle(
         ImageCommand::Pull(args) => handle_pull(ctx, client, args, "crs image pull").await,
         ImageCommand::Inspect { image } => handle_inspect(ctx, client, image).await,
         ImageCommand::Remove { image } => handle_remove(ctx, client, image).await,
-        ImageCommand::FsInfo => handle_fs_info(ctx, client).await,
-        ImageCommand::Transfers => handle_transfers(ctx, client).await,
-        ImageCommand::Config => handle_config(ctx, client).await,
     }
 }
 
@@ -214,146 +210,6 @@ pub(crate) async fn handle_remove(
     handle_remove_with_command(ctx, client, image, "crs image remove").await
 }
 
-async fn handle_fs_info(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
-    let mut image_client = client.image()?;
-    let response = client
-        .with_rpc_timeout(async {
-            image_client
-                .image_fs_info(ImageFsInfoRequest {})
-                .await
-                .map_err(|status| {
-                    CliError::from_tonic_status(status)
-                        .with_command("crs image fs-info")
-                        .with_endpoint(client.endpoint())
-                })
-        })
-        .await?
-        .into_inner();
-
-    let image_filesystem_count = response.image_filesystems.len();
-    let container_filesystem_count = response.container_filesystems.len();
-    let total_used_bytes = response
-        .image_filesystems
-        .iter()
-        .chain(response.container_filesystems.iter())
-        .map(used_bytes)
-        .sum::<u64>();
-
-    let mut views = response
-        .image_filesystems
-        .into_iter()
-        .map(|usage| filesystem_view("image", usage))
-        .collect::<Vec<_>>();
-    views.extend(
-        response
-            .container_filesystems
-            .into_iter()
-            .map(|usage| filesystem_view("container", usage)),
-    );
-
-    render_and_print(
-        ctx,
-        CommandOutput::new("ImageFsInfo", client.endpoint(), views).with_summary(
-            serde_json::json!({
-                "count": image_filesystem_count + container_filesystem_count,
-                "imageFilesystemCount": image_filesystem_count,
-                "containerFilesystemCount": container_filesystem_count,
-                "totalUsedBytes": total_used_bytes,
-            }),
-        ),
-    )
-}
-
-async fn handle_transfers(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
-    let mut warnings = Vec::new();
-    let views = if let Ok(mut diagnostics) = client.diagnostics() {
-        match client
-            .with_rpc_timeout(async {
-                diagnostics
-                    .image_transfers(ImageTransfersRequest {
-                        include_completed: false,
-                    })
-                    .await
-                    .map_err(|status| {
-                        CliError::from_diagnostics_status(status, client.endpoint())
-                            .with_command("crs image transfers")
-                    })
-            })
-            .await
-        {
-            Ok(response) => response
-                .into_inner()
-                .transfers
-                .into_iter()
-                .filter(|transfer| transfer.status != "succeeded")
-                .map(|transfer| ImageTransferView {
-                    image: transfer.image,
-                    status: transfer.status,
-                    updated: crate::crs::format::format_unix_nanos(
-                        transfer.updated_at_unix_nanos,
-                        std::time::SystemTime::now(),
-                    ),
-                    error: transfer.error,
-                })
-                .collect::<Vec<_>>(),
-            Err(error) => {
-                warnings.push(format!(
-                    "failed to read diagnostics image transfers: {error}"
-                ));
-                load_transfers_from_status(client, &mut warnings).await?
-            }
-        }
-    } else {
-        warnings.push(client.diagnostics_unavailable().to_string());
-        load_transfers_from_status(client, &mut warnings).await?
-    };
-
-    render_and_print(
-        ctx,
-        CommandOutput::new("ImageTransfers", client.endpoint(), views.clone())
-            .with_summary(serde_json::json!({ "count": views.len() }))
-            .with_warnings(warnings),
-    )
-}
-
-async fn handle_config(ctx: &CliContext, client: &CrsClient) -> Result<CommandResult, CliError> {
-    let mut warnings = Vec::new();
-    let (config, _) = load_effective_config(client, "crs image config", &mut warnings)
-        .await
-        .ok_or_else(|| {
-            CliError::diagnostics_unavailable(client.endpoint()).with_command("crs image config")
-        })?;
-    let image_config = extract_image_config(&config);
-    let view = ImageConfigView {
-        snapshotter: string_field(&image_config, &["snapshotter", "defaultSnapshotter"])
-            .or_else(|| {
-                config
-                    .pointer("/imageSnapshotModel/snapshotter")
-                    .and_then(crate::crs::commands::config::value_to_display)
-            })
-            .unwrap_or_else(|| "unknown".to_string()),
-        policy: string_field(
-            &image_config,
-            &["signaturePolicy", "signaturePolicyDir", "policy"],
-        )
-        .unwrap_or_else(|| "unknown".to_string()),
-        auth_configured: auth_summary(&image_config),
-        pinned_images: string_array(&image_config, "pinnedImages").join(","),
-        config: image_config,
-    };
-
-    render_and_print(
-        ctx,
-        CommandOutput::new("ImageConfig", client.endpoint(), vec![view.clone()])
-            .with_summary(serde_json::json!({
-                "snapshotter": view.snapshotter,
-                "authConfigured": view.auth_configured,
-                "pinnedImages": view.pinned_images,
-            }))
-            .with_warnings(warnings),
-    )
-}
-
 
 fn extract_image_config(config: &serde_json::Value) -> serde_json::Value {
     config
@@ -370,7 +226,7 @@ fn string_array(value: &serde_json::Value, key: &str) -> Vec<String> {
         .map(|items| {
             items
                 .iter()
-                .filter_map(crate::crs::commands::config::value_to_display)
+                .filter_map(|v| v.as_str().map(|s| s.to_string()))
                 .collect()
         })
         .unwrap_or_default()
@@ -632,5 +488,5 @@ fn used_bytes(usage: &FilesystemUsage) -> u64 {
 fn string_field(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| value.get(*key))
-        .find_map(crate::crs::commands::config::value_to_display)
+        .find_map(|v| v.as_str().map(|s| s.to_string()))
 }

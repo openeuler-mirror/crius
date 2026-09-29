@@ -63,62 +63,6 @@ struct Args {
     #[clap(long)]
     listen: Option<String>,
 
-    /// Override the OCI runtime binary path.
-    #[clap(long)]
-    runtime_path: Option<PathBuf>,
-
-    /// Override the runtime-specific config file path.
-    #[clap(long)]
-    runtime_config_path: Option<PathBuf>,
-
-    /// Override the runtime state/runroot directory.
-    #[clap(long)]
-    runtime_root: Option<PathBuf>,
-
-    /// Override the pause image reference used for PodSandbox.
-    #[clap(long)]
-    pause_image: Option<String>,
-
-    /// Override CNI config directories, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    cni_config_dirs: Vec<String>,
-
-    /// Override CNI plugin directories, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    cni_plugin_dirs: Vec<String>,
-
-    /// Override the streaming server bind address.
-    #[clap(long)]
-    stream_address: Option<String>,
-
-    /// Override the streaming server bind port.
-    #[clap(long)]
-    stream_port: Option<u16>,
-
-    /// Override whether the streaming server uses TLS.
-    #[clap(long)]
-    stream_enable_tls: Option<bool>,
-
-    /// Override the streaming TLS certificate file path.
-    #[clap(long)]
-    stream_tls_cert_file: Option<PathBuf>,
-
-    /// Override the streaming TLS private key file path.
-    #[clap(long)]
-    stream_tls_key_file: Option<PathBuf>,
-
-    /// Override the streaming TLS client CA file path.
-    #[clap(long)]
-    stream_tls_ca_file: Option<PathBuf>,
-
-    /// Override the streaming TLS minimum version.
-    #[clap(long)]
-    stream_tls_min_version: Option<String>,
-
-    /// Override the streaming TLS cipher suite list, comma-separated.
-    #[clap(long, value_delimiter = ',')]
-    stream_tls_cipher_suites: Vec<String>,
-
     /// Print the built-in default configuration as TOML and exit.
     #[clap(long, conflicts_with = "write_default_config")]
     dump_default_config: bool,

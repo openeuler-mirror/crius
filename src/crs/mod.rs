@@ -68,15 +68,11 @@ where
         }
     };
 
-    let client = if matches!(args.command, Command::Completion(_)) {
-        CrsClient::new(&ctx)
-    } else {
-        match CrsClient::connect(&ctx).await {
-            Ok(client) => client,
-            Err(error) => {
-                error.render(ctx.output());
-                return CommandResult::failure(error.exit_status());
-            }
+    let client = match CrsClient::connect(&ctx).await {
+        Ok(client) => client,
+        Err(error) => {
+            error.render(ctx.output());
+            return CommandResult::failure(error.exit_status());
         }
     };
 

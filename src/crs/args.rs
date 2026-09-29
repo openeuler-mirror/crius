@@ -71,8 +71,6 @@ pub enum Command {
     },
     Image(ImageArgs),
     Inspect(InspectArgs),
-    Debug(DebugArgs),
-    Completion(CompletionArgs),
 }
 
 #[derive(Debug, ClapArgs)]
@@ -188,9 +186,6 @@ pub enum ImageCommand {
     Pull(ImagePullArgs),
     Inspect { image: String },
     Remove { image: String },
-    FsInfo,
-    Transfers,
-    Config,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -211,52 +206,6 @@ pub struct InspectArgs {
     #[arg(long = "type", value_enum)]
     pub object_type: Option<ObjectType>,
     pub target: String,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum DebugCommand {
-    Network,
-    Runtime,
-    Shims,
-    Nri,
-    Security,
-    Cgroups,
-    Streaming,
-    Metrics,
-    Tracing,
-    Rootless,
-}
-
-#[derive(Debug, ClapArgs)]
-pub struct DebugArgs {
-    #[command(subcommand)]
-    pub command: DebugCommand,
-}
-
-#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
-pub enum CompletionShell {
-    Bash,
-    Zsh,
-    Fish,
-    Powershell,
-}
-
-#[derive(Debug, ClapArgs)]
-pub struct CompletionArgs {
-    #[arg(value_enum)]
-    pub shell: CompletionShell,
-}
-
-#[derive(Debug, ClapArgs)]
-pub struct ConfigArgs {
-    #[command(subcommand)]
-    pub command: ConfigCommand,
-}
-
-#[derive(Debug, Subcommand)]
-pub enum ConfigCommand {
-    Show,
-    ReloadStatus,
 }
 
 #[derive(Debug, Default, ClapArgs)]
