@@ -35,7 +35,7 @@ use crate::network::CniConfig;
 use crate::network::types::MainIpPreference;
 
 /// 守护进程主配置。
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// 持久化根目录。
@@ -64,6 +64,19 @@ pub struct Config {
 
     // NRI 配置
     // pub nri: NriConfig,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            root: "/var/lib/crius".to_string(),
+            api: ApiConfig::default(),
+            runtime: RuntimeConfig::default(),
+            image: ImageConfig::default(),
+            network: NetworkConfig::default(),
+            logging: LoggingConfig::default(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

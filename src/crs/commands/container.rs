@@ -18,7 +18,7 @@ limitations under the License.
 use crate::proto::runtime::v1::{
     ListContainersRequest, ContainerFilter,
     ContainerStateValue, ContainerState,
-    Container,
+    Container, ExecSyncRequest,
 };
 use crate::crs::{
     CliContext, CrsClient,
@@ -138,4 +138,64 @@ fn container_state_name(state: i32) -> &'static str {
         Some(ContainerState::ContainerUnknown) => "unknown",
         None => "unknown",
     }
+}
+
+pub(crate) async fn exec_sync_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: crate::crs::args::ExecArgs,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
+    let options = crate::crs::streaming::ExecStreamOptions::from_args(
+        args.container,
+        args.command,
+        args.stream,
+    )?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .exec_sync(ExecSyncRequest {
+                    container_id: options.container_id.clone(),
+                    cmd: options.command.clone(),
+                    timeout: 0,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command(command_name)
+                        .with_endpoint(client.endpoint())
+                        .with_object(format!("container {}", options.container_id))
+                })
+        })
+        .await?
+        .into_inner();
+
+    if matches!(ctx.output(), crate::crs::args::OutputArg::Json) {
+        let envelope = serde_json::json!({
+            "kind": "ContainerExecSync",
+            "apiVersion": crate::crs::format::API_VERSION,
+            "endpoint": client.endpoint(),
+            "summary": {
+                "containerId": options.container_id,
+                "exitCode": response.exit_code,
+            },
+            "stdout": String::from_utf8_lossy(&response.stdout),
+            "stderr": String::from_utf8_lossy(&response.stderr),
+            "warnings": [],
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&envelope).map_err(|source| CliError::internal(
+                format!("failed to render exec-sync JSON: {source}")
+            ))?
+        );
+    } else {
+        std::io::Write::write_all(&mut std::io::stdout(), &response.stdout)
+            .map_err(|source| CliError::internal(format!("failed to write stdout: {source}")))?;
+        std::io::Write::write_all(&mut std::io::stderr(), &response.stderr)
+            .map_err(|source| CliError::internal(format!("failed to write stderr: {source}")))?;
+    }
+
+    Ok(CommandResult::from_code(response.exit_code))
 }

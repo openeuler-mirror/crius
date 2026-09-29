@@ -633,6 +633,9 @@ impl RuntimeServiceImpl {
                 .collect(),
             ..Default::default()
         }));
+        let attach_socket_dir = config.attach_socket_dir.clone();
+        let container_exits_dir = config.container_exits_dir.clone();
+        let clean_shutdown_file = config.clean_shutdown_file.clone();
         let service = Self { 
             containers, 
             pod_sandboxes, 
@@ -646,10 +649,10 @@ impl RuntimeServiceImpl {
             persistence,
             events,
             internal_services,
-            shim_work_dir: PathBuf::new(), 
-            attach_socket_dir: PathBuf::new(), 
-            container_exits_dir: PathBuf::new(), 
-            clean_shutdown_file: PathBuf::new(), 
+            shim_work_dir: resolved_shim_work_dir.clone(), 
+            attach_socket_dir, 
+            container_exits_dir, 
+            clean_shutdown_file, 
             last_startup_clean_shutdown: Arc::new(StdMutex::new(None)), 
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
             reloadable_config,
@@ -996,9 +999,11 @@ impl RuntimeServiceImpl {
     }
 
     pub async fn container_log_path(&self, container_id: &str) -> Result<PathBuf, tonic::Status> {
+        let resolved_id = self.resolve_container_id_if_exists(container_id).await?
+            .ok_or_else(|| tonic::Status::not_found("container not found"))?;
         let container = {
             let containers = self.containers.lock().await;
-            containers.get(container_id).cloned()
+            containers.get(&resolved_id).cloned()
         }
         .ok_or_else(|| tonic::Status::not_found("container not found"))?;
 

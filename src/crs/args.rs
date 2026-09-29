@@ -63,6 +63,7 @@ pub enum Command {
     Images(ImageListArgs),
     Run(Box<RunArgs>),
     Ps(ListArgs),
+    Exec(ExecArgs),
     Logs(ContainerLogsArgs),
     Pull(ImagePullArgs),
     Rmi {
@@ -72,6 +73,15 @@ pub enum Command {
     Inspect(InspectArgs),
     Debug(DebugArgs),
     Completion(CompletionArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct ExecArgs {
+    #[command(flatten)]
+    pub stream: StreamOptions,
+    pub container: String,
+    #[arg(last = true, required = true)]
+    pub command: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
