@@ -25,6 +25,7 @@ use std::time::Instant;
 
 use tonic::{Response, Status};
 use anyhow::Context;
+use serde::Serialize;
 
 use crate::proto::runtime::v1::runtime_service_server::RuntimeService;
 use crate::proto::runtime::v1::*;
@@ -42,10 +43,13 @@ use crate::runtime::runc_backend::RuncBackend;
 use crate::network::CniConfig;
 use crate::server::state_model::{
     StoredRuntimeNetworkConfig, StoredLinuxResources,
+    StoredContainerState,
 };
+use crate::streaming::StreamingServer;
 use crate::defaults::{
     CRIO_RUNTIME_HANDLER_ANNOTATION,
     CONTAINERD_RUNTIME_HANDLER_ANNOTATION,
+    INTERNAL_CONTAINER_STATE_KEY,
 };
 
 /// 运行时配置
@@ -471,6 +475,7 @@ pub struct RuntimeServiceImpl {
     pub(super) runtime: RuntimeRegistry,
     pub(super) image_service: ImageServiceImpl,
     pub(super) persistence: Arc<Mutex<PersistenceManager>>,
+    pub(super) streaming: Arc<Mutex<Option<StreamingServer>>>,
     pub(super) events: tokio::sync::broadcast::Sender<ContainerEventResponse>,
     pub(super) internal_services: crate::service::InternalServices,
     pub(super) shim_work_dir: PathBuf,
@@ -649,6 +654,7 @@ impl RuntimeServiceImpl {
             runtime_network_config: Arc::new(Mutex::new(runtime_network_config)),
             reloadable_config,
             reload_state,
+            streaming: Arc::new(Mutex::new(None)),
         };
         service
     }
@@ -970,6 +976,194 @@ impl RuntimeServiceImpl {
             .clone()
     }
 
+    pub fn diagnostics_snapshot(
+        &self,
+        socket_path: impl Into<String>,
+    ) -> RuntimeDiagnosticsSnapshot {
+        RuntimeDiagnosticsSnapshot {
+            config_path: self.config.config_path.clone(),
+            state_dir: self.config.root_dir.clone(),
+            socket_path: socket_path.into(),
+            image_service: self.image_service.clone(),
+        }
+    }
+
+    pub fn last_startup_clean_shutdown(&self) -> Option<bool> {
+        self.last_startup_clean_shutdown
+            .lock()
+            .ok()
+            .and_then(|state| *state)
+    }
+
+    pub async fn container_log_path(&self, container_id: &str) -> Result<PathBuf, tonic::Status> {
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        }
+        .ok_or_else(|| tonic::Status::not_found("container not found"))?;
+
+        let log_path = Self::read_internal_state::<StoredContainerState>(
+            &container.annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        )
+        .and_then(|state| state.log_path)
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            tonic::Status::failed_precondition(format!(
+                "container {container_id} does not have a configured log path"
+            ))
+        })?;
+        let path = PathBuf::from(log_path);
+        if !path.is_absolute() {
+            return Err(tonic::Status::failed_precondition(
+                "container log path is not absolute",
+            ));
+        }
+
+        let allowed_roots = [self.config.root_dir.clone(), self.config.log_dir.clone()];
+        let parent = path.parent().ok_or_else(|| {
+            tonic::Status::failed_precondition("container log path does not have a parent")
+        })?;
+        let canonical_parent = parent
+            .canonicalize()
+            .map_err(|err| tonic::Status::not_found(format!("container log parent: {err}")))?;
+        let allowed = allowed_roots.iter().any(|root| {
+            if root.as_os_str().is_empty() {
+                return false;
+            }
+            let canonical_root = root.canonicalize().unwrap_or_else(|_| root.clone());
+            canonical_parent.starts_with(canonical_root)
+        });
+        if !allowed {
+            return Err(tonic::Status::permission_denied(
+                "container log path is outside daemon state or log directory",
+            ));
+        }
+
+        Ok(path)
+    }
+
+    pub async fn shim_diagnostics(
+        &self,
+        container_id: Option<&str>,
+    ) -> Result<Vec<RuntimeShimDiagnostics>, String> {
+        let mut records = self
+            .persistence
+            .lock()
+            .await
+            .list_shim_process_records()
+            .map_err(|err| format!("failed to inspect shim ledger: {err}"))?;
+        records.sort_by(|left, right| left.container_id.cmp(&right.container_id));
+
+        let shims = records
+            .into_iter()
+            .filter(|record| {
+                container_id
+                    .map(|id| record.container_id == id)
+                    .unwrap_or(true)
+            })
+            .map(|record| {
+                let task_socket = if record.socket_path.is_empty() {
+                    self.task_socket_path(&record.container_id)
+                        .display()
+                        .to_string()
+                } else {
+                    record.socket_path.clone()
+                };
+                let mut errors = Vec::new();
+                if !task_socket.is_empty() && !PathBuf::from(&task_socket).exists() {
+                    errors.push("task socket is missing".to_string());
+                }
+                if record.shim_pid > 0
+                    && !PathBuf::from("/proc")
+                        .join(record.shim_pid.to_string())
+                        .exists()
+                {
+                    errors.push("shim process is not running".to_string());
+                }
+
+                RuntimeShimDiagnostics {
+                    container_id: record.container_id.clone(),
+                    pid: record.shim_pid,
+                    task_socket,
+                    attach_socket: self
+                        .attach_socket_path(&record.container_id)
+                        .display()
+                        .to_string(),
+                    state: record.state,
+                    error: (!errors.is_empty()).then(|| errors.join("; ")),
+                }
+            })
+            .collect();
+
+        Ok(shims)
+    }
+
+    fn shared_cpuset_annotation_enabled(
+        annotations: &HashMap<String, String>,
+        container_name: Option<&str>,
+    ) -> bool {
+        let Some(container_name) = container_name
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+        else {
+            return false;
+        };
+        let key = format!("cpu-shared.crio.io/{container_name}");
+        annotations
+            .get(&key)
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on" | "enable" | "enabled"
+                )
+            })
+            .unwrap_or(false)
+    }
+
+    async fn container_internal_state(&self, container_id: &str) -> Option<StoredContainerState> {
+        let containers = self.containers.lock().await;
+        containers.get(container_id).and_then(|container| {
+            Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            )
+        })
+    }
+
+    pub(super) async fn effective_exec_cpu_affinity(&self, container_id: &str) -> Option<usize> {
+        if self.config.exec_cpu_affinity != "first" {
+            return None;
+        }
+        let container = {
+            let containers = self.containers.lock().await;
+            containers.get(container_id).cloned()
+        };
+        let shared_enabled = container.as_ref().is_some_and(|container| {
+            Self::shared_cpuset_annotation_enabled(
+                &container.annotations,
+                container
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name.as_str()),
+            )
+        });
+        if shared_enabled && !self.config.shared_cpuset.trim().is_empty() {
+            if let Some(cpu) =
+                crate::runtime::RuncRuntime::first_cpu_from_cpuset(&self.config.shared_cpuset)
+            {
+                return Some(cpu);
+            }
+        }
+
+        self.container_internal_state(container_id)
+            .await
+            .and_then(|state| {
+                state.linux_resources.and_then(|resources| {
+                    crate::runtime::RuncRuntime::first_cpu_from_cpuset(&resources.cpuset_cpus)
+                })
+            })
+    }
 }
 
 
@@ -1267,6 +1461,15 @@ impl RuntimeService for RuntimeServiceImpl {
     }
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RuntimeShimDiagnostics {
+    pub container_id: String,
+    pub pid: u32,
+    pub task_socket: String,
+    pub attach_socket: String,
+    pub state: String,
+    pub error: Option<String>,
+}
 
 #[derive(Debug)]
 pub(super) struct NameReservationGuard {
@@ -1464,6 +1667,73 @@ impl RuntimeRegistry {
             .runtime_context()
             .bundle_path_for(container_id))
     }
+
+    pub(super) fn runtime_handler_name_for_annotations_map(
+        &self,
+        annotations: &HashMap<String, String>,
+    ) -> String {
+        annotations
+            .get(CRIO_RUNTIME_HANDLER_ANNOTATION)
+            .or_else(|| annotations.get(CONTAINERD_RUNTIME_HANDLER_ANNOTATION))
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+            .unwrap_or(self.default_handler.as_str())
+            .to_string()
+    }
+
+    pub(super) fn runtime_handler_name_for_container(
+        &self,
+        container_id: &str,
+    ) -> anyhow::Result<String> {
+        if let Ok(handlers) = self.container_handlers.lock() {
+            if let Some(handler) = handlers.get(container_id) {
+                return Ok(handler.clone());
+            }
+        }
+
+        for (handler, runtime) in self.runtimes.iter() {
+            if runtime
+                .runtime_context()
+                .bundle_path_for(container_id)
+                .exists()
+            {
+                self.remember_container_handler(container_id, handler);
+                return Ok(handler.clone());
+            }
+        }
+
+        Ok(self.default_handler.clone())
+    }
+
+    pub(super) fn restore_attach_shim(&self, container_id: &str) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .restore_attach_shim(container_id)
+    }
+
+    pub(super) fn open_attach_stream(
+        &self,
+        container_id: &str,
+        stdin: bool,
+        stdout: bool,
+        stderr: bool,
+        tty: bool,
+    ) -> anyhow::Result<crate::shim_rpc::OpenAttachStreamResponse> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .open_attach_stream(container_id, stdin, stdout, stderr, tty)
+    }
+
+    pub(super) fn close_attach_stream(
+        &self,
+        container_id: &str,
+        stream_id: &str,
+    ) -> anyhow::Result<()> {
+        self.runtime_for_container(container_id)?
+            .task_controller()
+            .close_attach_stream(container_id, stream_id)
+    }
+
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1545,4 +1815,25 @@ impl ContainerRuntime for RuntimeRegistry {
             .task_controller()
             .update_container_resources(container_id, resources)
     }
+}
+
+#[derive(Clone)]
+pub struct RuntimeDiagnosticsSnapshot {
+    pub config_path: Option<PathBuf>,
+    pub state_dir: PathBuf,
+    pub socket_path: String,
+    pub image_service: ImageServiceImpl,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RuntimeSecurityDiagnosticsSnapshot {
+    pub selinux_enabled: bool,
+    pub rootless_enabled: bool,
+    pub allowed_device_count: usize,
+    pub additional_device_count: usize,
+    pub device_ownership_from_security_context: bool,
+    pub default_capability_count: usize,
+    pub privileged_seccomp_profile: String,
+    pub apparmor_default_profile: String,
 }

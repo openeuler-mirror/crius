@@ -35,7 +35,7 @@ use crate::network::CniConfig;
 use crate::network::types::MainIpPreference;
 
 /// 守护进程主配置。
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     /// 持久化根目录。
@@ -66,7 +66,7 @@ pub struct Config {
     // pub nri: NriConfig,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ApiConfig{
     /// CRI gRPC 监听地址。
     pub listen: String,
@@ -93,7 +93,7 @@ pub struct ApiConfig{
 }
 
 /// 运行时配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RuntimeConfig {
     /// 默认运行时类型/handler 名称。
@@ -423,7 +423,7 @@ impl RuntimeConfig {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ImageConfig{
     /// 镜像存储后端。
     pub driver: String,
@@ -469,7 +469,7 @@ pub struct ImageConfig{
     pub oci_artifact_mount_support: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoggingConfig{
     /// tracing filter/level。
     pub level: String,
@@ -482,7 +482,7 @@ pub struct LoggingConfig{
 }
 
 /// 单个 runtime handler 的细化配置。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RuntimeHandlerConfig {
     /// 该 handler 绑定的 runtime backend 类型。
     pub backend: String,
@@ -525,7 +525,7 @@ pub struct RuntimeHandlerConfig {
     pub cni_max_conf_num: Option<usize>,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct RuntimeWorkloadConfig {
     /// 激活该 workload 的 Pod annotation key。
@@ -538,7 +538,7 @@ pub struct RuntimeWorkloadConfig {
     pub resources: RuntimeWorkloadResources,
 }
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct RuntimeWorkloadResources {
     /// 默认 CPU shares。
     #[serde(rename = "cpushares")]

@@ -3166,6 +3166,24 @@ impl RuncRuntime {
             .and_then(|entry| entry.parse::<usize>().ok())
     }
 
+    pub(crate) fn apply_exec_cpu_affinity_to_tokio_command(
+        command: &mut tokio::process::Command,
+        cpu: Option<usize>,
+    ) {
+        let Some(cpu) = cpu else {
+            return;
+        };
+        unsafe {
+            command.pre_exec(move || {
+                let mut set = nix::sched::CpuSet::new();
+                set.set(cpu)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                nix::sched::sched_setaffinity(nix::unistd::Pid::from_raw(0), &set)
+                    .map_err(|err| std::io::Error::other(err.to_string()))?;
+                Ok(())
+            });
+        }
+    }
 }
 
 impl ContainerRuntime for RuncRuntime {

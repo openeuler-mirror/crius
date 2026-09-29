@@ -64,7 +64,7 @@ impl CrsClient {
         let channel = client.connect_channel().await?;
         client.runtime = Some(RuntimeServiceClient::new(channel.clone()));
         client.image = Some(ImageServiceClient::new(channel.clone()));
-        // client.diagnostics = Some(DiagnosticsServiceClient::new(channel.clone()));
+        client.diagnostics = Some(DiagnosticsServiceClient::new(channel.clone()));
         client.local = Some(LocalServiceClient::new(channel));
         Ok(client)
     }

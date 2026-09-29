@@ -19,6 +19,7 @@ pub mod event;
 pub mod health;
 pub mod introspection;
 pub mod local;
+pub mod diagnostics;
 
 use event::EventService;
 use health::HealthService;

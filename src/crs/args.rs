@@ -63,6 +63,7 @@ pub enum Command {
     Images(ImageListArgs),
     Run(Box<RunArgs>),
     Ps(ListArgs),
+    Logs(ContainerLogsArgs),
     Pull(ImagePullArgs),
     Rmi {
         image: String,
@@ -72,6 +73,20 @@ pub enum Command {
     Debug(DebugArgs),
     Completion(CompletionArgs),
 }
+
+#[derive(Debug, ClapArgs)]
+pub struct ContainerLogsArgs {
+    #[arg(short = 'f', long)]
+    pub follow: bool,
+    #[arg(short = 'n', long)]
+    pub tail: Option<i64>,
+    #[arg(long)]
+    pub since: Option<String>,
+    #[arg(short = 't', long)]
+    pub timestamps: bool,
+    pub container: String,
+}
+
 
 #[derive(Debug, Default, ClapArgs)]
 pub struct ListArgs {

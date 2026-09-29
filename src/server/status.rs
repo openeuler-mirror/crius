@@ -40,9 +40,13 @@ use crate::server::state_model::
     StoredPodState, StoredNamespaceOptions,
     StoredContainerState,
 };
+use crate::state::{
+    RecoveryLedgerSnapshot, SnapshotLedgerState
+};
 use crate::defaults::{
     STATUS_RECENT_NETWORK_EVENT_LIMIT,
     INTERNAL_CONTAINER_STATE_KEY,
+    INTERNAL_POD_STATE_KEY,
 };
 
 impl RuntimeServiceImpl {
@@ -831,21 +835,6 @@ impl RuntimeServiceImpl {
         env!("CARGO_PKG_VERSION")
     }
 
-    async fn runtime_container_status_checked(&self, container_id: &str) -> ContainerStatus {
-        let runtime = match self.runtime_for_container_request(container_id).await {
-            Ok(runtime) => runtime,
-            Err(_) => return ContainerStatus::Unknown,
-        };
-        let container_id = container_id.to_string();
-        tokio::task::spawn_blocking(move || {
-            runtime.task_controller().container_status(&container_id)
-        })
-        .await
-        .ok()
-        .and_then(Result::ok)
-        .unwrap_or(ContainerStatus::Unknown)
-    }
-
     pub(super) fn effective_runtime_state_for_container(
         container: &Container,
         runtime_status: crate::runtime::ContainerStatus,
@@ -960,5 +949,112 @@ impl RuntimeServiceImpl {
         let mut deduped: Vec<_> = best.into_values().collect();
         deduped.extend(passthrough);
         deduped
+    }
+
+    pub async fn recovery_ledger_health_summary(
+        &self,
+    ) -> Result<crate::service::health::RecoveryLedgerHealthSummary, String> {
+        let snapshot = {
+            let persistence = self.persistence.lock().await;
+            RecoveryLedgerSnapshot::load(&persistence)
+                .map_err(|err| format!("failed to load recovery ledger snapshot: {err}"))?
+        };
+
+        let broken_containers = snapshot
+            .containers
+            .iter()
+            .filter(|entry| {
+                serde_json::from_str::<HashMap<String, String>>(&entry.record.annotations)
+                    .ok()
+                    .and_then(|annotations| {
+                        Self::read_internal_state::<StoredContainerState>(
+                            &annotations,
+                            INTERNAL_CONTAINER_STATE_KEY,
+                        )
+                    })
+                    .and_then(|state| state.broken)
+                    .is_some()
+            })
+            .count();
+        let broken_pods = snapshot
+            .pods
+            .iter()
+            .filter(|record| {
+                serde_json::from_str::<HashMap<String, String>>(&record.annotations)
+                    .ok()
+                    .and_then(|annotations| {
+                        Self::read_internal_state::<StoredPodState>(
+                            &annotations,
+                            INTERNAL_POD_STATE_KEY,
+                        )
+                    })
+                    .and_then(|state| state.broken)
+                    .is_some()
+            })
+            .count();
+
+        Ok(crate::service::health::RecoveryLedgerHealthSummary {
+            broken_containers,
+            broken_pods,
+            broken_snapshots: snapshot
+                .snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.state == SnapshotLedgerState::Broken.as_str()
+                })
+                .count(),
+            stale_snapshots: snapshot
+                .snapshots
+                .iter()
+                .filter(|snapshot| {
+                    snapshot.state == SnapshotLedgerState::Stale.as_str()
+                })
+                .count(),
+            broken_runtime_artifacts: snapshot
+                .runtime_artifacts
+                .iter()
+                .filter(|artifact| {
+                    artifact.state == crate::state::RuntimeArtifactLedgerState::Broken.as_str()
+                })
+                .count(),
+            dead_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Dead.as_str())
+                .count(),
+            broken_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Broken.as_str())
+                .count(),
+            degraded_shims: snapshot
+                .shim_processes
+                .iter()
+                .filter(|shim| shim.state == crate::state::ShimLedgerState::Degraded.as_str())
+                .count(),
+        })
+    }
+
+    pub async fn recovery_check_report(
+        &self,
+        execute: bool,
+    ) -> Result<crate::state::LedgerCheckReport, String> {
+        let mut persistence = self.persistence.lock().await;
+        crate::state::StateLedgerWriter::new(&mut persistence)
+            .repair(crate::state::LedgerRepairOptions::default(), !execute)
+            .map_err(|err| {
+                if execute {
+                    format!("failed to repair recovery ledger: {err}")
+                } else {
+                    format!("failed to check recovery ledger: {err}")
+                }
+            })
+    }
+
+    pub(super) fn pod_requires_managed_netns(state: Option<&StoredPodState>) -> bool {
+        state
+            .and_then(|pod| pod.namespace_options.as_ref())
+            .map(|options| options.network != NamespaceMode::Node as i32)
+            .unwrap_or(true)
     }
 }

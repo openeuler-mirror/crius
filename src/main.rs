@@ -32,7 +32,11 @@ use tokio::net::UnixListener as TokioUnixListener;
 use tracing_subscriber::{fmt, fmt::MakeWriter, util::SubscriberInitExt, prelude::__tracing_subscriber_SubscriberExt, EnvFilter};
 
 use crius::proto::runtime::v1::{runtime_service_server::RuntimeServiceServer, image_service_server::ImageServiceServer};
+use crius::proto::diagnostics::v1::diagnostics_service_server::DiagnosticsServiceServer;
 use crius::proto::local::v1::local_service_server::LocalServiceServer;
+use crius::service::diagnostics::{
+    DiagnosticsState, DiagnosticsServiceImpl
+};
 use crius::service::local::LocalServiceImpl;
 
 use crius::config::Config;
@@ -155,6 +159,16 @@ async fn main() -> Result<(), Error> {
         )))
         .build()
         .map_err(|e| anyhow::anyhow!("Failed to create reflection service: {}", e))?;
+    let diagnostics_state = DiagnosticsState::from_runtime(
+        env!("CARGO_PKG_VERSION"),
+        option_env!("GIT_COMMIT").unwrap_or("unknown"),
+        &config,
+        &runtime_service,
+        listen
+            .strip_prefix("unix://")
+            .unwrap_or(&listen)
+            .to_string(),
+    );
     
     let runtime_service_server = RuntimeServiceServer::new(runtime_service.clone())
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
@@ -165,13 +179,17 @@ async fn main() -> Result<(), Error> {
     let local_service_server = LocalServiceServer::new(LocalServiceImpl::new(runtime_service.clone()))
         .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
         .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
+    let diagnostics_service_server = DiagnosticsServiceServer::new(DiagnosticsServiceImpl::new(diagnostics_state))
+            .max_encoding_message_size(runtime_config.grpc_max_send_msg_size as usize)
+            .max_decoding_message_size(runtime_config.grpc_max_recv_msg_size as usize);
 
     // 注册路由
     let server = Server::builder()
         .add_service(runtime_service_server)
         .add_service(reflection_service)
         .add_service(image_service_server)
-        .add_service(local_service_server);
+        .add_service(local_service_server)
+        .add_service(diagnostics_service_server);
 
     let shutdown_watchdog = spawn_shutdown_watchdog();
 

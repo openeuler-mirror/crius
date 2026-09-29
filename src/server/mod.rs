@@ -777,4 +777,55 @@ impl RuntimeServiceImpl {
             ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
         }
     }
+
+    fn runtime_container_status_name(status: &ContainerStatus) -> &'static str {
+        match status {
+            ContainerStatus::Created => "created",
+            ContainerStatus::Running => "running",
+            ContainerStatus::Stopped(_) => "stopped",
+            ContainerStatus::Unknown => "unknown",
+        }
+    }
+
+    async fn runtime_handler_name_for_container_request(
+        &self,
+        container_id: &str,
+    ) -> Result<String, Status> {
+        let annotations = {
+            let containers = self.containers.lock().await;
+            containers
+                .get(container_id)
+                .map(|container| container.annotations.clone())
+        };
+
+        if let Some(annotations) = annotations {
+            return Ok(self
+                .runtime
+                .runtime_handler_name_for_annotations_map(&annotations));
+        }
+
+        self.runtime
+            .runtime_handler_name_for_container(container_id)
+            .map_err(|e| {
+                Status::internal(format!(
+                    "Failed to resolve runtime handler for container {}: {}",
+                    container_id, e
+                ))
+            })
+    }
+
+    async fn runtime_container_status_checked(&self, container_id: &str) -> ContainerStatus {
+        let runtime = match self.runtime_for_container_request(container_id).await {
+            Ok(runtime) => runtime,
+            Err(_) => return ContainerStatus::Unknown,
+        };
+        let container_id = container_id.to_string();
+        tokio::task::spawn_blocking(move || {
+            runtime.task_controller().container_status(&container_id)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .unwrap_or(ContainerStatus::Unknown)
+    }
 }

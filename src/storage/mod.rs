@@ -1235,6 +1235,35 @@ impl StorageManager {
         ).optional().context("Failed to get shim process")?;
         Ok(record)
     }
+
+    pub fn update_runtime_artifact_state(
+        &mut self,
+        owner_kind: &str,
+        owner_id: &str,
+        artifact_kind: &str,
+        path: &str,
+        state: &str,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE runtime_artifacts
+                 SET state = ?5
+                 WHERE owner_kind = ?1 AND owner_id = ?2 AND artifact_kind = ?3 AND path = ?4",
+                rusqlite::params![owner_kind, owner_id, artifact_kind, path, state],
+            )
+            .context("Failed to update runtime artifact state")?;
+        Ok(())
+    }
+
+    pub fn update_shim_process_state(&mut self, container_id: &str, state: &str) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE shim_processes SET state = ?2, last_seen_at = ?3 WHERE container_id = ?1",
+                rusqlite::params![container_id, state, chrono::Utc::now().timestamp()],
+            )
+            .context("Failed to update shim process state")?;
+        Ok(())
+    }
 }
 
 /// 镜像记录
@@ -1386,6 +1415,21 @@ pub struct SchemaMigrationRecord {
     pub applied_at: i64,
 }
 
+/// Pod沙箱记录
+#[derive(Debug, Clone)]
+pub struct PodSandboxRecord {
+    pub id: String,
+    pub state: String,
+    pub name: String,
+    pub namespace: String,
+    pub uid: String,
+    pub created_at: i64,
+    pub netns_path: String,
+    pub labels: String,      // JSON
+    pub annotations: String, // JSON
+    pub pause_container_id: Option<String>,
+    pub ip: Option<String>,
+}
 
 fn content_blob_ref_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContentBlobRefRecord> {
     Ok(ContentBlobRefRecord {

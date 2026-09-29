@@ -186,6 +186,10 @@ impl PersistenceManager {
     pub fn get_shim_process_record(&self, container_id: &str) -> Result<Option<ShimProcessRecord>> {
         self.storage.get_shim_process(container_id)
     }
+
+    pub fn delete_shim_process_record(&mut self, container_id: &str) -> Result<()> {
+        self.storage.delete_shim_process(container_id)
+    }
 }
 
 /// 将容器配置转换为存储记录
