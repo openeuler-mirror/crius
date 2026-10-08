@@ -1229,11 +1229,111 @@ impl RuntimeServiceImpl {
         Ok(Response::new(StopContainerResponse {}))
     }
 
+   pub(super) async fn remove_container_internal(
+        &self,
+        actual_container_id: &str,
+    ) -> Result<Option<Container>, Status> {
+        let container_state = self.container_internal_state(actual_container_id).await;
+
+        let deleted_container = {
+            let containers = self.containers.lock().await;
+            containers.get(actual_container_id).cloned()
+        };
+
+        let runtime = self.runtime.clone();
+        let actual_container_id_owned = actual_container_id.to_string();
+        tokio::task::spawn_blocking(move || runtime.remove_container(&actual_container_id_owned))
+            .await
+            .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+            .map_err(|e| Status::internal(format!("Failed to remove container: {}", e)))?;
+
+        {
+            let mut containers = self.containers.lock().await;
+            containers.remove(actual_container_id);
+        }
+        if let Ok(mut removed) = self.removed_container_ids.lock() {
+            removed.insert(actual_container_id.to_string());
+        }
+        self.cleanup_local_container_network_from_state(
+            actual_container_id,
+            container_state.as_ref(),
+        )
+        .await;
+        self.release_container_name(actual_container_id);
+
+        let mut persistence = self.persistence.lock().await;
+        if let Err(err) = persistence.delete_container(actual_container_id) {
+            log::error!(
+                "Failed to delete container {} from database: {}",
+                actual_container_id,
+                err
+            );
+        } else {
+            log::info!("Container {} removed from database", actual_container_id);
+        }
+        drop(persistence);
+
+        Ok(deleted_container)
+    }
+
     pub(super) async fn remove_container(
         &self,
         request: Request<RemoveContainerRequest>,
     ) -> Result<Response<RemoveContainerResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let container_id = req.container_id;
+
+        log::info!("Removing container {}", container_id);
+
+        let Some(actual_container_id) = self.resolve_container_id_if_exists(&container_id).await?
+        else {
+            return Ok(Response::new(RemoveContainerResponse {}));
+        };
+        self.ensure_container_loaded(&actual_container_id).await?;
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "remove_start",
+            InternalEventSeverity::Info,
+            serde_json::Value::Null,
+        )
+        .await;
+        let deleted_container = match self.remove_container_internal(&actual_container_id).await {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "remove_failed",
+                    InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
+
+        log::info!("Container {} removed", actual_container_id);
+        if let Some(container) = deleted_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "remove_success",
+                InternalEventSeverity::Info,
+                json!({
+                    "podSandboxId": container.pod_sandbox_id,
+                    "previousState": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
+            self.emit_container_event(
+                ContainerEventType::ContainerDeletedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
+        Ok(Response::new(RemoveContainerResponse {}))
     }
 
     fn create_container_sandbox_not_ready_error(

@@ -41,6 +41,7 @@ pub(crate) async fn dispatch(
         Command::Ps(args) => shortcuts::handle_ps(ctx, client, args).await,
         Command::Exec(args) => exec::handle(ctx, client, args).await,
         Command::Stop(args) => shortcuts::handle_stop(ctx, client, args).await,
+        Command::Rm(args) => shortcuts::handle_rm(ctx, client, args).await,
         Command::Logs(args) => logs::handle(ctx, client, args).await,
         Command::Pull(args) => shortcuts::handle_pull(ctx, client, args).await,
         Command::Rmi { image: image_name } => {

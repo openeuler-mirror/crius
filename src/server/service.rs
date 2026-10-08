@@ -390,6 +390,16 @@ impl NameRegistry {
             }
         }
     }
+
+    pub(super) fn get_id(&self, name: &str) -> Option<String> {
+        self.ids_by_name.get(name).cloned()
+    }
+
+    fn release_by_id(&mut self, id: &str) {
+        if let Some(name) = self.names_by_id.remove(id) {
+            self.ids_by_name.remove(&name);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize)]
@@ -1126,16 +1136,6 @@ impl RuntimeServiceImpl {
             .unwrap_or(false)
     }
 
-    async fn container_internal_state(&self, container_id: &str) -> Option<StoredContainerState> {
-        let containers = self.containers.lock().await;
-        containers.get(container_id).and_then(|container| {
-            Self::read_internal_state::<StoredContainerState>(
-                &container.annotations,
-                INTERNAL_CONTAINER_STATE_KEY,
-            )
-        })
-    }
-
     pub(super) async fn effective_exec_cpu_affinity(&self, container_id: &str) -> Option<usize> {
         if self.config.exec_cpu_affinity != "first" {
             return None;
@@ -1175,6 +1175,12 @@ impl RuntimeServiceImpl {
             self.config.container_stop_timeout
         } else {
             requested_timeout_secs.max(self.config.container_stop_timeout)
+        }
+    }
+
+    pub(super) fn release_container_name(&self, container_id: &str) {
+        if let Ok(mut registry) = self.container_names.lock() {
+            registry.release_by_id(container_id);
         }
     }
 }

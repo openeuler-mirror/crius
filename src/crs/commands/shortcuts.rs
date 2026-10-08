@@ -25,6 +25,7 @@ use crate::crs::{
         InspectArgs, ObjectType,
         ListArgs, ContainerListArgs,
         StopArgs, StopObjectType,
+        RemoveArgs,
     },
     CommandResult,commands::{
         CliError, container,
@@ -72,6 +73,16 @@ pub(crate) async fn handle_stop(
             StopCandidate::Pod => unimplemented!(),
         },
     }
+}
+
+pub(crate) async fn handle_rm(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: RemoveArgs,
+) -> Result<CommandResult, CliError> {
+    let _force = args.force;
+    let target = resolve_container_remove_target(client, &args.target).await?;
+    container::handle_remove_with_command(ctx, client, target, "crs rm").await
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -258,6 +269,49 @@ async fn resolve_stop_target(client: &CrsClient, target: &str) -> Result<StopCan
             "target {target} is ambiguous; specify --type container|pod"
         ))
         .with_command("crs stop")
+        .with_object(target.to_string())),
+    }
+}
+
+async fn resolve_container_remove_target(
+    client: &CrsClient,
+    target: &str,
+) -> Result<String, CliError> {
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_containers(crate::proto::runtime::v1::ListContainersRequest { filter: None })
+                .await
+                .map_err(|status| candidate_error(status, client, "crs rm", "container", target))
+        })
+        .await?
+        .into_inner();
+
+    let mut matches = response
+        .containers
+        .into_iter()
+        .filter(|container| {
+            container.id == target
+                || container.id.starts_with(target)
+                || container
+                    .metadata
+                    .as_ref()
+                    .map(|metadata| metadata.name == target)
+                    .unwrap_or(false)
+        })
+        .map(|container| container.id)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.dedup();
+
+    match matches.as_slice() {
+        [id] => Ok(id.clone()),
+        [] => Err(not_found_error(client, "crs rm", "container", target)),
+        [_, ..] => Err(CliError::invalid_input(format!(
+            "container target {target} is ambiguous; retry with the full container ID"
+        ))
+        .with_command("crs rm")
         .with_object(target.to_string())),
     }
 }

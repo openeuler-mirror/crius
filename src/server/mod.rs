@@ -900,4 +900,14 @@ impl RuntimeServiceImpl {
 
         container
     }
+
+    async fn container_internal_state(&self, container_id: &str) -> Option<StoredContainerState> {
+        let containers = self.containers.lock().await;
+        containers.get(container_id).and_then(|container| {
+            Self::read_internal_state::<StoredContainerState>(
+                &container.annotations,
+                INTERNAL_CONTAINER_STATE_KEY,
+            )
+        })
+    }
 }
