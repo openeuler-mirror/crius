@@ -65,6 +65,7 @@ pub enum Command {
     Ps(ListArgs),
     Exec(ExecArgs),
     Stop(StopArgs),
+    Rm(RemoveArgs),
     Logs(ContainerLogsArgs),
     Pull(ImagePullArgs),
     Rmi {
@@ -72,6 +73,13 @@ pub enum Command {
     },
     Image(ImageArgs),
     Inspect(InspectArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct RemoveArgs {
+    #[arg(short = 'f', long)]
+    pub force: bool,
+    pub target: String,
 }
 
 #[derive(Debug, ClapArgs)]

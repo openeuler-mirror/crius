@@ -19,7 +19,7 @@ use crate::proto::runtime::v1::{
     ListContainersRequest, ContainerFilter,
     ContainerStateValue, ContainerState,
     Container, ExecSyncRequest, ContainerStatusRequest,
-    StopContainerRequest,
+    StopContainerRequest, RemoveContainerRequest,
 };
 use crate::crs::{
     CliContext, CrsClient,
@@ -357,6 +357,42 @@ pub(crate) async fn handle_stop(
                 "containerId": id,
                 "stopped": true,
                 "timeoutSeconds": timeout.unwrap_or_default(),
+            }),
+        },
+    )
+}
+
+pub(crate) async fn handle_remove_with_command(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    command_name: &'static str,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, command_name)?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .remove_container(RemoveContainerRequest {
+                    container_id: id.clone(),
+                })
+                .await
+                .map_err(|status| container_status_error(status, client, command_name, &id))
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        ContainerOperationRender {
+            kind: "ContainerRemove",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "removed",
+            summary: serde_json::json!({
+                "containerId": id,
+                "removed": true,
             }),
         },
     )
