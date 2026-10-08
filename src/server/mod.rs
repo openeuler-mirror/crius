@@ -33,7 +33,10 @@ use std::time::Instant;
 
 use tonic::Status;
 
-use crate::proto::runtime::v1::ContainerState;
+use crate::proto::runtime::v1::{
+    ContainerState, Container, ContainerMetadata,
+    ImageSpec,
+};
 use crate::config::{Config, CgroupDriverConfig};
 use crate::server::service::{
     RuntimeServiceConfig, RuntimeServiceImpl,
@@ -46,7 +49,10 @@ use crate::runtime::{
 };
 use crate::server::state_model::{
     StoredSecurityProfile, CgroupResourceSupport,
-    StoredLinuxResources,
+    StoredLinuxResources, StoredContainerState,
+};
+use crate::defaults::{
+    INTERNAL_CONTAINER_STATE_KEY,
 };
 
 impl RuntimeServiceConfig {
@@ -827,5 +833,71 @@ impl RuntimeServiceImpl {
         .ok()
         .and_then(Result::ok)
         .unwrap_or(ContainerStatus::Unknown)
+    }
+
+    fn container_from_record(record: &crate::storage::ContainerRecord) -> Container {
+        let annotations: HashMap<String, String> =
+            serde_json::from_str(&record.annotations).unwrap_or_default();
+        let container_state = Self::read_internal_state::<StoredContainerState>(
+            &annotations,
+            INTERNAL_CONTAINER_STATE_KEY,
+        );
+        let metadata_name = container_state
+            .as_ref()
+            .and_then(|state| state.metadata_name.clone())
+            .unwrap_or_else(|| {
+                record
+                    .command
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or("unknown")
+                    .to_string()
+            });
+        let metadata_attempt = container_state
+            .as_ref()
+            .and_then(|state| state.metadata_attempt)
+            .unwrap_or(1);
+
+        let mut container = Container {
+            id: record.id.clone(),
+            metadata: Some(ContainerMetadata {
+                name: metadata_name,
+                attempt: metadata_attempt,
+            }),
+            state: match crate::storage::persistence::record_to_container_status(record) {
+                crate::runtime::ContainerStatus::Created => ContainerState::ContainerCreated as i32,
+                crate::runtime::ContainerStatus::Running => ContainerState::ContainerRunning as i32,
+                crate::runtime::ContainerStatus::Stopped(_) => {
+                    ContainerState::ContainerExited as i32
+                }
+                crate::runtime::ContainerStatus::Unknown => ContainerState::ContainerUnknown as i32,
+            },
+            pod_sandbox_id: record.pod_id.clone().unwrap_or_default(),
+            image: Some(ImageSpec {
+                image: record.image.clone(),
+                ..Default::default()
+            }),
+            image_ref: record.image.clone(),
+            labels: serde_json::from_str(&record.labels).unwrap_or_default(),
+            annotations,
+            created_at: record.created_at,
+        };
+
+        if let Some(mut state) = container_state {
+            if state.finished_at.is_none() {
+                state.finished_at = record.exit_time;
+            }
+            if state.exit_code.is_none() {
+                state.exit_code = record.exit_code;
+            }
+            let mut annotations = container.annotations.clone();
+            if Self::insert_internal_state(&mut annotations, INTERNAL_CONTAINER_STATE_KEY, &state)
+                .is_ok()
+            {
+                container.annotations = annotations;
+            }
+        }
+
+        container
     }
 }

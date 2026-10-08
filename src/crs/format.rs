@@ -182,6 +182,56 @@ pub(crate) trait TableRow {
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerOperationView {
+    pub container_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub pod_id: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub image: String,
+    pub action: String,
+    pub success: bool,
+}
+
+impl TableRow for ContainerOperationView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER ID", "POD ID", "IMAGE", "ACTION", "SUCCESS"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            self.container_id.clone(),
+            self.pod_id.clone(),
+            self.image.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn table_cells(&self, no_trunc: bool) -> Vec<String> {
+        vec![
+            if no_trunc {
+                self.container_id.clone()
+            } else {
+                short_id(&self.container_id).to_string()
+            },
+            if no_trunc || self.pod_id.is_empty() {
+                self.pod_id.clone()
+            } else {
+                short_id(&self.pod_id).to_string()
+            },
+            self.image.clone(),
+            self.action.clone(),
+            format_bool(self.success).to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct FilesystemUsageView {
     pub kind: String,
     pub mountpoint: String,

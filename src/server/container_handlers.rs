@@ -1131,11 +1131,102 @@ impl RuntimeServiceImpl {
         unimplemented!()
     }
 
+    pub(super) async fn stop_container_internal(
+        &self,
+        actual_container_id: &str,
+        timeout: u32,
+    ) -> Result<Option<Container>, Status> {
+        let runtime = self.runtime.clone();
+        let actual_container_id_owned = actual_container_id.to_string();
+        let stop_result = tokio::task::spawn_blocking(move || {
+            runtime.stop_container(&actual_container_id_owned, Some(timeout))
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))
+        .and_then(|result| {
+            result.map_err(|e| Status::internal(format!("Failed to stop container: {}", e)))
+        });
+        if let Err(status) = stop_result {
+            return Err(status);
+        }
+
+        let final_runtime_status = {
+            let runtime = self.runtime.clone();
+            let container_id_for_status = actual_container_id.to_string();
+            tokio::task::spawn_blocking(move || runtime.container_status(&container_id_for_status))
+                .await
+                .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+                .unwrap_or(ContainerStatus::Unknown)
+        };
+        let updated_container = self
+            .finalize_container_stop_state(actual_container_id, final_runtime_status)
+            .await?;
+
+        Ok(updated_container)
+    }
+
+
     pub(super) async fn stop_container(
         &self,
         request: Request<StopContainerRequest>,
     ) -> Result<Response<StopContainerResponse>, Status> {
-        unimplemented!()
+        let req = request.into_inner();
+        let container_id = req.container_id;
+        let timeout = self.effective_container_stop_timeout(req.timeout as u32);
+
+        log::info!("Stopping container {}", container_id);
+
+        let Some(actual_container_id) = self.resolve_container_id_if_exists(&container_id).await?
+        else {
+            return Ok(Response::new(StopContainerResponse {}));
+        };
+        self.ensure_container_loaded(&actual_container_id).await?;
+        self.publish_container_lifecycle_event(
+            &actual_container_id,
+            "stop_start",
+            InternalEventSeverity::Info,
+            json!({ "timeout": timeout }),
+        )
+        .await;
+        let updated_container = match self
+            .stop_container_internal(&actual_container_id, timeout)
+            .await
+        {
+            Ok(container) => container,
+            Err(status) => {
+                self.publish_container_lifecycle_event(
+                    &actual_container_id,
+                    "stop_failed",
+                    InternalEventSeverity::Error,
+                    json!({
+                        "code": format!("{:?}", status.code()),
+                        "message": status.message(),
+                    }),
+                )
+                .await;
+                return Err(status);
+            }
+        };
+
+        log::info!("Container {} stopped", actual_container_id);
+        if let Some(container) = updated_container {
+            self.publish_container_lifecycle_event(
+                &actual_container_id,
+                "stop_success",
+                InternalEventSeverity::Info,
+                json!({
+                    "state": Self::runtime_state_name(container.state),
+                }),
+            )
+            .await;
+            self.emit_container_event(
+                ContainerEventType::ContainerStoppedEvent,
+                &container,
+                Some(container.state),
+            )
+            .await;
+        }
+        Ok(Response::new(StopContainerResponse {}))
     }
 
     pub(super) async fn remove_container(
@@ -1772,5 +1863,35 @@ impl RuntimeServiceImpl {
 
         Ok(updated_container)
     }
-    
+
+    async fn ensure_container_loaded(&self, container_id: &str) -> Result<bool, Status> {
+        let already_loaded = {
+            let containers = self.containers.lock().await;
+            containers.contains_key(container_id)
+        };
+        if already_loaded {
+            return Ok(false);
+        }
+
+        let persisted = {
+            let persistence = self.persistence.lock().await;
+            crate::state::StateLedger::new(&persistence)
+                .container(container_id)
+                .map_err(|e| {
+                    Status::internal(format!(
+                        "Failed to load persisted container {}: {}",
+                        container_id, e
+                    ))
+                })?
+        };
+        if let Some(record) = persisted {
+            let rehydrated = Self::container_from_record(&record);
+            let mut containers = self.containers.lock().await;
+            containers.insert(container_id.to_string(), rehydrated);
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
 }

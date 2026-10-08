@@ -1169,6 +1169,14 @@ impl RuntimeServiceImpl {
                 })
             })
     }
+
+    pub(super) fn effective_container_stop_timeout(&self, requested_timeout_secs: u32) -> u32 {
+        if requested_timeout_secs == 0 {
+            self.config.container_stop_timeout
+        } else {
+            requested_timeout_secs.max(self.config.container_stop_timeout)
+        }
+    }
 }
 
 
