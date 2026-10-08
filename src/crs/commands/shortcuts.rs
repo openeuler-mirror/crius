@@ -24,6 +24,7 @@ use crate::crs::{
         ImageListArgs, ImagePullArgs, 
         InspectArgs, ObjectType,
         ListArgs, ContainerListArgs,
+        StopArgs, StopObjectType,
     },
     CommandResult,commands::{
         CliError, container,
@@ -44,6 +45,33 @@ pub(crate) async fn handle_pull(
     args: ImagePullArgs,
 ) -> Result<CommandResult, CliError> {
     image::handle_pull(ctx, client, args, "crs pull").await
+}
+
+pub(crate) async fn handle_stop(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: StopArgs,
+) -> Result<CommandResult, CliError> {
+    match args.object_type {
+        Some(StopObjectType::Container) => {
+            if !container_exists(client, &args.target, "crs stop").await? {
+                return Err(not_found_error(
+                    client,
+                    "crs stop",
+                    "container",
+                    &args.target,
+                ));
+            }
+            container::handle_stop(ctx, client, args.target, args.timeout).await
+        }
+        Some(StopObjectType::Pod) => unimplemented!(),
+        None => match resolve_stop_target(client, &args.target).await? {
+            StopCandidate::Container => {
+                container::handle_stop(ctx, client, args.target, args.timeout).await
+            }
+            StopCandidate::Pod => unimplemented!(),
+        },
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -204,4 +232,32 @@ pub(crate) async fn handle_ps(
         },
     )
     .await
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum StopCandidate {
+    Container,
+    Pod,
+}
+
+async fn resolve_stop_target(client: &CrsClient, target: &str) -> Result<StopCandidate, CliError> {
+    let mut candidates = Vec::new();
+    if container_exists(client, target, "crs stop").await? {
+        candidates.push(StopCandidate::Container);
+    }
+
+    match candidates.as_slice() {
+        [candidate] => Ok(*candidate),
+        [] => Err(not_found_error(
+            client,
+            "crs stop",
+            "container or pod",
+            target,
+        )),
+        [_, ..] => Err(CliError::invalid_input(format!(
+            "target {target} is ambiguous; specify --type container|pod"
+        ))
+        .with_command("crs stop")
+        .with_object(target.to_string())),
+    }
 }

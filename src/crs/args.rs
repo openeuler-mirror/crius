@@ -64,6 +64,7 @@ pub enum Command {
     Run(Box<RunArgs>),
     Ps(ListArgs),
     Exec(ExecArgs),
+    Stop(StopArgs),
     Logs(ContainerLogsArgs),
     Pull(ImagePullArgs),
     Rmi {
@@ -499,4 +500,25 @@ pub struct ContainerCreateOptions {
     pub resources: ContainerResourceArgs,
     #[command(flatten)]
     pub security: ContainerSecurityArgs,
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+pub enum StopObjectType {
+    Container,
+    Pod,
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct StopArgs {
+    #[arg(long = "type", value_enum)]
+    pub object_type: Option<StopObjectType>,
+    #[arg(
+        short = 't',
+        long = "time",
+        alias = "timeout",
+        id = "stop-timeout",
+        value_name = "SECONDS"
+    )]
+    pub timeout: Option<u32>,
+    pub target: String,
 }
