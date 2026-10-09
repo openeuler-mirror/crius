@@ -51,6 +51,7 @@ use crate::defaults::{
 #[derive(Debug)]
 struct RunPlan {
     image: String,
+    name: Option<String>,
     command: Vec<String>,
     pull: PullPolicyArg,
     detach: bool,
@@ -182,6 +183,7 @@ impl RunPlan {
 
         Ok(Self {
             image: args.image,
+            name: args.name,
             command: args.command,
             pull: args.pull,
             detach: args.detach,
@@ -201,7 +203,6 @@ impl RunPlan {
             sysctls: args.pod_options.sysctls,
             container_options: run_container_options(
                 args.container_options,
-                args.name,
                 args.stdin,
                 args.tty,
             ),
@@ -211,12 +212,10 @@ impl RunPlan {
 
 fn run_container_options(
     options: crate::crs::args::RunContainerCreateOptions,
-    name: Option<String>,
     stdin: bool,
     tty: bool,
 ) -> ContainerCreateOptions {
     ContainerCreateOptions {
-        name,
         attempt: options.container_attempt,
         commands: options.commands,
         args: options.args,
@@ -364,10 +363,10 @@ async fn create_run_container(
 
 async fn create_local_container(client: &CrsClient, plan: &RunPlan) -> Result<String, CliError> {
     let args = ContainerCreateArgs {
-        options: plan.container_options.clone(),
-        pod: String::new(),
         image: plan.image.clone(),
+        container: plan.name.clone().unwrap_or_default(),
         command: plan.command.clone(),
+        options: plan.container_options.clone(),
     };
     let config = build_container_config(&args).map_err(CliError::invalid_input)?;
     let sysctls = parse_local_sysctls(&plan.sysctls).map_err(CliError::invalid_input)?;
@@ -401,10 +400,10 @@ async fn create_container(
     sandbox_config: PodSandboxConfig,
 ) -> Result<String, CliError> {
     let args = ContainerCreateArgs {
-        options: plan.container_options.clone(),
-        pod: pod_id.to_string(),
         image: plan.image.clone(),
+        container: plan.name.clone().unwrap_or_default(),
         command: plan.command.clone(),
+        options: plan.container_options.clone(),
     };
     let mut config = build_container_config(&args).map_err(CliError::invalid_input)?;
     config.annotations.insert(

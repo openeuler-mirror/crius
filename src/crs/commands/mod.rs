@@ -24,7 +24,7 @@ pub(crate) mod logs;
 pub(crate) mod exec;
 
 use crate::crs::{
-    args::Command, client::CrsClient, context::CliContext, error::{CliError, CommandResult},
+    args::{self, Command}, client::CrsClient, context::CliContext, error::{CliError, CommandResult},
 };
 
 
@@ -48,6 +48,9 @@ pub(crate) async fn dispatch(
             image::handle_remove_with_command(ctx, client, image_name, "crs rmi").await
         }
         Command::Image(args) => image::handle(ctx, client, args).await,
+        Command::Container(args) => match args.command {
+            command => container::handle(ctx, client, command).await,
+        }
         Command::Inspect(args) => shortcuts::handle_inspect(ctx, client, args).await,
     }
 }

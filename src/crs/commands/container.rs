@@ -15,26 +15,36 @@ limitations under the License.
 */
 
 
+use crate::crs::args;
 use crate::proto::runtime::v1::{
     ListContainersRequest, ContainerFilter,
     ContainerStateValue, ContainerState,
     Container, ExecSyncRequest, ContainerStatusRequest,
-    StopContainerRequest, RemoveContainerRequest,
+    StartContainerRequest, StopContainerRequest, RemoveContainerRequest,
+    AttachRequest, ContainerStatsRequest,
+    UpdateContainerResourcesRequest, ContainerStats as ProtoContainerStats,
 };
+use crate::proto::local::v1::CreateLocalContainerRequest;
 use crate::crs::{
     CliContext, CrsClient,
     CommandResult,
     commands::{
         CliError, status::render_and_print,
+        logs, exec,
     },
     args::{
         ContainerListArgs, ContainerStateArg,
+        ContainerCommand, ContainerCreateArgs,
+        ContainerStatsArgs,
     },
     format::{
         CommandOutput, ContainerView, InspectView,
         format_unix_nanos, ContainerOperationView,
+        ContainerStatsView,
     },
     parsers::parse_key_value,
+    streaming,
+    builders::{build_container_config, build_resources_from_specs},
 };
 
 pub(crate) async fn handle_list(
@@ -272,6 +282,198 @@ pub(crate) async fn handle_inspect(
     )
 }
 
+pub(crate) async fn handle_create(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ContainerCreateArgs,
+) -> Result<CommandResult, CliError> {
+    let config = build_container_config(&args).map_err(CliError::invalid_input)?;
+    let image = args.image.clone();
+    let mut local = client.local()?;
+    let response = client
+        .with_rpc_timeout(async {
+            local
+                .create_local_container(CreateLocalContainerRequest {
+                    config: Some(config),
+                    runtime_handler: String::new(),
+                    cgroup_parent: String::new(),
+                    sysctls: Vec::new(),
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs container create")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+
+    render_container_operation(
+        ctx,
+        client,
+        ContainerOperationRender {
+            kind: "ContainerCreate",
+            container_id: response.container_id.clone(),
+            pod_id: String::new(),
+            image,
+            action: "created",
+            summary: serde_json::json!({
+                "containerId": response.container_id,
+                "created": true,
+            }),
+        },
+    )
+}
+
+pub(crate) async fn handle(
+    ctx: &CliContext,
+    client: &CrsClient,
+    command: ContainerCommand,
+) -> Result<CommandResult, CliError> {
+    match command {
+        ContainerCommand::List(args) => handle_list(ctx, client, args).await,
+        ContainerCommand::Inspect { id } => handle_inspect(ctx, client, id).await,
+        ContainerCommand::Create(args) => handle_create(ctx, client, *args).await,
+        ContainerCommand::Start { id } => handle_start(ctx, client, id).await,
+        ContainerCommand::Stop { id, timeout } => handle_stop(ctx, client, id, timeout).await,
+        ContainerCommand::Remove { id } => handle_remove_with_command(ctx, client, id, "crs container remove").await,
+        ContainerCommand::Exec(args) => exec::handle(ctx, client, args).await,
+        ContainerCommand::Attach { id, stream } => handle_attach(ctx, client, id, stream).await,
+        ContainerCommand::Stats(args) => handle_stats(ctx, client, args).await,
+        ContainerCommand::Update {
+            id,
+            resources,
+            annotations,
+        } => handle_update(ctx, client, id, resources, annotations).await,
+        ContainerCommand::Logs(args) => logs::handle(ctx, client, args).await,
+    }
+}
+
+pub(crate) async fn handle_attach(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    stream: crate::crs::args::StreamOptions,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container attach")?;
+    let mut options = streaming::AttachStreamOptions::from_args(id.clone(), stream)?;
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .attach(AttachRequest {
+                    container_id: id.clone(),
+                    stdin: options.stdin,
+                    stdout: options.stdout,
+                    stderr: options.stderr,
+                    tty: options.tty,
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container attach", &id)
+                })
+        })
+        .await?
+        .into_inner();
+    options.stream_url = Some(response.url);
+    streaming::attach(options).await
+}
+
+pub(crate) async fn handle_stats(
+    ctx: &CliContext,
+    client: &CrsClient,
+    args: ContainerStatsArgs,
+) -> Result<CommandResult, CliError> {
+    if let Some(id) = args.id {
+        ensure_container_id(&id, "crs container stats")?;
+        let mut runtime = client.runtime()?;
+        let response = client
+            .with_rpc_timeout(async {
+                runtime
+                    .container_stats(ContainerStatsRequest {
+                        container_id: id.clone(),
+                    })
+                    .await
+                    .map_err(|status| {
+                        container_status_error(status, client, "crs container stats", &id)
+                    })
+            })
+            .await?
+            .into_inner();
+        let items: Vec<ContainerStatsView> = response
+            .stats
+            .into_iter()
+            .map(ContainerStatsView::from)
+            .collect();
+        return render_and_print(
+            ctx,
+            CommandOutput::new("ContainerStats", client.endpoint(), items),
+        );
+    }
+
+    Err(CliError::invalid_input("container stats requires a container ID; listing all stats is not supported")
+        .with_command("crs container stats")
+        .with_endpoint(client.endpoint()))
+}
+
+pub(crate) async fn handle_update(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+    resources: Vec<String>,
+    annotations: Vec<String>,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container update")?;
+    if resources.is_empty() && annotations.is_empty() {
+        return Err(CliError::invalid_input(
+            "container update requires at least one --resource or --annotation field",
+        )
+        .with_command("crs container update"));
+    }
+
+    let linux = build_resources_from_specs(&resources).map_err(CliError::invalid_input)?;
+    let annotations = annotations
+        .iter()
+        .map(|annotation| {
+            parse_key_value("--annotation", annotation).map(|pair| (pair.key, pair.value))
+        })
+        .collect::<Result<std::collections::HashMap<_, _>, _>>()
+        .map_err(CliError::invalid_input)?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .update_container_resources(UpdateContainerResourcesRequest {
+                    container_id: id.clone(),
+                    linux,
+                    windows: None,
+                    annotations,
+                })
+                .await
+                .map_err(|status| {
+                    container_status_error(status, client, "crs container update", &id)
+                })
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        ContainerOperationRender {
+            kind: "ContainerUpdate",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "updated",
+            summary: serde_json::json!({
+                "containerId": id,
+                "updated": true,
+            }),
+        },
+    )
+}
+
 struct ContainerOperationRender {
     kind: &'static str,
     pod_id: String,
@@ -321,6 +523,41 @@ fn render_container_operation(
             }],
         )
         .with_summary(operation.summary),
+    )
+}
+
+pub(crate) async fn handle_start(
+    ctx: &CliContext,
+    client: &CrsClient,
+    id: String,
+) -> Result<CommandResult, CliError> {
+    ensure_container_id(&id, "crs container start")?;
+    let mut runtime = client.runtime()?;
+    client
+        .with_rpc_timeout(async {
+            runtime
+                .start_container(StartContainerRequest {
+                    container_id: id.clone(),
+                })
+                .await
+                .map_err(|status| container_status_error(status, client, "crs container start", &id))
+        })
+        .await?;
+
+    render_container_operation(
+        ctx,
+        client,
+        ContainerOperationRender {
+            kind: "ContainerStart",
+            container_id: id.clone(),
+            pod_id: String::new(),
+            image: String::new(),
+            action: "started",
+            summary: serde_json::json!({
+                "containerId": id,
+                "started": true,
+            }),
+        },
     )
 }
 
@@ -396,4 +633,45 @@ pub(crate) async fn handle_remove_with_command(
             }),
         },
     )
+}
+
+impl From<ProtoContainerStats> for ContainerStatsView {
+    fn from(stats: ProtoContainerStats) -> Self {
+        let container_id = stats
+            .attributes
+            .as_ref()
+            .map(|a| a.id.clone())
+            .unwrap_or_default();
+        let name = stats
+            .attributes
+            .as_ref()
+            .and_then(|a| a.metadata.as_ref())
+            .map(|m| m.name.clone())
+            .unwrap_or_default();
+        let cpu_core_usage_nanos = stats
+            .cpu
+            .as_ref()
+            .and_then(|c| c.usage_core_nano_seconds.as_ref())
+            .map(|v| v.value as i64)
+            .unwrap_or_default();
+        let memory_usage_bytes = stats
+            .memory
+            .as_ref()
+            .and_then(|m| m.usage_bytes.as_ref())
+            .map(|v| v.value as i64)
+            .unwrap_or_default();
+        let memory_working_set_bytes = stats
+            .memory
+            .as_ref()
+            .and_then(|m| m.working_set_bytes.as_ref())
+            .map(|v| v.value as i64)
+            .unwrap_or_default();
+        Self {
+            container_id,
+            name,
+            cpu_core_usage_nanos,
+            memory_usage_bytes,
+            memory_working_set_bytes,
+        }
+    }
 }
