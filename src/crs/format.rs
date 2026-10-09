@@ -734,3 +734,33 @@ fn value_object_keys(value: &Value) -> Vec<String> {
         .map(|object| object.keys().cloned().collect())
         .unwrap_or_default()
 }
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ContainerStatsView {
+    pub container_id: String,
+    pub name: String,
+    pub cpu_core_usage_nanos: i64,
+    pub memory_usage_bytes: i64,
+    pub memory_working_set_bytes: i64,
+}
+
+impl TableRow for ContainerStatsView {
+    fn headers() -> &'static [&'static str] {
+        &["CONTAINER", "NAME", "CPU (ns)", "MEM (bytes)", "WORKING SET"]
+    }
+
+    fn cells(&self) -> Vec<String> {
+        vec![
+            short_id(&self.container_id).to_string(),
+            self.name.clone(),
+            self.cpu_core_usage_nanos.to_string(),
+            self.memory_usage_bytes.to_string(),
+            self.memory_working_set_bytes.to_string(),
+        ]
+    }
+
+    fn quiet_cell(&self) -> String {
+        self.container_id.clone()
+    }
+}

@@ -42,7 +42,7 @@ use crate::{
 pub(crate) fn build_container_config(
     args: &ContainerCreateArgs,
 ) -> Result<ContainerConfig, String> {
-    build_container_config_from_parts(&args.image, &args.command, &args.options)
+    build_container_config_from_parts(&args.image, &args.container, &args.command, &args.options)
 }
 
 pub(crate) fn build_auth_config(args: &ImageAuthArgs) -> Result<Option<AuthConfig>, String> {
@@ -106,6 +106,7 @@ pub(crate) fn parse_local_sysctls(sysctls: &[String]) -> Result<Vec<String>, Str
 
 fn build_container_config_from_parts(
     image: &str,
+    name: &str,
     positional_command: &[String],
     options: &ContainerCreateOptions,
 ) -> Result<ContainerConfig, String> {
@@ -114,7 +115,7 @@ fn build_container_config_from_parts(
     }
 
     let metadata = ContainerMetadata {
-        name: options.name.clone().unwrap_or_default(),
+        name: name.to_string(),
         attempt: options.attempt.unwrap_or_default(),
     };
 

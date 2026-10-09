@@ -72,7 +72,58 @@ pub enum Command {
         image: String,
     },
     Image(ImageArgs),
+    Container(ContainerArgs),
     Inspect(InspectArgs),
+}
+
+#[derive(Debug, ClapArgs)]
+pub struct ContainerArgs {
+    #[command(subcommand)]
+    pub command: ContainerCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContainerCommand {
+    List(ContainerListArgs),
+    Inspect {
+        id: String,
+    },
+    Create(Box<ContainerCreateArgs>),
+    Start {
+        id: String,
+    },
+    Stop {
+        id: String,
+        #[arg(short = 't', long = "time", alias = "timeout", value_name = "SECONDS")]
+        timeout: Option<u32>,
+    },
+    Remove {
+        id: String,
+    },
+    Exec(ExecArgs),
+    Attach {
+        id: String,
+        #[command(flatten)]
+        stream: StreamOptions,
+    },
+    Stats(ContainerStatsArgs),
+    Update {
+        id: String,
+        #[arg(long = "resource")]
+        resources: Vec<String>,
+        #[arg(long = "annotation")]
+        annotations: Vec<String>,
+    },
+    Logs(ContainerLogsArgs),
+}
+
+#[derive(Debug, Default, ClapArgs)]
+pub struct ContainerStatsArgs {
+    pub id: Option<String>,
+    #[arg(long)]
+    pub pod: Option<String>,
+    #[arg(long = "label")]
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, ClapArgs)]
@@ -464,18 +515,19 @@ pub struct RunArgs {
 
 #[derive(Debug, ClapArgs)]
 pub struct ContainerCreateArgs {
-    #[command(flatten)]
-    pub options: ContainerCreateOptions,
-    pub pod: String,
+    /// Container image (e.g. alpine:latest)
     pub image: String,
+    /// Container name or ID
+    pub container: String,
+    /// Command to execute inside the container
     #[arg(last = true)]
     pub command: Vec<String>,
+    #[command(flatten)]
+    pub options: ContainerCreateOptions,
 }
 
 #[derive(Clone, Debug, Default, ClapArgs)]
 pub struct ContainerCreateOptions {
-    #[arg(long)]
-    pub name: Option<String>,
     #[arg(long)]
     pub attempt: Option<u32>,
     #[arg(long = "command")]
@@ -488,9 +540,9 @@ pub struct ContainerCreateOptions {
     pub env: Vec<String>,
     #[arg(long = "env-file")]
     pub env_files: Vec<String>,
-    #[arg(long = "pod-label")]
+    #[arg(short = 'l', long = "label")]
     pub labels: Vec<String>,
-    #[arg(long = "pod-annotation")]
+    #[arg(long = "annotation")]
     pub annotations: Vec<String>,
     #[arg(long = "mount")]
     pub mounts: Vec<String>,
@@ -502,7 +554,7 @@ pub struct ContainerCreateOptions {
     pub log_path: Option<String>,
     #[arg(short = 'i', long = "interactive", alias = "stdin")]
     pub stdin: bool,
-    #[arg(long)]
+    #[arg(short = 't', long)]
     pub tty: bool,
     #[command(flatten)]
     pub resources: ContainerResourceArgs,
