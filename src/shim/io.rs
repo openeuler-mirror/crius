@@ -517,6 +517,26 @@ impl IoManager {
         Ok(())
     }
 
+    /// 等待第一个 attach 客户端连接（阻塞轮询，供 std 线程使用）。
+    /// 用于 exec 会话：确保流式消费者连上后再启动 exec 进程，
+    /// 避免输出在消费者连上前丢失（会话早亡时消费者连上的是死会话，形成黑洞）。
+    pub fn wait_for_first_client(&self, timeout: Duration) {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !self.clients.lock().unwrap().is_empty() {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                debug!(
+                    "wait_for_first_client timed out after {:?}, continuing",
+                    timeout
+                );
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
     /// 启动attach服务器
     pub fn start_attach_server(&mut self) -> Result<()> {
         let config = self.config.lock().unwrap().clone();

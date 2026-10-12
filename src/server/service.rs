@@ -672,6 +672,11 @@ impl RuntimeServiceImpl {
         service
     }
 
+    pub async fn set_streaming_server(&self, streaming_server: StreamingServer) {
+        let mut streaming = self.streaming.lock().await;
+        *streaming = Some(streaming_server);
+    }
+
     pub fn image_service(&self) -> ImageServiceImpl {
         self.image_service.clone()
     }
@@ -1359,14 +1364,11 @@ impl RuntimeService for RuntimeServiceImpl {
         RuntimeServiceImpl::container_stats(self, request).await
     }
 
-    // TODO: 列出所有运行中容器的统计信息
     async fn list_container_stats(
         &self,
-        _request: tonic::Request<ListContainerStatsRequest>,
+        request: tonic::Request<ListContainerStatsRequest>,
     ) -> std::result::Result<tonic::Response<ListContainerStatsResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented(
-            "list_container_stats: not implemented",
-        ))
+        RuntimeServiceImpl::list_container_stats(self, request).await
     }
 
     // TODO: 返回 Pod 沙箱统计信息

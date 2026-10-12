@@ -135,6 +135,9 @@ pub struct CgroupManager {
     version: CgroupVersion,
     /// 容器ID
     container_id: String,
+    /// 显式指定的 cgroup 路径（来自 /proc/<pid>/cgroup 解析）；
+    /// 为空时回退到 <mount>/crius/<id>（猜测路径，可能与 runc 实际创建位置不一致）
+    explicit_cgroup_path: Option<PathBuf>,
 }
 
 /// Cgroups版本
@@ -155,7 +158,32 @@ impl CgroupManager {
             mount_point,
             version,
             container_id,
+            explicit_cgroup_path: None,
         })
+    }
+
+    /// 按容器实际 cgroup 路径创建管理器（路径应来自 /proc/<pid>/cgroup 解析）。
+    pub fn with_cgroup_path(container_id: String, cgroup_path: PathBuf) -> Result<Self> {
+        let (mount_point, version) = Self::detect_cgroup_version()?;
+
+        info!(
+            "Detected cgroups {:?} at {:?} (explicit path: {:?})",
+            version, mount_point, cgroup_path
+        );
+
+        Ok(Self {
+            mount_point,
+            version,
+            container_id,
+            explicit_cgroup_path: Some(cgroup_path),
+        })
+    }
+
+    /// v2 生效的 cgroup 目录：优先显式路径，否则回退默认猜测路径。
+    fn effective_cgroup_path(&self) -> PathBuf {
+        self.explicit_cgroup_path
+            .clone()
+            .unwrap_or_else(|| self.mount_point.join("crius").join(&self.container_id))
     }
 
     /// 检测cgroups版本
@@ -264,7 +292,7 @@ impl CgroupManager {
 
     /// 设置资源限制v2
     fn set_resources_v2(&self, limits: &ResourceLimits) -> Result<()> {
-        let cgroup_path = self.mount_point.join("crius").join(&self.container_id);
+        let cgroup_path = self.effective_cgroup_path();
 
         // 设置CPU限制
         if let Some(cpu) = &limits.cpu {

@@ -15,6 +15,7 @@ limitations under the License.
 */
 
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::result::Result::Ok;
 use std::os::unix::net::UnixListener;
@@ -42,6 +43,7 @@ use crius::service::local::LocalServiceImpl;
 use crius::config::Config;
 use crius::defaults::{LOCAL_LOG_TIME_FORMAT, SERVER_SHUTDOWN_GRACE_PERIOD};
 use crius::server::service::{RuntimeServiceImpl, RuntimeServiceConfig};
+use crius::streaming::StreamingServer;
 
 /// crius - OCI-based implementation of Kubernetes Container Runtime Interface
 #[derive(Parser, Debug)]
@@ -75,6 +77,11 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<(), Error> {
     let args = Args::parse();
+
+    if args.dump_default_config || args.write_default_config.is_some() {
+        handle_default_config_export(&args)?;
+        return Ok(());
+    }
     
     let mut config = match Config::load(&args.config) {
         Ok(cfg) => cfg,
@@ -95,6 +102,13 @@ async fn main() -> Result<(), Error> {
     // 创建服务实例
     let runtime_service =
         RuntimeServiceImpl::new(runtime_config.clone());
+    runtime_service.recover_containers_from_ledger().await;
+    let streaming_server = StreamingServer::start_with_config(
+        config.api.streaming.clone(),
+        runtime_config.runtime_path.clone(),
+    )
+    .await?;
+    runtime_service.set_streaming_server(streaming_server).await;
     let image_service = runtime_service.image_service();
     let reflection_service = ReflectionBuilder::configure()
         .register_encoded_file_descriptor_set(include_bytes!(concat!(
@@ -188,6 +202,28 @@ fn apply_cli_overrides(args: &Args, config: &mut Config) {
     if args.debug {
         config.logging.level = "debug".to_string();
     }
+}
+
+fn render_default_config_toml() -> Result<String, Error> {
+    toml::to_string_pretty(&Config::default())
+        .map_err(|err| anyhow::anyhow!("Failed to render default config template: {}", err))
+}
+
+fn handle_default_config_export(args: &Args) -> Result<(), Error> {
+    let rendered = render_default_config_toml()?;
+    if args.dump_default_config {
+        std::io::stdout().write_all(rendered.as_bytes())?;
+        return Ok(());
+    }
+
+    if let Some(path) = &args.write_default_config {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, rendered)?;
+    }
+
+    Ok(())
 }
 
 fn unix_socket_path(listen: &str) -> Option<&Path> {
