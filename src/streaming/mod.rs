@@ -529,6 +529,15 @@ async fn handle_request(
     _runtime_path: PathBuf,
     req: Request<Body>,
 ) -> Response<Body> {
+    log::debug!(
+        "streaming request: {} {} (upgrade: {})",
+        req.method(),
+        req.uri().path(),
+        req.headers()
+            .get("Upgrade")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("none")
+    );
     if req.method() != Method::GET && req.method() != Method::POST {
         return response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
     }
@@ -549,6 +558,12 @@ async fn handle_request(
         StreamingServer::prune_expired_requests_locked(&mut cache, config.request_token_ttl);
         cache.remove(token)
     };
+    log::debug!(
+        "streaming token lookup: action={} token_prefix={:?} found={}",
+        action,
+        &token[..token.len().min(8)],
+        request.is_some()
+    );
 
     match (action, request.map(|entry| entry.request)) {
         ("exec", Some(StreamingRequest::Exec(exec_ctx))) => {
@@ -2482,6 +2497,7 @@ async fn serve_exec_websocket(
     on_upgrade: hyper::upgrade::OnUpgrade,
     context: ExecServeContext,
 ) -> anyhow::Result<()> {
+    log::debug!("serve_exec_websocket: entered, io_socket={:?}", context.exec_io_socket_path);
     let ExecServeContext {
         req,
         runtime_path,
@@ -3804,7 +3820,9 @@ async fn serve_exec_websocket_via_shim(
     exec_resize_socket_path: Option<PathBuf>,
     _protocol: &'static str,
 ) -> anyhow::Result<()> {
+    log::debug!("serve_exec_websocket_via_shim: waiting for upgrade");
     let upgraded = on_upgrade.await?;
+    log::debug!("serve_exec_websocket_via_shim: upgraded, connecting io socket");
     let (mut reader, writer) = tokio::io::split(upgraded);
     let writer = Arc::new(Mutex::new(writer));
 
@@ -3817,6 +3835,7 @@ async fn serve_exec_websocket_via_shim(
                 e
             )
         })?;
+    log::debug!("serve_exec_websocket_via_shim: io socket connected");
     let (mut shim_read, shim_write) = shim.into_split();
     let shim_write = Arc::new(Mutex::new(shim_write));
 

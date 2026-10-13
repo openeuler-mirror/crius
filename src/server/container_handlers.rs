@@ -1128,7 +1128,48 @@ impl RuntimeServiceImpl {
         &self,
         request: Request<UpdateContainerResourcesRequest>,
     ) -> Result<Response<UpdateContainerResourcesResponse>, Status> {
-        unimplemented!()
+        if self.config.disable_cgroup {
+            return Err(Status::failed_precondition(
+                "cgroup updates are disabled by configuration",
+            ));
+        }
+        let req = request.into_inner();
+        let container_id = self.resolve_container_id(&req.container_id).await?;
+
+        {
+            let containers = self.containers.lock().await;
+            if !containers.contains_key(&container_id) {
+                return Err(Status::not_found("Container not found"));
+            }
+        }
+
+        // 状态检查：仅 running/created 状态可更新资源
+        let runtime_status = self.runtime_container_status_checked(&container_id).await;
+        if !matches!(
+            runtime_status,
+            crate::runtime::ContainerStatus::Running | crate::runtime::ContainerStatus::Created
+        ) {
+            return Err(Status::failed_precondition(format!(
+                "container {} is not in a mutable state",
+                container_id
+            )));
+        }
+
+        let linux = req
+            .linux
+            .ok_or_else(|| Status::invalid_argument("linux resources must be specified"))?;
+        let runtime = self.runtime_for_container_request(&container_id).await?;
+        let task_container_id = container_id.clone();
+        tokio::task::spawn_blocking(move || {
+            runtime
+                .task_controller()
+                .update_container_resources(&task_container_id, &linux)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("Failed to spawn blocking task: {}", e)))?
+        .map_err(|e| Status::internal(format!("Failed to update container resources: {}", e)))?;
+
+        Ok(Response::new(UpdateContainerResourcesResponse {}))
     }
 
     pub(super) async fn stop_container_internal(

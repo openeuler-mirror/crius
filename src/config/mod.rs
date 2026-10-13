@@ -33,6 +33,7 @@ use crate::config::validation::{
 };
 use crate::network::CniConfig;
 use crate::network::types::MainIpPreference;
+use crate::streaming::StreamingConfig;
 
 /// 守护进程主配置。
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,8 +102,9 @@ pub struct ApiConfig{
     pub pod_sandbox_metrics_collection_period: u64,
     /// ExecSync 在主进程退出后等待 stdout/stderr EOF 的超时。
     pub exec_sync_io_drain_timeout: std::time::Duration,
-    // 流式服务配置。
-    // pub streaming: StreamingConfig,
+    /// 流式服务配置。
+    #[serde(default)]
+    pub streaming: StreamingConfig,
 }
 
 /// 运行时配置。
@@ -704,8 +706,9 @@ impl Default for ApiConfig {
             included_pod_metrics: vec!["all".to_string()],
             stats_collection_period: 0,
             pod_sandbox_metrics_collection_period: 0,
-            exec_sync_io_drain_timeout: std::time::Duration::ZERO, 
-        }        
+            exec_sync_io_drain_timeout: std::time::Duration::ZERO,
+            streaming: StreamingConfig::default(),
+        }
     }
 }
 

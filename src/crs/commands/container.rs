@@ -23,6 +23,7 @@ use crate::proto::runtime::v1::{
     StartContainerRequest, StopContainerRequest, RemoveContainerRequest,
     AttachRequest, ContainerStatsRequest,
     UpdateContainerResourcesRequest, ContainerStats as ProtoContainerStats,
+    ListContainerStatsRequest, ContainerStatsFilter,
 };
 use crate::proto::local::v1::CreateLocalContainerRequest;
 use crate::crs::{
@@ -385,6 +386,7 @@ pub(crate) async fn handle_stats(
     client: &CrsClient,
     args: ContainerStatsArgs,
 ) -> Result<CommandResult, CliError> {
+    let list_filter = list_stats_filter_from_args(&args);
     if let Some(id) = args.id {
         ensure_container_id(&id, "crs container stats")?;
         let mut runtime = client.runtime()?;
@@ -412,9 +414,50 @@ pub(crate) async fn handle_stats(
         );
     }
 
-    Err(CliError::invalid_input("container stats requires a container ID; listing all stats is not supported")
-        .with_command("crs container stats")
-        .with_endpoint(client.endpoint()))
+    // 无 ID：列出全部容器 stats（支持 --pod/--label 过滤）
+    let mut runtime = client.runtime()?;
+    let response = client
+        .with_rpc_timeout(async {
+            runtime
+                .list_container_stats(ListContainerStatsRequest {
+                    filter: list_filter,
+                })
+                .await
+                .map_err(|status| {
+                    CliError::from_tonic_status(status)
+                        .with_command("crs container stats")
+                        .with_endpoint(client.endpoint())
+                })
+        })
+        .await?
+        .into_inner();
+    let items: Vec<ContainerStatsView> = response
+        .stats
+        .into_iter()
+        .map(ContainerStatsView::from)
+        .collect();
+    render_and_print(
+        ctx,
+        CommandOutput::new("ContainerStatsList", client.endpoint(), items),
+    )
+}
+
+fn list_stats_filter_from_args(args: &ContainerStatsArgs) -> Option<ContainerStatsFilter> {
+    if args.id.is_none() && args.pod.is_none() && args.labels.is_empty() {
+        return None;
+    }
+    Some(ContainerStatsFilter {
+        id: args.id.clone().unwrap_or_default(),
+        pod_sandbox_id: args.pod.clone().unwrap_or_default(),
+        label_selector: args
+            .labels
+            .iter()
+            .map(|label| {
+                parse_key_value("--label", label).map(|pair| (pair.key, pair.value))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>, _>>()
+            .unwrap_or_default(),
+    })
 }
 
 pub(crate) async fn handle_update(

@@ -797,6 +797,10 @@ impl Daemon {
             session_id, request.command
         ))?;
 
+        // 等待流式消费者连接后再启动 exec 进程：消费者（streaming server）连上
+        // io socket 后 exec 才运行，输出/错误直接流向消费者，不会因会话早亡丢失
+        io_manager.wait_for_first_client(Duration::from_secs(10));
+
         let result = if request.tty {
             self.serve_tty_exec_session(request, &io_manager)
         } else {
@@ -1839,12 +1843,56 @@ impl Daemon {
         let resources: crate::proto::runtime::v1::LinuxContainerResources =
             request.resources.clone().into();
         let limits = RuncRuntime::cri_to_limits(&resources);
-        let cgroup_manager = CgroupManager::new(request.container_id.clone())
-            .context("Failed to create cgroup manager")?;
+
+        // 经容器 init 进程解析实际 cgroup 路径；CgroupManager 默认按
+        // <mount>/crius/<id> 猜测，与 runc 实际创建的位置不一致
+        let cgroup_manager = match self.resolve_container_cgroup_dir() {
+            Some(dir) => CgroupManager::with_cgroup_path(request.container_id.clone(), dir),
+            None => {
+                log::warn!(
+                    "update_resources: failed to resolve cgroup for {}, falling back to default path",
+                    request.container_id
+                );
+                CgroupManager::new(request.container_id.clone())
+            }
+        }
+        .context("Failed to create cgroup manager")?;
         cgroup_manager
             .set_resources(&limits)
             .context("Failed to set cgroup resources")?;
         Ok(())
+    }
+
+    /// 读取容器 init 进程的 /proc/<pid>/cgroup，解析 cgroup v2 实际路径。
+    /// PID 优先取已跟踪值（终端路径设置）；非终端 foreground runc run 路径不跟踪 PID，
+    /// 此时经 runc state <id> 查询。
+    fn resolve_container_cgroup_dir(&self) -> Option<PathBuf> {
+        let tracked = self
+            .container_pid
+            .lock()
+            .ok()
+            .and_then(|guard| *guard);
+        let pid = match tracked {
+            Some(pid) => pid,
+            None => self.query_container_pid_via_runc_state()?,
+        };
+        let content = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()?;
+        let relative = content
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .map(str::trim)?
+            .trim_start_matches('/');
+        Some(PathBuf::from("/sys/fs/cgroup").join(relative))
+    }
+
+    /// 经 runc state <id> 查询容器 init 进程 PID。
+    fn query_container_pid_via_runc_state(&self) -> Option<i32> {
+        let output = self
+            .runtime_command_output(&["state", &self.container_id])
+            .ok()?;
+        let state: serde_json::Value = serde_json::from_slice(&output.stdout).ok()?;
+        let pid = state.get("pid").and_then(|v| v.as_i64())?;
+        i32::try_from(pid).ok()
     }
 
     fn checkpoint_task_internal(&self, request: &CheckpointTaskRequest) -> Result<()> {

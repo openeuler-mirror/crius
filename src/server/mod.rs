@@ -24,6 +24,7 @@ pub mod events;
 pub mod annotations;
 pub mod state_model;
 pub mod responses;
+pub mod recovery;
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
